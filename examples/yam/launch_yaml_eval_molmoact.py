@@ -19,6 +19,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -31,6 +32,7 @@ import tyro
 from omegaconf import OmegaConf
 
 from camera_client import CameraClient
+from chunked_rollout import run_chunked_rollout
 from gello_min.realsense_camera import RealSenseCamera, get_device_ids
 from gello_min.env import RobotEnv
 from eval_utils import (
@@ -95,6 +97,28 @@ class Args:
 
     num_rollouts: Annotated[int, tyro.conf.arg(aliases=("-n",))] = 1
     """How many rollouts to run in this session."""
+
+    prefetch: bool = False
+    """Overlap the policy round trip with arm motion instead of blocking on it.
+
+    Off by default: this changes what the arm does at every chunk boundary and has not yet
+    been validated on hardware. See ``chunked_rollout.py``. Measured in the hermetic replay
+    harness, it removes the full ~135 ms boundary freeze (p95 135.1 ms -> 0.0 ms).
+    """
+
+    exec_steps: Optional[int] = None
+    """Rows to execute per chunk before re-querying. ``None`` walks the whole chunk (stock).
+
+    Lower values trade GPU duty cycle for fresher actions; only meaningful with ``prefetch``,
+    since without it every re-query costs another blocking round trip.
+    """
+
+    max_jump: Optional[float] = None
+    """Abort if a commanded row differs from the arm's actual pose by more than this (radians).
+
+    No bracket has been characterised for MolmoAct2 on YAM, so the default is off and the
+    loop says so at startup. Do not copy the SO-101 numbers here -- they are degrees, on a
+    different arm."""
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +237,9 @@ def run_one_rollout(
     num_rollouts: int,
     max_steps: int,
     live_view: LiveCameraView,
+    prefetch: bool = False,
+    exec_steps: Optional[int] = None,
+    max_jump: Optional[float] = None,
 ) -> RolloutOutcome:
     """Execute one rollout and buffer per-step observations into ``saver``.
 
@@ -226,26 +253,34 @@ def run_one_rollout(
     Does NOT flush the saver — the caller does that so the Ctrl-C path can
     also flush the partial buffer.
     """
-    chunk_size = max(1, int(policy.get_action_horizon()))
-    action_chunk: Optional[List[Any]] = None
+    # The robot bus and the camera reads are NOT thread-safe, and with prefetch enabled the
+    # observation is captured on a background thread while this one is still commanding the
+    # arm. Every touch of `env` goes through this lock. (The repo has already been bitten by
+    # unserialized bus access: concurrent traffic corrupts Feetech packets under load.)
+    env_lock = threading.Lock()
 
-    for step in range(max_steps):
-        if action_chunk is None or (step % chunk_size) == 0:
-            obs_for_policy = env.get_obs()
-            input_dict = policy.prepare_input(obs_for_policy, instruction)
-            t0 = time.time()
+    def observe() -> Any:
+        with env_lock:
+            return env.get_obs()
 
-            action_chunk = policy.inference(input_dict)["actions"]
-            
-            log_collect_demos(
-                f"Policy inference {time.time() - t0:.3f}s "
-                f"({len(action_chunk)} actions)",
-                "data_info",
-            )
+    def infer(observation: Any) -> List[Any]:
+        input_dict = policy.prepare_input(observation, instruction)
+        t0 = time.time()
+        actions = policy.inference(input_dict)["actions"]
+        log_collect_demos(
+            f"Policy inference {time.time() - t0:.3f}s ({len(actions)} actions)",
+            "data_info",
+        )
+        return actions
 
-        action = np.asarray(action_chunk[step % chunk_size])
-        obs_pre = env.get_obs()
-        obs_post = dynamic_smoothing(env, action) or obs_pre
+    def current_joints() -> np.ndarray:
+        with env_lock:
+            return np.asarray(env.get_robot_state()["joint_positions"], dtype=float)
+
+    def execute(action: np.ndarray, step: int) -> Optional[str]:
+        with env_lock:
+            obs_pre = env.get_obs()
+            obs_post = dynamic_smoothing(env, action) or obs_pre
 
         saver.add_step(obs_pre=obs_pre, obs_post=obs_post)
 
@@ -257,13 +292,37 @@ def run_one_rollout(
             max_steps=max_steps,
             instruction=instruction,
         )
-        if key == "y":
-            return RolloutOutcome(end_reason="success", last_step=step + 1)
-        if key == "n":
-            return RolloutOutcome(end_reason="failure", last_step=step + 1)
-        if key == "q":
-            return RolloutOutcome(end_reason="quit", last_step=step + 1)
+        if key in ("y", "n", "q"):
+            return {"y": "success", "n": "failure", "q": "quit"}[key]
+        return None
 
+    report = run_chunked_rollout(
+        observe=observe,
+        infer=infer,
+        execute=execute,
+        current_joints=current_joints,
+        max_steps=max_steps,
+        exec_steps=exec_steps,
+        max_jump=max_jump,
+        prefetch=prefetch,
+    )
+
+    gap_p95 = report.boundary_gap_p95_ms()
+    log_collect_demos(
+        f"Rollout loop: prefetch={prefetch} chunks={len(report.chunks)} "
+        f"steps={report.steps} boundary_gap_p95="
+        f"{'n/a' if gap_p95 is None else f'{gap_p95:.1f}ms'} "
+        f"late_prefetch={report.late_prefetch_rate()}",
+        "data_info",
+    )
+
+    if report.aborted in ("success", "failure", "quit"):
+        return RolloutOutcome(end_reason=report.aborted, last_step=report.steps)
+    if report.aborted is not None:
+        # A guard abort is a failure with a reason, not a timeout: say so rather than letting
+        # it be recorded as a run that merely ran out of steps.
+        print(f"  !! rollout aborted: {report.aborted}")
+        return RolloutOutcome(end_reason="failure", last_step=report.steps)
     return RolloutOutcome(end_reason="timeout", last_step=max_steps)
 
 
@@ -279,6 +338,9 @@ def run_session(
     right_cfg: Optional[Dict[str, Any]],
     bimanual: bool,
     num_rollouts: int,
+    prefetch: bool = False,
+    exec_steps: Optional[int] = None,
+    max_jump: Optional[float] = None,
 ) -> None:
     """Drive ``num_rollouts`` rollouts; convert the labeled set to LeRobot at the end.
 
@@ -333,6 +395,9 @@ def run_session(
                 num_rollouts=num_rollouts,
                 max_steps=max_steps,
                 live_view=live_view,
+                prefetch=prefetch,
+                exec_steps=exec_steps,
+                max_jump=max_jump,
             )
 
             saver.flush()
@@ -445,6 +510,9 @@ def main() -> None:
         right_cfg=right_cfg,
         bimanual=bimanual,
         num_rollouts=args.num_rollouts,
+        prefetch=args.prefetch,
+        exec_steps=args.exec_steps,
+        max_jump=args.max_jump,
     )
 
 
