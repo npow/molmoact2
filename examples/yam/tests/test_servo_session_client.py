@@ -668,7 +668,7 @@ class ServoSessionHostTests(unittest.TestCase):
             {**_camera_blobs(), "right": b""},
             {},
         ):
-            with self.assertRaisesRegex(ServoBridgeError, "missing camera bytes"):
+            with self.assertRaisesRegex(ServoBridgeError, "missing camera frames"):
                 host.act(broken, [0.0] * STATE_DIM)
 
     def test_a_wrong_length_state_is_refused(self):
@@ -1041,8 +1041,10 @@ class ServoSessionTransportTests(unittest.TestCase):
 class _StubTransport:
     """Stands in for :class:`ServoSessionTransport` (no SDK, no subprocess)."""
 
-    def __init__(self, prediction=None, deployment_id="dep_test"):
+    def __init__(self, prediction=None, deployment_id="dep_test",
+                 observation_encoding="jpeg"):
         self.deployment_id = deployment_id
+        self.observation_encoding = observation_encoding
         self.identity = {
             "deployment_id": deployment_id,
             "session_id": "sess_stub_1",

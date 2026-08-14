@@ -493,6 +493,21 @@ class Args:
     servo_python: Optional[str] = None
     """Python >= 3.12 interpreter with servo-client, if this runtime lacks it."""
 
+    servo_observation_encoding: Optional[Literal["jpeg", "h264"]] = None
+    """``direct`` mode only: the wire camera frames ride to the endpoint.
+
+    ``jpeg`` (default) encodes each frame independently in this process.
+    ``h264`` hands the SDK's action session raw fitted pixels and lets it emit
+    one access unit per camera per act against session-scoped encoder state —
+    roughly a quarter of the bytes on the same frames, at the cost of a wire
+    that only the session it was minted for can decode. The endpoint must be a
+    codec-capable ``servo serve``; a hosted deployment refuses this outright
+    rather than quietly running jpeg."""
+
+    servo_h264_crf: Optional[int] = None
+    """``--servo-observation-encoding h264`` only: x264 rate point (lower =
+    larger and sharper). Unset keeps the SDK's qualified default."""
+
     prefetch_lead_steps: int = 0
     """Fire the next inference this many control steps BEFORE the current chunk
     ends, from a fresh observation captured at that moment, and splice the reply
@@ -1822,6 +1837,8 @@ def main() -> None:
         for cli_value, key in (
             (args.servo_grant, "grant"),
             (args.servo_python, "servo_python"),
+            (args.servo_observation_encoding, "observation_encoding"),
+            (args.servo_h264_crf, "h264_crf"),
         ):
             if cli_value is not None:
                 direct_options[key] = cli_value
@@ -1850,7 +1867,8 @@ def main() -> None:
         print(
             f"[servo] action session {identity.get('session_id')} on "
             f"{identity.get('deployment_id')} "
-            f"(generation {identity.get('generation_id')})"
+            f"(generation {identity.get('generation_id')}) "
+            f"observation wire {identity.get('observation_encoding', 'jpeg')}"
         )
 
     env, left_cfg, right_cfg, bimanual = _build_env(args)

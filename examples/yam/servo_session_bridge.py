@@ -20,8 +20,22 @@ So this module is both halves of that bridge:
   :mod:`molmoact_client` under a Python >= 3.12 interpreter when it cannot.
 
 The parent/child framing below is a local implementation detail (a pipe on this
-host), deliberately kept trivial: a JSON header plus raw JPEG buffers so camera
+host), deliberately kept trivial: a JSON header plus binary buffers so camera
 frames never take a base64 round trip between the two local processes.
+
+Which bytes ride those buffers depends on the wire the action session
+negotiated, and the difference is not an optimization:
+
+* ``images`` -- one pre-encoded JPEG buffer per camera. The JPEG wire is
+  stateless, so bytes minted in the parent are as valid at send time as when
+  they were made. Unchanged, and still the default.
+* ``frames`` -- one raw ``HxWx3`` ``uint8`` buffer per camera. The h264 wire is
+  session-stateful: an access unit is only decodable against the state its
+  predecessor left, so the SDK's transport owns the encoder and mints it at
+  send time. Handing that transport a JPEG would make it *decode* the frame
+  before encoding it (``CapturedFrame.rgb_array``) -- a full generation of
+  compression loss the h264 stream then re-encodes, plus the cost of both
+  codecs. Pixels are therefore what has to cross this pipe.
 
 This module must stay importable on Python 3.11 with no ``servo`` installed:
 keep the module level to the standard library and import the SDK lazily.
@@ -56,6 +70,13 @@ SDK_CREDENTIAL_SCHEMA = "servo.sdk-credentials.v1"
 #: official ``servo`` package, used when the robot runtime cannot.
 SERVO_PYTHON_ENV = "SERVO_PYTHON"
 
+#: Observation wires an action session can negotiate. ``jpeg`` is the default
+#: and the only wire the hosted (control-plane) session offers; ``h264`` is the
+#: codec wire and exists only on a direct ``servo serve`` grant, because the
+#: encoder is owned by that session's own transport.
+OBSERVATION_ENCODINGS: Tuple[str, ...] = ("jpeg", "h264")
+DEFAULT_OBSERVATION_ENCODING = "jpeg"
+
 _FRAME_MAGIC = b"SVYB"
 _FRAME_PREFIX = struct.Struct("<4sII")
 _MAX_BUFFERS = 16
@@ -74,12 +95,21 @@ class ServoBridgeError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def encode_frame(header: Mapping[str, Any], buffers: Sequence[bytes] = ()) -> bytes:
-    """Encode one ``(JSON header, raw buffers)`` frame."""
+def frame_parts(
+    header: Mapping[str, Any], buffers: Sequence[Any] = ()
+) -> List[Any]:
+    """One frame as the pieces to write, in wire order.
+
+    Pieces rather than one joined blob because the raw-pixel wire moves ~2 MB
+    per act (three 360x640x3 frames) on the act hot path: joining would copy
+    every one of those bytes into a throwaway buffer that the pipe then copies
+    again. The caller writes the pieces in order, so the pixels are read
+    straight out of the capture array.
+    """
     if len(buffers) > _MAX_BUFFERS:
         raise ValueError(f"a bridge frame carries at most {_MAX_BUFFERS} buffers")
     for buffer in buffers:
-        if not isinstance(buffer, (bytes, bytearray)) or not buffer:
+        if not isinstance(buffer, (bytes, bytearray, memoryview)) or not len(buffer):
             raise ValueError("bridge frame buffers must be non-empty bytes")
         if len(buffer) > 0xFFFFFFFF:
             raise ValueError("bridge frame buffer exceeds uint32 framing")
@@ -92,14 +122,17 @@ def encode_frame(header: Mapping[str, Any], buffers: Sequence[bytes] = ()) -> by
     if len(encoded_header) > 0xFFFFFFFF:
         raise ValueError("bridge frame header exceeds uint32 framing")
     lengths = struct.pack(f"<{len(buffers)}I", *(len(buffer) for buffer in buffers))
-    return b"".join(
-        (
-            _FRAME_PREFIX.pack(_FRAME_MAGIC, len(encoded_header), len(buffers)),
-            lengths,
-            encoded_header,
-            *(bytes(buffer) for buffer in buffers),
-        )
-    )
+    return [
+        _FRAME_PREFIX.pack(_FRAME_MAGIC, len(encoded_header), len(buffers)),
+        lengths,
+        encoded_header,
+        *buffers,
+    ]
+
+
+def encode_frame(header: Mapping[str, Any], buffers: Sequence[Any] = ()) -> bytes:
+    """Encode one ``(JSON header, raw buffers)`` frame as a single blob."""
+    return b"".join(bytes(part) for part in frame_parts(header, buffers))
 
 
 def _read_exactly(stream: Any, size: int) -> bytes:
@@ -182,6 +215,60 @@ def load_sdk_credentials(path: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # The official-SDK half
 # ---------------------------------------------------------------------------
+
+
+def _camera_present(value: Any) -> bool:
+    """Is this camera value usable? Works for bytes AND raw pixel arrays.
+
+    ``not value`` is wrong for a numpy array (ambiguous truth value) and would
+    turn a perfectly good raw frame into a ``ValueError`` from deep inside the
+    missing-camera check.
+    """
+    if value is None:
+        return False
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value) > 0
+    size = getattr(value, "size", None)
+    if size is not None:
+        return int(size) > 0
+    return True
+
+
+def raw_frames_from_buffers(
+    index: Mapping[str, Any], buffers: Sequence[bytes]
+) -> Dict[str, Any]:
+    """Rebuild ``HxWx3`` ``uint8`` camera arrays from the pipe's raw buffers.
+
+    numpy is imported here rather than at module scope so this file stays
+    importable on the 3.11 robot runtime with nothing but the standard library
+    (the parent half never calls this).
+    """
+    import numpy as np
+
+    frames: Dict[str, Any] = {}
+    for key, spec in index.items():
+        try:
+            buffer = buffers[int(spec["buffer"])]
+            shape = tuple(int(value) for value in spec["shape"])
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ServoBridgeError(
+                f"raw bridge frame for camera {key!r} is malformed: {spec!r}"
+            ) from exc
+        if len(shape) != 3 or shape[2] != 3 or min(shape) <= 0:
+            raise ServoBridgeError(
+                f"raw bridge frame for camera {key!r} must be HxWx3, got {shape}"
+            )
+        expected = shape[0] * shape[1] * shape[2]
+        if len(buffer) != expected:
+            # Length is the only integrity check this framing can make, and it
+            # is the one that matters: a short buffer reshaped anyway would
+            # hand the model a torn frame instead of failing.
+            raise ServoBridgeError(
+                f"raw bridge frame for camera {key!r} carries {len(buffer)} bytes, "
+                f"expected {expected} for shape {shape}"
+            )
+        frames[key] = np.frombuffer(buffer, dtype=np.uint8).reshape(shape)
+    return frames
 
 
 class ServoSessionHost:
@@ -273,23 +360,29 @@ class ServoSessionHost:
 
     def act(
         self,
-        images: Mapping[str, bytes],
+        images: Mapping[str, Any],
         state: Sequence[float],
         instruction: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Run one action chunk over the open session."""
+        """Run one action chunk over the open session.
+
+        A camera value is either encoded bytes (the JPEG wire) or a raw
+        ``HxWx3`` ``uint8`` array (the codec wire). Both are things the SDK's
+        ``capture_observation`` normalizes; neither is a codec decision made
+        here, which is the point — the session owns the wire.
+        """
         if self._session is None:
             raise ServoBridgeError("Servo session is not open")
-        missing = [key for key in CAMERA_KEYS if not images.get(key)]
+        missing = [key for key in CAMERA_KEYS if not _camera_present(images.get(key))]
         if missing:
-            raise ServoBridgeError(f"Servo observation is missing camera bytes: {missing}")
+            raise ServoBridgeError(f"Servo observation is missing camera frames: {missing}")
         state_values = [float(value) for value in state]
         if len(state_values) != STATE_DIM:
             raise ServoBridgeError(
                 f"BimanualYAM state must be {STATE_DIM} floats, got {len(state_values)}"
             )
         observation = {
-            "images": {key: bytes(images[key]) for key in CAMERA_KEYS},
+            "images": {key: images[key] for key in CAMERA_KEYS},
             "state": state_values,
             "instruction": instruction or self.instruction,
         }
@@ -371,6 +464,8 @@ class ServoDirectHost(ServoSessionHost):
         grant: str,
         instruction: Optional[str] = None,
         timeout_sec: Optional[float] = 600.0,
+        observation_encoding: str = DEFAULT_OBSERVATION_ENCODING,
+        h264_crf: Optional[int] = None,
     ):
         # Deliberately NOT calling super().__init__: this host has no
         # credentials file and no managed deployment id to require.
@@ -378,6 +473,14 @@ class ServoDirectHost(ServoSessionHost):
         self.deployment_id = "self-hosted"
         self.instruction = instruction
         self._timeout_sec = timeout_sec
+        encoding = str(observation_encoding or DEFAULT_OBSERVATION_ENCODING)
+        if encoding not in OBSERVATION_ENCODINGS:
+            raise ServoBridgeError(
+                f"observation_encoding must be one of {list(OBSERVATION_ENCODINGS)}, "
+                f"got {encoding!r}"
+            )
+        self.observation_encoding = encoding
+        self.h264_crf = int(h264_crf) if h264_crf is not None else None
         self._client = None
         self._session = None
         self.identity: Dict[str, Any] = {}
@@ -404,11 +507,33 @@ class ServoDirectHost(ServoSessionHost):
                 f"Servo grant {grant_path} is group/world readable; it holds a "
                 "private key — chmod 600 it"
             )
-        policy = attach(
-            grant=grant_path.read_text().strip(),
-            instruction=self.instruction,
-            timeout=float(self._timeout_sec or 600.0),
-        )
+        attach_kwargs: Dict[str, Any] = {}
+        if self.observation_encoding != DEFAULT_OBSERVATION_ENCODING:
+            # Passed only when it differs so this bridge keeps working against
+            # an SDK build that predates the codec wire: on the default the
+            # call is byte-for-byte the one it has always made, and asking for
+            # h264 from an SDK without it fails loudly (TypeError) instead of
+            # silently running jpeg while the operator believes otherwise.
+            attach_kwargs["observation_encoding"] = self.observation_encoding
+            if self.h264_crf is not None:
+                attach_kwargs["h264_crf"] = self.h264_crf
+        try:
+            policy = attach(
+                grant=grant_path.read_text().strip(),
+                instruction=self.instruction,
+                timeout=float(self._timeout_sec or 600.0),
+                **attach_kwargs,
+            )
+        except TypeError as exc:
+            if not attach_kwargs:
+                raise
+            raise ServoBridgeError(
+                f"the servo SDK in {sys.executable} does not support "
+                f"observation_encoding={self.observation_encoding!r} "
+                f"(servo.direct.attach rejected it: {exc}); upgrade that checkout "
+                "or run the default jpeg wire",
+                error_type="ObservationEncodingUnsupported",
+            ) from exc
         # DirectPolicy.act(observation, instruction=...) matches the hosted
         # Session.act call shape, so the inherited act() drives it unchanged.
         self._session = policy
@@ -417,6 +542,13 @@ class ServoDirectHost(ServoSessionHost):
             "backend": "servo-direct-action-session",
             "grant": str(grant_path),
             "cameras": sorted(dict(getattr(policy, "camera_inputs", None) or {})),
+            # Read back off the policy rather than echoed from the request: the
+            # wire the session actually negotiated is the only one worth
+            # recording in a rollout's identity.
+            "observation_encoding": str(
+                getattr(policy, "observation_encoding", self.observation_encoding)
+            ),
+            "h264_crf": getattr(policy, "h264_crf", self.h264_crf),
         })
         return dict(self.identity)
 
@@ -467,6 +599,9 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
                 grant=header["grant"],
                 instruction=header.get("instruction"),
                 timeout_sec=header.get("timeout_sec"),
+                observation_encoding=header.get("observation_encoding")
+                or DEFAULT_OBSERVATION_ENCODING,
+                h264_crf=header.get("h264_crf"),
             )
         else:
             host = ServoSessionHost(
@@ -482,11 +617,16 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
         if host is None:
             raise ServoBridgeError("act requested before open")
         image_index = header.get("images") or {}
-        images = {key: buffers[int(index)] for key, index in image_index.items()}
+        cameras: Dict[str, Any] = {
+            key: buffers[int(index)] for key, index in image_index.items()
+        }
+        frame_index = header.get("frames") or {}
+        if frame_index:
+            cameras.update(raw_frames_from_buffers(frame_index, buffers))
         return {
             "ok": True,
             "prediction": host.act(
-                images,
+                cameras,
                 header.get("state") or [],
                 instruction=header.get("instruction"),
             ),

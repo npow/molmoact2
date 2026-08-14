@@ -44,12 +44,14 @@ from servo_session_bridge import (
     ACTION_HORIZON,
     ACTION_SPACE,
     CAMERA_KEYS,
+    DEFAULT_OBSERVATION_ENCODING,
+    OBSERVATION_ENCODINGS,
     SERVO_PYTHON_ENV,
     STATE_DIM,
     ServoBridgeError,
     ServoDirectHost,
     ServoSessionHost,
-    encode_frame,
+    frame_parts,
     read_frame,
 )
 
@@ -425,6 +427,22 @@ class MolmoActHTTP(PolicyBase):
 _BRIDGE_EOF = object()
 
 
+def _camera_present(value: Any) -> bool:
+    """Is this camera value usable? Works for bytes AND raw pixel arrays.
+
+    ``not value`` is right for bytes and raises ``ValueError`` for an array,
+    which would turn a perfectly good raw frame into an unrelated traceback.
+    """
+    if value is None:
+        return False
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value) > 0
+    size = getattr(value, "size", None)
+    if size is not None:
+        return int(size) > 0
+    return True
+
+
 class ServoSessionTransport:
     """Owns exactly one official Servo action session for a whole eval run.
 
@@ -453,6 +471,8 @@ class ServoSessionTransport:
         servo_python: Optional[str] = None,
         open_timeout_sec: float = 600.0,
         act_timeout_sec: float = 120.0,
+        observation_encoding: str = DEFAULT_OBSERVATION_ENCODING,
+        h264_crf: Optional[int] = None,
         logger: Optional[logging.Logger] = None,
         bridge_env: Optional[Dict[str, str]] = None,
     ):
@@ -465,6 +485,23 @@ class ServoSessionTransport:
         if act_timeout_sec <= 0:
             raise ValueError("act_timeout_sec must be positive")
         self.bridge_env = dict(bridge_env or {})
+        encoding = str(observation_encoding or DEFAULT_OBSERVATION_ENCODING)
+        if encoding not in OBSERVATION_ENCODINGS:
+            raise ServoBridgeError(
+                f"observation_encoding must be one of {list(OBSERVATION_ENCODINGS)}, "
+                f"got {encoding!r}"
+            )
+        if encoding != DEFAULT_OBSERVATION_ENCODING and not grant:
+            # The codec wire's encoder lives in the direct session's transport.
+            # A hosted session has no such thing, so accepting the flag there
+            # would silently run jpeg — the failure mode this whole change is
+            # about (an operator believing a wire that is not the one running).
+            raise ServoBridgeError(
+                f"observation_encoding={encoding!r} needs a self-hosted grant; the "
+                "hosted control-plane session only offers the jpeg wire"
+            )
+        self.observation_encoding = encoding
+        self.h264_crf = int(h264_crf) if h264_crf is not None else None
         self.grant = str(Path(grant).expanduser()) if grant else None
         if self.grant is None:
             # Hosted mode: both halves of the control-plane identity are required.
@@ -538,6 +575,8 @@ class ServoSessionTransport:
                     grant=self.grant,
                     instruction=self.instruction,
                     timeout_sec=sdk_timeout,
+                    observation_encoding=self.observation_encoding,
+                    h264_crf=self.h264_crf,
                 )
             else:
                 self._host = ServoSessionHost(
@@ -556,44 +595,83 @@ class ServoSessionTransport:
             }
             if self.grant is not None:
                 header["grant"] = self.grant
+                header["observation_encoding"] = self.observation_encoding
+                if self.h264_crf is not None:
+                    header["h264_crf"] = self.h264_crf
             else:
                 header["credentials"] = self.credentials
                 header["deployment_id"] = self.deployment_id
             identity = self._request(header, timeout=self.open_timeout_sec)["identity"]
         self.identity = dict(identity)
+        # The wire is read back from the identity the session reported, not
+        # from what was requested: a negotiated-down wire must be visible here.
+        negotiated = self.identity.get("observation_encoding")
+        if negotiated:
+            self.observation_encoding = str(negotiated)
         self.logger.info(
-            "Servo action session %s open on deployment %s (generation %s, %s SDK)",
+            "Servo action session %s open on deployment %s (generation %s, %s SDK, "
+            "%s observation wire)",
             self.identity.get("session_id"),
             self.identity.get("deployment_id"),
             self.identity.get("generation_id"),
             self.mode,
+            self.observation_encoding,
         )
         return dict(self.identity)
 
     def act(
         self,
-        images: Dict[str, bytes],
+        images: Dict[str, Any],
         state: Any,
         instruction: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Send one observation over the open session and return its prediction."""
+        """Send one observation over the open session and return its prediction.
+
+        A camera value is either encoded ``bytes`` (the jpeg wire) or a raw
+        ``HxWx3`` ``uint8`` array (the codec wire, whose encoder is owned by the
+        SDK session and runs at send time). The framing follows the value, so
+        neither half of the bridge has to be told which wire is running twice.
+        """
         if not self.identity:
             self.open()
         # Both modes must fail identically: the caller only handles
         # ServoBridgeError, and a stalled camera must not surface as a KeyError
         # from one transport and a clean error from the other.
-        missing = [key for key in CAMERA_KEYS if not images.get(key)]
+        missing = [key for key in CAMERA_KEYS if not _camera_present(images.get(key))]
         if missing:
-            raise ServoBridgeError(f"Servo observation is missing camera bytes: {missing}")
+            raise ServoBridgeError(f"Servo observation is missing camera frames: {missing}")
         if self._host is not None:
             return self._host.act(images, state, instruction=instruction)
-        header = {
+        header: Dict[str, Any] = {
             "op": "act",
-            "images": {key: index for index, key in enumerate(CAMERA_KEYS)},
             "state": [float(value) for value in state],
             "instruction": instruction,
         }
-        buffers = [images[key] for key in CAMERA_KEYS]
+        buffers: List[Any] = []
+        image_index: Dict[str, int] = {}
+        frame_index: Dict[str, Dict[str, Any]] = {}
+        for key in CAMERA_KEYS:
+            value = images[key]
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                image_index[key] = len(buffers)
+                buffers.append(value)
+                continue
+            array = np.ascontiguousarray(value, dtype=np.uint8)
+            if array.ndim != 3 or array.shape[2] != 3:
+                raise ServoBridgeError(
+                    f"raw camera frame {key!r} must be HxWx3 uint8, got {array.shape}"
+                )
+            frame_index[key] = {
+                "buffer": len(buffers),
+                "shape": [int(dim) for dim in array.shape],
+            }
+            # A byte view, not ``tobytes()``: this is ~700 KB per camera on the
+            # act hot path and the pipe writer takes a memoryview directly.
+            buffers.append(memoryview(array).cast("B"))
+        if image_index:
+            header["images"] = image_index
+        if frame_index:
+            header["frames"] = frame_index
         return self._request(header, buffers, timeout=self.act_timeout_sec)["prediction"]
 
     def close(self, success: bool = True) -> None:
@@ -727,11 +805,12 @@ class ServoSessionTransport:
         # observation problem (an empty camera frame, a non-finite state) and
         # must not be reported as a dead helper process.
         try:
-            frame = encode_frame(header, buffers or ())
+            parts = frame_parts(header, buffers or ())
         except ValueError as exc:
             raise ServoBridgeError(f"Servo observation cannot be framed: {exc}") from exc
         try:
-            self._write_all(process.stdin, frame)
+            for part in parts:
+                self._write_all(process.stdin, part)
             process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             raise ServoBridgeError(
@@ -791,6 +870,8 @@ class MolmoActServo(PolicyBase):
         jpeg_quality: int = 85,
         image_size: Optional[int] = None,
         image_fit: str = "pad",
+        observation_encoding: str = DEFAULT_OBSERVATION_ENCODING,
+        h264_crf: Optional[int] = None,
     ):
         self.logger = get_molmoact_logger()
         if image_fit not in ("pad", "stretch"):
@@ -808,6 +889,15 @@ class MolmoActServo(PolicyBase):
             raise ValueError("image_size must be positive or None")
         self.jpeg_quality = int(jpeg_quality)
         self.image_size = int(image_size) if image_size is not None else None
+        # Which bytes this client hands the session. ``jpeg`` encodes here (the
+        # unchanged default); ``h264`` hands over raw fitted pixels because the
+        # codec wire's encoder is session state owned by the SDK's transport and
+        # must run at send time. Validated inside the transport, which is also
+        # the thing that knows whether a grant (direct) session exists at all.
+        self.observation_encoding = str(
+            observation_encoding or DEFAULT_OBSERVATION_ENCODING
+        )
+        self.h264_crf = int(h264_crf) if h264_crf is not None else None
         self.action_horizon = ACTION_HORIZON
         self._transport = ServoSessionTransport(
             credentials=(credentials or DEFAULT_SERVO_CREDENTIALS) if not grant else None,
@@ -817,13 +907,16 @@ class MolmoActServo(PolicyBase):
             servo_python=servo_python,
             open_timeout_sec=open_timeout_sec,
             act_timeout_sec=act_timeout_sec,
+            observation_encoding=self.observation_encoding,
+            h264_crf=self.h264_crf,
             logger=self.logger,
         )
         self.logger.info(
-            "MolmoActServo bound to %s (%s SDK)",
+            "MolmoActServo bound to %s (%s SDK, %s observation wire)",
             f"grant {grant} (self-hosted, no fallback)" if grant else
             f"deployment {deployment} (credentials {self._transport.credentials})",
             self._transport.mode,
+            self.observation_encoding,
         )
 
     @property
@@ -851,12 +944,32 @@ class MolmoActServo(PolicyBase):
             "generation_id": identity.get("generation_id"),
             "checkpoint_digest": identity.get("checkpoint_digest"),
             "manifest_hash": identity.get("manifest_hash"),
-            "image_encoding": (
-                f"jpeg-quality-{self.jpeg_quality}-size-{self.image_size or 'source'}"
-            ),
+            "image_encoding": self._image_encoding_descriptor(),
+            "observation_encoding": self.wire,
             "deterministic_generator": False,
             "note": "hosted policy does not expose a per-query generator seed",
         }
+
+    @property
+    def wire(self) -> str:
+        """The observation wire in force, as the open session reported it.
+
+        Read off the transport rather than the constructor argument: ``open()``
+        overwrites it with what the endpoint actually negotiated, and the whole
+        point of this attribute is that an operator who asked for h264 can see
+        whether they got it.
+        """
+        return str(self._transport.observation_encoding)
+
+    def _image_encoding_descriptor(self) -> str:
+        """What the model's pixels went through, for the rollout manifest."""
+        size = self.image_size or "source"
+        if self.wire == "h264":
+            crf = self.h264_crf if self.h264_crf is not None else "default"
+            # No jpeg leg at all on this wire: the client sends fitted pixels
+            # and the session's x264 stream is the only lossy step.
+            return f"h264-crf-{crf}-size-{size}"
+        return f"jpeg-quality-{self.jpeg_quality}-size-{size}"
 
     def prepare_input(self, obs: Dict[str, Any], instruction: str) -> Dict[str, Any]:
         self.logger.info("Preparing input for MolmoActServo inference")
@@ -875,11 +988,25 @@ class MolmoActServo(PolicyBase):
         encode_started = time.perf_counter()
         # Servo's stable camera names for the YAM embodiment; the runtime maps
         # them to the checkpoint's own keys through the deployment manifest.
-        images = {
-            "top": self._jpeg_bytes(input_dict["front_camera_rgb"]),
-            "left": self._jpeg_bytes(input_dict["left_camera_rgb"]),
-            "right": self._jpeg_bytes(input_dict["right_camera_rgb"]),
-        }
+        wire = self.wire
+        if wire == "jpeg":
+            images: Dict[str, Any] = {
+                "top": self._jpeg_bytes(input_dict["front_camera_rgb"]),
+                "left": self._jpeg_bytes(input_dict["left_camera_rgb"]),
+                "right": self._jpeg_bytes(input_dict["right_camera_rgb"]),
+            }
+            image_bytes = sum(len(buffer) for buffer in images.values())
+        else:
+            # Raw pixels. Encoding here would be worse than pointless: the
+            # session's h264 encoder would DECODE the jpeg to get its frame
+            # back (CapturedFrame.rgb_array), so the model would see pixels
+            # that went through two lossy codecs instead of one.
+            images = {
+                "top": self._fitted_array(input_dict["front_camera_rgb"]),
+                "left": self._fitted_array(input_dict["left_camera_rgb"]),
+                "right": self._fitted_array(input_dict["right_camera_rgb"]),
+            }
+            image_bytes = sum(int(frame.nbytes) for frame in images.values())
         encode_ms = (time.perf_counter() - encode_started) * 1000.0
         state = require_bimanual_state(
             input_dict["state"], source="MolmoActServo request"
@@ -903,13 +1030,19 @@ class MolmoActServo(PolicyBase):
         # ``runtime.inference_ms`` to the top-level key ``server_infer_ms``
         # (servo/types.py:_telemetry_view) — there is no ``infer_ms`` key.
         server_infer_ms = telemetry.get("server_infer_ms")
-        image_bytes = sum(len(buffer) for buffer in images.values())
+        # What actually left the machine. On the jpeg wire this tracks
+        # ``image_bytes``; on the codec wire it is the only honest number,
+        # because the pixels handed to the session are ~2 MB and the access
+        # units the session sends are a twentieth of that.
+        request_bytes = telemetry.get("request_bytes")
         self.logger.info(
-            "Servo action session step in %.1fms (encode %.1fms, %d image bytes, "
-            "server inference %sms)",
+            "Servo action session step in %.1fms (wire %s, prepare %.1fms, "
+            "%d client image bytes, request_bytes=%s, server inference %sms)",
             act_ms,
+            wire,
             encode_ms,
             image_bytes,
+            request_bytes if request_bytes is not None else "unknown",
             server_infer_ms if server_infer_ms is not None else "unknown",
         )
         identity = self._transport.identity
@@ -921,7 +1054,9 @@ class MolmoActServo(PolicyBase):
                 "protocol": "servo-action-session",
                 "action_space": prediction.get("action_space", ACTION_SPACE),
                 "session_id": identity.get("session_id"),
+                "observation_encoding": wire,
                 "image_bytes": image_bytes,
+                "request_bytes": request_bytes,
                 "act_ms": act_ms,
                 "encode_ms": encode_ms,
                 "server_inference_ms": server_infer_ms,
@@ -929,7 +1064,14 @@ class MolmoActServo(PolicyBase):
             },
         }
 
-    def _jpeg_bytes(self, image: Any) -> bytes:
+    def _fitted_array(self, image: Any) -> np.ndarray:
+        """Validate a camera frame and apply the optional client-side resize.
+
+        Shared by both wires so ``--servo-observation-encoding`` changes only
+        the encoding, never which pixels the model is asked about. The
+        authoritative fit is still the manifest geometry the SDK applies in
+        ``capture_observation``; ``image_size`` here stays a diagnostic.
+        """
         array = np.asarray(image)
         if array.dtype != np.uint8:
             array = np.clip(array, 0, 255).astype(np.uint8)
@@ -947,6 +1089,10 @@ class MolmoActServo(PolicyBase):
                 )
             else:
                 array = self._resize_with_pad(array, self.image_size)
+        return array
+
+    def _jpeg_bytes(self, image: Any) -> bytes:
+        array = self._fitted_array(image)
         output = io.BytesIO()
         Image.fromarray(array).convert("RGB").save(
             output,
