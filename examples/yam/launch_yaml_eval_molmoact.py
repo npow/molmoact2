@@ -1811,6 +1811,20 @@ def main() -> None:
     )
 
     mode = args.policy_mode or eval_cfg.get("mode", "server")
+    if mode != "direct":
+        # Only the self-hosted session owns an observation encoder, so these
+        # flags have nowhere to go in any other mode. Ignoring them is the
+        # failure this whole change is about -- an operator reading "h264" on
+        # their own command line while jpeg runs.
+        for value, flag in (
+            (args.servo_observation_encoding, "--servo-observation-encoding"),
+            (args.servo_h264_crf, "--servo-h264-crf"),
+        ):
+            if value is not None:
+                raise SystemExit(
+                    f"{flag} applies to `--policy-mode direct` only "
+                    f"(a `servo serve` grant); this run is {mode!r}"
+                )
     if mode == "local":
         policy = MolmoActLocal(**(eval_cfg.get("local") or {}))
     elif mode == "server":
