@@ -36,12 +36,16 @@ from types import ModuleType, SimpleNamespace
 from servo_session_bridge import (
     ACTION_HORIZON,
     CAMERA_KEYS,
+    OBSERVATION_ENCODINGS,
     SDK_CREDENTIAL_SCHEMA,
     SERVO_PYTHON_ENV,
     STATE_DIM,
     ServoBridgeError,
+    ServoDirectHost,
     ServoSessionHost,
     encode_frame,
+    frame_parts,
+    raw_frames_from_buffers,
     read_frame,
     write_frame,
 )
@@ -1291,6 +1295,371 @@ class MolmoActServoTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "HxWx3"):
             policy.inference(policy.prepare_input(observation, "x"))
         self.assertEqual(policy._transport.calls, [])
+
+
+# ---------------------------------------------------------------------------
+# The codec wire: raw pixels across the bridge
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_direct(test, *, reject_encoding=False):
+    """Inject a fake ``servo.direct`` that records what ``attach`` was given."""
+
+    state = SimpleNamespace(attach_calls=[], policies=[])
+
+    class _FakeDirectPolicy:
+        def __init__(self, **kwargs):
+            self.camera_inputs = {"top": {"height": 360, "width": 640, "fit": "stretch"}}
+            # The SDK stores the negotiated wire on the policy; the host reads
+            # it back from here rather than echoing the request.
+            self.observation_encoding = kwargs.get("observation_encoding", "jpeg")
+            self.h264_crf = kwargs.get("h264_crf")
+            self.kwargs = kwargs
+
+        def close(self):
+            pass
+
+    def _attach(**kwargs):
+        if reject_encoding and "observation_encoding" in kwargs:
+            raise TypeError("attach() got an unexpected keyword 'observation_encoding'")
+        state.attach_calls.append(dict(kwargs))
+        policy = _FakeDirectPolicy(**kwargs)
+        state.policies.append(policy)
+        return policy
+
+    package = ModuleType("servo")
+    package.__spec__ = importlib.machinery.ModuleSpec("servo", loader=None)
+    package.__path__ = []  # type: ignore[attr-defined]
+    direct = ModuleType("servo.direct")
+    direct.__spec__ = importlib.machinery.ModuleSpec("servo.direct", loader=None)
+    direct.attach = _attach
+    package.direct = direct
+
+    previous = {name: sys.modules.get(name) for name in ("servo", "servo.direct")}
+    sys.modules["servo"] = package
+    sys.modules["servo.direct"] = direct
+
+    def _restore():
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:  # pragma: no cover
+                sys.modules[name] = module
+
+    test.addCleanup(_restore)
+    return state
+
+
+class RawFrameWireTests(unittest.TestCase):
+    """The pixel half of the bridge framing (the codec wire's payload)."""
+
+    def _array(self, height, width, value):
+        import numpy as np
+
+        frame = np.empty((height, width, 3), dtype=np.uint8)
+        frame[:, :, :] = value
+        return frame
+
+    def test_frame_parts_join_to_what_encode_frame_produces(self):
+        blobs = list(_camera_blobs().values())
+        header = {"op": "act", "images": {"top": 0, "left": 1, "right": 2}}
+        joined = b"".join(bytes(part) for part in frame_parts(header, blobs))
+        self.assertEqual(joined, encode_frame(header, blobs))
+
+    def test_a_memoryview_buffer_is_framed_by_bytes_not_rows(self):
+        # The parent writes pixels as ``memoryview(array).cast("B")`` to avoid
+        # copying ~2 MB per act. ``len(memoryview(HxWx3))`` is the ROW count, so
+        # framing an uncast view would declare 4 bytes for a 60-byte frame and
+        # truncate it silently.
+        array = self._array(4, 5, 200)
+        view = memoryview(array).cast("B")
+        self.assertEqual(len(view), array.nbytes)
+        header = {"op": "act", "frames": {"top": {"buffer": 0, "shape": [4, 5, 3]}}}
+        decoded_header, buffers = read_frame(io.BytesIO(encode_frame(header, [view])))
+        self.assertEqual(decoded_header, header)
+        self.assertEqual(buffers[0], array.tobytes())
+
+    def test_raw_frames_rebuild_every_camera_at_its_own_geometry(self):
+        import numpy as np
+
+        arrays = {
+            "top": self._array(6, 8, 11),
+            "left": self._array(4, 4, 22),
+            "right": self._array(2, 9, 33),
+        }
+        buffers, index = [], {}
+        for key, array in arrays.items():
+            index[key] = {"buffer": len(buffers), "shape": list(array.shape)}
+            buffers.append(array.tobytes())
+        rebuilt = raw_frames_from_buffers(index, buffers)
+        self.assertEqual(sorted(rebuilt), sorted(arrays))
+        for key, array in arrays.items():
+            self.assertEqual(rebuilt[key].dtype, np.uint8)
+            self.assertTrue(np.array_equal(rebuilt[key], array))
+
+    def test_a_torn_buffer_is_refused_instead_of_reshaped(self):
+        # The only integrity check this framing can make, and the one that
+        # matters: a short buffer reshaped anyway reaches the model as a torn
+        # frame rather than an error.
+        array = self._array(4, 5, 7)
+        index = {"top": {"buffer": 0, "shape": [4, 5, 3]}}
+        with self.assertRaisesRegex(ServoBridgeError, "expected 60"):
+            raw_frames_from_buffers(index, [array.tobytes()[:-1]])
+
+    def test_a_non_rgb_shape_is_refused(self):
+        for shape in ([4, 5], [4, 5, 4], [0, 5, 3]):
+            with self.assertRaisesRegex(ServoBridgeError, "HxWx3"):
+                raw_frames_from_buffers({"top": {"buffer": 0, "shape": shape}}, [b"x" * 60])
+
+    def test_a_malformed_index_is_refused(self):
+        with self.assertRaisesRegex(ServoBridgeError, "malformed"):
+            raw_frames_from_buffers({"top": {"shape": [1, 1, 3]}}, [b"xyz"])
+        with self.assertRaisesRegex(ServoBridgeError, "malformed"):
+            raw_frames_from_buffers({"top": {"buffer": 4, "shape": [1, 1, 3]}}, [b"xyz"])
+
+
+class DirectHostEncodingTests(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.grant = Path(self._dir.name) / "grant.txt"
+        self.grant.write_text("grant-blob")
+        self.grant.chmod(0o600)
+
+    def test_an_unknown_encoding_is_refused_at_construction(self):
+        with self.assertRaisesRegex(ServoBridgeError, "observation_encoding"):
+            ServoDirectHost(grant=str(self.grant), observation_encoding="av1")
+
+    def test_the_default_wire_is_jpeg_and_asks_attach_for_nothing(self):
+        state = _install_fake_direct(self)
+        host = ServoDirectHost(grant=str(self.grant))
+        self.assertEqual(host.observation_encoding, "jpeg")
+        host.open()
+        # Untouched call shape: an SDK build predating the codec wire keeps working.
+        self.assertNotIn("observation_encoding", state.attach_calls[-1])
+        self.assertEqual(host.identity["observation_encoding"], "jpeg")
+
+    def test_h264_reaches_attach_and_is_reported_from_the_policy(self):
+        state = _install_fake_direct(self)
+        host = ServoDirectHost(
+            grant=str(self.grant), observation_encoding="h264", h264_crf=27
+        )
+        host.open()
+        call = state.attach_calls[-1]
+        self.assertEqual(call["observation_encoding"], "h264")
+        self.assertEqual(call["h264_crf"], 27)
+        self.assertEqual(host.identity["observation_encoding"], "h264")
+        self.assertEqual(host.identity["h264_crf"], 27)
+
+    def test_an_sdk_without_the_codec_wire_fails_by_name(self):
+        _install_fake_direct(self, reject_encoding=True)
+        host = ServoDirectHost(grant=str(self.grant), observation_encoding="h264")
+        with self.assertRaisesRegex(ServoBridgeError, "does not support"):
+            host.open()
+
+    def test_the_host_accepts_raw_pixels_as_a_camera_value(self):
+        import numpy as np
+
+        state = _install_fake_direct(self)
+        host = ServoDirectHost(grant=str(self.grant), observation_encoding="h264")
+        host.open()
+        sent = {}
+        pixels = {key: np.full((2, 3, 3), 5, dtype=np.uint8) for key in CAMERA_KEYS}
+
+        def _act(observation, instruction=None):
+            sent["observation"] = observation
+            return _fake_prediction()
+
+        state.policies[-1].act = _act
+        host._session.act = _act
+        host.act(pixels, [0.0] * STATE_DIM)
+        # Handed through untouched: no codec decision is made in the bridge.
+        for key in CAMERA_KEYS:
+            self.assertIs(sent["observation"]["images"][key], pixels[key])
+
+    def test_an_empty_raw_frame_is_reported_as_a_missing_camera(self):
+        import numpy as np
+
+        _install_fake_direct(self)
+        host = ServoDirectHost(grant=str(self.grant), observation_encoding="h264")
+        host.open()
+        pixels = {key: np.full((2, 3, 3), 5, dtype=np.uint8) for key in CAMERA_KEYS}
+        pixels["left"] = np.empty((0, 3, 3), dtype=np.uint8)
+        # ``not array`` raises "truth value is ambiguous" here rather than
+        # naming the camera -- the bug this check exists to prevent.
+        with self.assertRaisesRegex(ServoBridgeError, "missing camera frames"):
+            host.act(pixels, [0.0] * STATE_DIM)
+
+
+@unittest.skipUnless(_HAVE_CLIENT, _CLIENT_SKIP)
+class ObservationWireTests(unittest.TestCase):
+    """What the policy hands the transport on each wire."""
+
+    def setUp(self):
+        import numpy as np
+
+        self.np = np
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.grant = Path(self._dir.name) / "grant.txt"
+        self.grant.write_text("grant-blob")
+        self.grant.chmod(0o600)
+
+    def _policy(self, encoding):
+        policy = MolmoActServo(
+            grant=str(self.grant),
+            servo_python=sys.executable,
+            instruction="pick up the red cap",
+            observation_encoding=encoding,
+        )
+        policy._transport = _StubTransport(observation_encoding=encoding)
+        return policy
+
+    def _observation(self):
+        def frame(height, width, value):
+            return self.np.full((height, width, 3), value, dtype=self.np.uint8)
+
+        return {
+            "front_camera_rgb": frame(48, 64, 220),
+            "left_camera_rgb": frame(24, 32, 120),
+            "right_camera_rgb": frame(16, 16, 20),
+            "joint_positions": self.np.arange(STATE_DIM, dtype=self.np.float32),
+        }
+
+    def test_the_jpeg_wire_still_sends_encoded_bytes(self):
+        policy = self._policy("jpeg")
+        policy.inference(policy.prepare_input(self._observation(), "x"))
+        sent = policy._transport.calls[-1]["images"]
+        self.assertEqual(sorted(sent), sorted(CAMERA_KEYS))
+        for value in sent.values():
+            self.assertIsInstance(value, bytes)
+            self.assertTrue(value.startswith(b"\xff\xd8"))
+        self.assertEqual(
+            policy.reproducibility_metadata()["image_encoding"],
+            "jpeg-quality-85-size-source",
+        )
+
+    def test_the_codec_wire_sends_raw_pixels_and_never_a_jpeg(self):
+        policy = self._policy("h264")
+        observation = self._observation()
+        policy.inference(policy.prepare_input(observation, "x"))
+        sent = policy._transport.calls[-1]["images"]
+        self.assertEqual(sorted(sent), sorted(CAMERA_KEYS))
+        for value in sent.values():
+            self.assertIsInstance(value, self.np.ndarray)
+            self.assertEqual(value.dtype, self.np.uint8)
+            self.assertEqual(value.ndim, 3)
+        # Camera mapping is identical on both wires: front -> top.
+        self.assertTrue(self.np.array_equal(sent["top"], observation["front_camera_rgb"]))
+        self.assertTrue(self.np.array_equal(sent["left"], observation["left_camera_rgb"]))
+        self.assertTrue(self.np.array_equal(sent["right"], observation["right_camera_rgb"]))
+        metadata = policy.reproducibility_metadata()
+        self.assertEqual(metadata["observation_encoding"], "h264")
+        # No jpeg leg in the provenance: one lossy step on this wire, not two.
+        self.assertNotIn("jpeg", metadata["image_encoding"])
+
+    def test_both_wires_ask_the_model_about_identical_pixels(self):
+        observation = self._observation()
+        raw_policy = self._policy("h264")
+        raw_policy.inference(raw_policy.prepare_input(observation, "x"))
+        raw = raw_policy._transport.calls[-1]["images"]
+
+        jpeg_policy = self._policy("jpeg")
+        for key, source in (
+            ("top", "front_camera_rgb"),
+            ("left", "left_camera_rgb"),
+            ("right", "right_camera_rgb"),
+        ):
+            self.assertTrue(
+                self.np.array_equal(raw[key], jpeg_policy._fitted_array(observation[source]))
+            )
+
+    def test_a_non_rgb_frame_is_refused_on_the_codec_wire_too(self):
+        policy = self._policy("h264")
+        observation = self._observation()
+        observation["front_camera_rgb"] = self.np.zeros((8, 8), dtype=self.np.uint8)
+        with self.assertRaisesRegex(ValueError, "HxWx3"):
+            policy.inference(policy.prepare_input(observation, "x"))
+        self.assertEqual(policy._transport.calls, [])
+
+
+@unittest.skipUnless(_HAVE_CLIENT, _CLIENT_SKIP)
+class TransportEncodingTests(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.grant = Path(self._dir.name) / "grant.txt"
+        self.grant.write_text("blob")
+        self.grant.chmod(0o600)
+
+    def _transport(self, **kwargs):
+        transport = ServoSessionTransport(
+            grant=str(self.grant),
+            servo_python=sys.executable,
+            logger=_QUIET_LOGGER,
+            **kwargs,
+        )
+        transport.identity = {"session_id": "sess"}
+        return transport
+
+    def test_the_codec_wire_needs_a_grant(self):
+        credentials = _write_credentials(self._dir.name)
+        with self.assertRaisesRegex(ServoBridgeError, "needs a self-hosted grant"):
+            ServoSessionTransport(
+                credentials=credentials,
+                deployment_id="dep_test",
+                servo_python=sys.executable,
+                observation_encoding="h264",
+                logger=_QUIET_LOGGER,
+            )
+
+    def test_an_unknown_wire_is_refused(self):
+        with self.assertRaisesRegex(ServoBridgeError, "observation_encoding"):
+            self._transport(observation_encoding="webp")
+        # The declared set is the contract both halves of the bridge share.
+        self.assertEqual(tuple(OBSERVATION_ENCODINGS), ("jpeg", "h264"))
+
+    def test_act_frames_pixels_as_frames_and_bytes_as_images(self):
+        import numpy as np
+
+        transport = self._transport()
+        captured = {}
+
+        def fake_request(header, buffers=None, *, timeout):
+            captured["header"] = header
+            captured["buffers"] = [bytes(buffer) for buffer in (buffers or [])]
+            return {"prediction": {"actions": []}}
+
+        transport._request = fake_request  # type: ignore[assignment]
+        pixels = np.full((3, 4, 3), 9, dtype=np.uint8)
+        transport.act({"top": pixels, "left": _JPEG, "right": pixels}, [0.0] * STATE_DIM)
+
+        header = captured["header"]
+        self.assertEqual(sorted(header["frames"]), ["right", "top"])
+        self.assertEqual(list(header["images"]), ["left"])
+        self.assertEqual(header["frames"]["top"]["shape"], [3, 4, 3])
+        # Buffer indices address this frame's own buffer list, in send order.
+        self.assertEqual(
+            captured["buffers"][header["frames"]["top"]["buffer"]], pixels.tobytes()
+        )
+        self.assertEqual(captured["buffers"][header["images"]["left"]], _JPEG)
+
+    def test_the_open_header_carries_the_wire_only_for_a_grant(self):
+        transport = self._transport(observation_encoding="h264", h264_crf=23)
+        self.assertEqual(transport.observation_encoding, "h264")
+        self.assertEqual(transport.h264_crf, 23)
+
+    def test_an_empty_raw_frame_is_reported_as_a_missing_camera(self):
+        import numpy as np
+
+        transport = self._transport()
+        transport._request = lambda *a, **k: {"prediction": {}}  # type: ignore[assignment]
+        pixels = np.full((3, 4, 3), 9, dtype=np.uint8)
+        with self.assertRaisesRegex(ServoBridgeError, "missing camera frames"):
+            transport.act(
+                {"top": pixels, "left": np.empty((0, 0, 3), dtype=np.uint8), "right": pixels},
+                [0.0] * STATE_DIM,
+            )
 
 
 if __name__ == "__main__":
