@@ -7,7 +7,9 @@ Each class/function is independent; the launch script wires them together.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -15,7 +17,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence
+from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence
 
 import cv2
 import h5py
@@ -23,6 +25,7 @@ import numpy as np
 from PIL import Image
 
 from camera_client import CameraSubscriber
+from rollout_manifest import write_json_atomic
 
 # ``lerobot_convert`` (and its ``lerobot`` dependency) is imported lazily inside
 # ``convert_session_to_lerobot`` so that running rollouts does not require
@@ -42,8 +45,27 @@ def _save_png(image: np.ndarray, path: Path, compress_level: int) -> None:
     Image.fromarray(image).save(path, compress_level=compress_level)
 
 
+def _atomic_write_json(path: Path, value: Dict[str, Any]) -> None:
+    """Durably publish a small rollout lifecycle marker.
+
+    A separate offline exporter uses these markers, so it must never observe a
+    truncated JSON document while the control process is still alive.
+    """
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.partial")
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 class EvalRolloutSaver:
-    """Buffer one rollout's frames in RAM, then flush to PNG + HDF5 on disk.
+    """Record a rollout with bounded in-memory camera staging.
 
     Layout per rollout::
 
@@ -52,11 +74,24 @@ class EvalRolloutSaver:
         ├── right_rgb/{frame:06d}.png
         ├── front_rgb/{frame:06d}.png
         ├── episode.h5
+        ├── rollout.manifest.json # immutable launch/model/camera/CAN provenance
+        ├── rollout.rrd       # optional post-rollout Rerun export
         └── err.md          # only if write_err() is called
 
-    The HDF5 file holds the joint trajectory (state, next_state) and the
-    language instruction; the PNGs hold the per-frame RGB images. The DROID
-    layout converter (``load_droid_layout_data``) walks this structure.
+    The HDF5 file holds measured joint trajectories, the exact applied policy
+    targets, and policy-plan metadata; the PNGs hold the per-frame RGB images.
+    Numeric records remain compact in memory until their atomic HDF5 publish.
+    Camera frames are copied only into a fixed-size async writer queue and are
+    persisted during the rollout, rather than retaining every RGB frame until
+    shutdown. Consecutive reads of the V4L2 latest-frame cache are represented
+    by hard-linked PNG paths when possible, preserving the historical
+    per-control-step directory layout without recompressing or retaining six
+    copies of the same 5 Hz camera frame.
+
+    The extra action fields make it possible to diagnose a rollout after the
+    robot has stopped (including via the optional Rerun export) without adding
+    any visualization work to the control loop. The DROID layout converter
+    ignores the additional datasets.
     """
 
     CAMERA_OBS_TO_KEY = {
@@ -71,11 +106,23 @@ class EvalRolloutSaver:
         instruction: str,
         max_workers: int = 2,
         png_compress_level: int = 1,
+        rollout_manifest: Optional[Mapping[str, Any]] = None,
+        max_pending_image_tasks: Optional[int] = None,
     ) -> None:
         self.rollout_dir = Path(rollout_dir)
         self.instruction = instruction
         self.max_workers = max(1, int(max_workers))
         self.png_compress_level = max(0, min(9, int(png_compress_level)))
+        self.rollout_manifest = dict(rollout_manifest) if rollout_manifest is not None else None
+        if max_pending_image_tasks is None:
+            # Each pending unique RGB write owns one copied frame. Eight 640 x
+            # 360 RGB images are about 5.3 MiB, rather than multiple GiB for
+            # a long rollout. Links for repeated cached frames add no image
+            # array to the queue.
+            max_pending_image_tasks = max(4, self.max_workers * 4)
+        self.max_pending_image_tasks = int(max_pending_image_tasks)
+        if self.max_pending_image_tasks < 1:
+            raise ValueError("max_pending_image_tasks must be at least one")
 
         if self.rollout_dir.exists():
             raise FileExistsError(
@@ -84,16 +131,175 @@ class EvalRolloutSaver:
             )
         self.rollout_dir.mkdir(parents=True)
 
+        # Persist static provenance before the first motor command.  A later
+        # abnormal process exit can leave only a partial frame buffer, but it
+        # must never erase which model/config/camera/CAN setup produced it.
+        if self.rollout_manifest is not None:
+            write_json_atomic(self.rollout_dir / "rollout.manifest.json", self.rollout_manifest)
+
+        # This marker is deliberately written before any control steps.  If a
+        # process dies during final flush, the detached Rerun exporter can
+        # still create a camera-only, explicitly incomplete replay rather than
+        # silently leaving no .rrd at all.
+        started_marker: Dict[str, Any] = {
+            "schema_version": 1,
+            "instruction": self.instruction,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        if self.rollout_manifest is not None:
+            started_marker["manifest_file"] = "rollout.manifest.json"
+            reproducibility = self.rollout_manifest.get("reproducibility")
+            if isinstance(reproducibility, Mapping):
+                started_marker["rollout_seed"] = reproducibility.get("rollout_seed")
+        _atomic_write_json(
+            self.rollout_dir / "rollout.started.json",
+            started_marker,
+        )
+
+        # This contains only compact numeric telemetry. It intentionally never
+        # owns RGB arrays, so a 5,000-step rollout cannot accumulate a huge
+        # in-memory image buffer.
         self._buffer: List[Dict[str, Any]] = []
+        self._policy_action_chunks: List[Dict[str, Any]] = []
+        self._image_executor: Optional[concurrent.futures.ThreadPoolExecutor] = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_workers,
+                thread_name_prefix="yam_png_writer",
+            )
+        )
+        self._pending_image_futures: Deque[concurrent.futures.Future[Any]] = deque()
+        self._image_write_error: Optional[BaseException] = None
+        self._image_writer_closed = False
+        self._camera_frame_counts: Dict[str, int] = {}
+        # Hold only the latest source frame for each camera. V4L2Camera.read()
+        # returns the same ndarray between actual camera updates, allowing
+        # cheap hard links for those duplicate control ticks.
+        self._last_camera_frame: Dict[str, np.ndarray] = {}
+        self._last_camera_path: Dict[str, Path] = {}
+        self._last_camera_future: Dict[str, concurrent.futures.Future[Any]] = {}
 
     @property
     def num_steps(self) -> int:
         return len(self._buffer)
 
+    @property
+    def pending_image_tasks(self) -> int:
+        """Number of bounded asynchronous PNG/link jobs still retained."""
+        return len(self._pending_image_futures)
+
+    def _remember_image_error(self, exc: BaseException) -> None:
+        if self._image_write_error is None:
+            self._image_write_error = exc
+
+    def _consume_image_future(self, future: concurrent.futures.Future[Any]) -> None:
+        try:
+            future.result()
+        except BaseException as exc:  # noqa: BLE001 -- defer recorder failure to flush
+            self._remember_image_error(exc)
+
+    def _reap_completed_image_futures(self) -> None:
+        """Release finished writer jobs without blocking the control loop."""
+        while self._pending_image_futures and self._pending_image_futures[0].done():
+            self._consume_image_future(self._pending_image_futures.popleft())
+
+    def _wait_for_image_queue_capacity(self) -> None:
+        """Bound staged image arrays if disk compression falls behind.
+
+        Waiting happens only when the fixed queue is full. This is preferable
+        to silently growing RAM until the Jetson swaps or OOM-kills the control
+        process. Under the normal 5 Hz V4L2 cache, repeated frames become link
+        jobs and the small queue remains mostly empty.
+        """
+        self._reap_completed_image_futures()
+        while len(self._pending_image_futures) >= self.max_pending_image_tasks:
+            self._consume_image_future(self._pending_image_futures.popleft())
+            self._reap_completed_image_futures()
+
+    @staticmethod
+    def _link_png_after_source(source_future: concurrent.futures.Future[Any], source: Path, destination: Path) -> None:
+        """Publish a duplicate cached camera frame without recompressing RGB."""
+        source_future.result()
+        try:
+            os.link(source, destination)
+        except OSError:
+            # Hard links are expected on the local rollout filesystem. Keep a
+            # portable fallback for filesystems that disallow them.
+            shutil.copyfile(source, destination)
+
+    def _schedule_camera_frame(self, cam_key: str, step: int, image: Any) -> None:
+        """Persist one camera sample with a bounded async queue.
+
+        The caller does not retain ``image`` afterwards. A new physical frame
+        is copied exactly once for the writer; repeated latest-frame-cache
+        reads only retain file-path/future metadata and get a hard-linked path
+        for their control-step filename.
+        """
+        if self._image_writer_closed or self._image_write_error is not None:
+            return
+        executor = self._image_executor
+        if executor is None:
+            self._remember_image_error(RuntimeError("image writer is already closed"))
+            return
+
+        destination_dir = self.rollout_dir / cam_key
+        destination = destination_dir / f"{step:06d}.png"
+        try:
+            destination_dir.mkdir(exist_ok=True)
+            frame = np.ascontiguousarray(np.asarray(image))
+            if frame.ndim != 3 or frame.shape[-1] != 3:
+                raise ValueError(
+                    f"camera frame for {cam_key} must be HxWx3, got {frame.shape}"
+                )
+            self._wait_for_image_queue_capacity()
+
+            previous = self._last_camera_frame.get(cam_key)
+            if previous is frame:
+                source = self._last_camera_path[cam_key]
+                source_future = self._last_camera_future[cam_key]
+                future = executor.submit(
+                    self._link_png_after_source,
+                    source_future,
+                    source,
+                    destination,
+                )
+            else:
+                # A frame copy is intentionally made only after queue capacity
+                # is available. It is owned by at most one bounded writer job.
+                frame_copy = frame.copy()
+                future = executor.submit(
+                    _save_png,
+                    frame_copy,
+                    destination,
+                    self.png_compress_level,
+                )
+                self._last_camera_frame[cam_key] = frame
+            self._last_camera_path[cam_key] = destination
+            self._last_camera_future[cam_key] = future
+            self._pending_image_futures.append(future)
+            self._camera_frame_counts[cam_key] = self._camera_frame_counts.get(cam_key, 0) + 1
+        except BaseException as exc:  # noqa: BLE001 -- flush telemetry before surfacing camera failure
+            self._remember_image_error(exc)
+
+    def _finish_image_writes(self) -> None:
+        """Join writer jobs and surface their first failure after HDF5 publish."""
+        if not self._image_writer_closed:
+            while self._pending_image_futures:
+                self._consume_image_future(self._pending_image_futures.popleft())
+            if self._image_executor is not None:
+                self._image_executor.shutdown(wait=True)
+            self._image_executor = None
+            self._image_writer_closed = True
+        if self._image_write_error is not None:
+            raise self._image_write_error
+
     def add_step(
         self,
         obs_pre: Dict[str, Any],
         obs_post: Dict[str, Any],
+        action: Optional[np.ndarray] = None,
+        policy_chunk_index: Optional[int] = None,
+        policy_action_index: Optional[int] = None,
+        policy_inference_sec: Optional[float] = None,
     ) -> None:
         """Buffer one control-step record.
 
@@ -103,54 +309,168 @@ class EvalRolloutSaver:
         data-collection convention used in ``DataSaver``: the observed post-step
         joint positions, not the commanded action.
         """
+        step = self.num_steps
         record: Dict[str, Any] = {
             "state": np.asarray(obs_pre["joint_positions"], dtype=np.float32).copy(),
             "next_state": np.asarray(obs_post["joint_positions"], dtype=np.float32).copy(),
         }
+        if action is not None:
+            record["action"] = np.asarray(action, dtype=np.float32).copy()
+        if policy_chunk_index is not None:
+            record["policy_chunk_index"] = int(policy_chunk_index)
+        if policy_action_index is not None:
+            record["policy_action_index"] = int(policy_action_index)
+        if policy_inference_sec is not None:
+            record["policy_inference_sec"] = float(policy_inference_sec)
         for obs_key, cam_key in self.CAMERA_OBS_TO_KEY.items():
             img = obs_pre.get(obs_key)
             if img is not None:
-                record[cam_key] = np.ascontiguousarray(img).copy()
+                self._schedule_camera_frame(cam_key, step, img)
         self._buffer.append(record)
 
+    def add_policy_observation(self, step: int, obs: Mapping[str, Any]) -> None:
+        """Save the frames a PREFETCHED policy query consumed.
+
+        The control loop saves ``obs_pre`` for each step. A prefetched query
+        runs against a *later* capture taken on the prefetch thread, so the
+        step's saved PNG is not the image that produced that chunk. Replaying a
+        prefetched act from it compares the model against pixels it never saw --
+        exactly the kind of confound that has cost this project whole sessions.
+
+        Written under ``<camera>_policy/`` rather than overwriting the control
+        record: both captures are real and a diagnosis may need either.
+        """
+
+        for obs_key, cam_key in self.CAMERA_OBS_TO_KEY.items():
+            image = obs.get(obs_key)
+            if image is not None:
+                self._schedule_camera_frame(f"{cam_key}_policy", step, image)
+
+    def add_policy_action_chunk(
+        self,
+        start_step: int,
+        actions: np.ndarray,
+        inference_sec: float,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Persist a complete policy plan for post-rollout inspection.
+
+        ``actions`` is deliberately copied here: it is tiny compared with the
+        images and records the model's original plan before the rollout loop
+        starts consuming it. This method does no disk I/O or visualization and
+        therefore cannot affect control-loop timing.
+        """
+        actions = np.asarray(actions, dtype=np.float32)
+        if actions.ndim != 2 or len(actions) == 0:
+            raise ValueError(f"policy action chunk must be a nonempty 2D array, got {actions.shape}")
+        self._policy_action_chunks.append(
+            {
+                "start_step": int(start_step),
+                "actions": actions.copy(),
+                "inference_sec": float(inference_sec),
+                "metadata_json": (
+                    json.dumps(dict(metadata), sort_keys=True, default=str)
+                    if metadata is not None
+                    else None
+                ),
+            }
+        )
+
     def flush(self) -> None:
-        """Write buffered PNGs and ``episode.h5`` to ``rollout_dir``."""
+        """Publish telemetry, finish streamed camera writes, and mark completion.
+
+        ``episode.h5`` is the compact source of truth for a replay's state,
+        applied actions, and policy plans. It is deliberately atomically
+        published before waiting for any remaining background image writes. If
+        a camera write fails during that final drain, the detached Rerun
+        exporter can still create a telemetry-bearing replay from HDF5 rather
+        than falling back to a camera-only trace.
+        """
         if not self._buffer:
+            self._finish_image_writes()
             logger.warning("Empty buffer at %s; nothing to flush.", self.rollout_dir)
             return
 
-        cam_keys_present = sorted(
-            k for k in self.CAMERA_OBS_TO_KEY.values() if k in self._buffer[0]
-        )
-        for cam_key in cam_keys_present:
-            (self.rollout_dir / cam_key).mkdir(exist_ok=True)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as exe:
-            futures = []
-            for i, rec in enumerate(self._buffer):
-                for cam_key in cam_keys_present:
-                    img_path = self.rollout_dir / cam_key / f"{i:06d}.png"
-                    futures.append(
-                        exe.submit(_save_png, rec[cam_key], img_path, self.png_compress_level)
-                    )
-            for fut in futures:
-                fut.result()
-
+        # A camera can fail to deliver one frame at the end of a rollout. Do
+        # not let that one sparse stream prevent us from publishing all
+        # telemetry and the other camera artifacts (20260727_163712).
+        cam_keys_present = sorted(self._camera_frame_counts)
         states = np.stack([rec["state"] for rec in self._buffer]).astype(np.float32)
         next_states = np.stack([rec["next_state"] for rec in self._buffer]).astype(np.float32)
         cam_names_stripped = [k.replace("_rgb", "") for k in cam_keys_present]
 
         h5_path = self.rollout_dir / "episode.h5"
-        with h5py.File(h5_path, "w") as f:
-            f.attrs["language_instruction"] = self.instruction
-            f.attrs["num_steps"] = len(self._buffer)
-            f.attrs["camera_names"] = np.array(
-                cam_names_stripped, dtype=h5py.string_dtype()
-            )
-            f.create_dataset("state", data=states, compression="gzip", compression_opts=4)
-            f.create_dataset(
-                "next_state", data=next_states, compression="gzip", compression_opts=4
-            )
+        temporary_h5_path = self.rollout_dir / ".episode.h5.partial"
+        camera_frame_counts = {
+            cam_key: int(self._camera_frame_counts[cam_key])
+            for cam_key in cam_keys_present
+        }
+        try:
+            with h5py.File(temporary_h5_path, "w") as f:
+                f.attrs["language_instruction"] = self.instruction
+                f.attrs["num_steps"] = len(self._buffer)
+                if self.rollout_manifest is not None:
+                    f.attrs["rollout_manifest_file"] = "rollout.manifest.json"
+                f.attrs["camera_names"] = np.array(
+                    cam_names_stripped, dtype=h5py.string_dtype()
+                )
+                f.attrs["camera_frame_counts"] = json.dumps(camera_frame_counts, sort_keys=True)
+                f.create_dataset("state", data=states, compression="gzip", compression_opts=4)
+                f.create_dataset(
+                    "next_state", data=next_states, compression="gzip", compression_opts=4
+                )
+                for key, dtype in (
+                    ("action", np.float32),
+                    ("policy_chunk_index", np.int32),
+                    ("policy_action_index", np.int32),
+                    ("policy_inference_sec", np.float32),
+                ):
+                    if key in self._buffer[0]:
+                        f.create_dataset(
+                            key,
+                            data=np.asarray([rec[key] for rec in self._buffer], dtype=dtype),
+                            compression="gzip",
+                            compression_opts=4,
+                        )
+
+                if self._policy_action_chunks:
+                    chunks_group = f.create_group("policy_action_chunks")
+                    for chunk_idx, chunk in enumerate(self._policy_action_chunks):
+                        dataset = chunks_group.create_dataset(
+                            f"{chunk_idx:06d}",
+                            data=chunk["actions"],
+                            compression="gzip",
+                            compression_opts=4,
+                        )
+                        dataset.attrs["start_step"] = chunk["start_step"]
+                        dataset.attrs["inference_sec"] = chunk["inference_sec"]
+                        if chunk["metadata_json"] is not None:
+                            dataset.attrs["metadata_json"] = chunk["metadata_json"]
+            os.replace(temporary_h5_path, h5_path)
+        except Exception:
+            temporary_h5_path.unlink(missing_ok=True)
+            # Prevent writer threads from retaining frame copies after a
+            # telemetry failure, but preserve the original HDF5 exception.
+            try:
+                self._finish_image_writes()
+            except Exception:  # noqa: BLE001 -- original failure wins
+                logger.debug("Camera writer close after HDF5 failure failed", exc_info=True)
+            raise
+
+        # Camera jobs ran while the control loop progressed. Finish their
+        # bounded queue only after the numeric replay has been published.
+        self._finish_image_writes()
+
+        _atomic_write_json(
+            self.rollout_dir / "rollout.raw_complete.json",
+            {
+                "schema_version": 1,
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+                "num_steps": len(self._buffer),
+                "camera_frame_counts": camera_frame_counts,
+                "episode_file": h5_path.name,
+            },
+        )
 
         logger.info(
             "Saved rollout: %s (%d steps, cameras=%s)",

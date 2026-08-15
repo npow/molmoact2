@@ -1,0 +1,102 @@
+# Primary configuration for a native MolmoAct2-BimanualYAM rollout.
+#
+# State/action field order is fixed by the checkpoint:
+#   0:7   physical left arm / can_left
+#   7:14  physical right arm / can_right
+#
+# This config intentionally starts in ``shadow`` mode. It runs the full model
+# and records both action halves, but commands each arm back to its live
+# encoder feedback. Actual dual-arm motion requires explicit CLI opt-in:
+#   --active-arm-side both --execution-mode active_arm_hold
+model_arm_side: left
+
+sensors:
+  cameras:
+    left_camera:
+      # D405 serial 402323071792 (model ``left_cam``)
+      device_id: "/dev/yam-cameras/left"
+    front_camera:
+      # D435 serial 250423122040 (model ``top_cam``)
+      device_id: "/dev/yam-cameras/middle"
+    right_camera:
+      # D405 serial 402323071794 (model ``right_cam``)
+      device_id: "/dev/yam-cameras/right"
+
+robot:
+  _target_: gello_min.yam.YAMRobot
+  channel: can_left
+
+agent:
+  start_joints: null
+
+hz: 30
+# Full cloth-manipulation horizon. At 30 Hz this permits about 167 seconds of
+# commanded motion, plus policy-inference gaps; the recorder uses bounded
+# memory so long sessions do not retain every RGB frame in RAM.
+max_steps: 5000
+
+storage:
+  base_dir: "./yam_eval_runs"
+  task_directory: "red_lid_bimanual"
+  language_instruction: "Using both arms, coordinate to pick up the red lid, place it fully on top of the black box, release it, then move both arms away."
+  saver_max_workers: 2
+  png_compress_level: 1
+
+lerobot:
+  fps: 30
+  robot_type: "molmoact_bimanual_yam"
+  hf_repo_id: "local/yam_eval_session"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 2
+  image_writer_threads: 2
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+
+eval:
+  bimanual:
+    # Config may select both arms only for safe shadow execution. Active dual
+    # execution must be chosen explicitly on the command line.
+    active_arm_side: both
+    execution_mode: shadow
+    # Smooth bimanual target bound. This is still faster than the original
+    # 0.03 rad/tick cap, but keeps chunk-to-chunk policy reversals from
+    # feeling snappy on the real arms. Fields 6 and 13 are normalized gripper
+    # apertures.
+    both_arm_max_delta: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025]
+  live_view_enabled: false
+  # Return both arms to the encoder-measured pose at launcher startup only
+  # after a normal, completed session. Faults and Ctrl-C never autonomously
+  # move the arms during teardown. This is intentionally not a hard-coded
+  # neutral pose: start the script from the pose you want to restore.
+  return_to_rest_on_exit: true
+  return_to_rest_max_joint_step: 0.01
+  reproducibility:
+    seed: 20260727
+    deterministic_algorithms: false
+  camera_preflight:
+    enabled: true
+    timeout_sec: 10
+    min_warmup_sec: 2.0
+    required_consecutive_frames: 2
+    expected_shape: [360, 640, 3]
+    max_clipped_white_fraction: 0.15
+  rerun:
+    enabled: true
+    image_stride: 6
+    jpeg_quality: 75
+    action_chunk_size: 15
+  mode: local
+  local:
+    repo_id: "allenai/MolmoAct2-BimanualYAM"
+    device: "cuda:0"
+    dtype: "bfloat16"
+    num_steps: 10
+    # Thor supports this checkpoint's static CUDA-graph replay. After the
+    # one-time first-query capture, the measured policy latency falls below
+    # the 30-action (~1 s) execution window, avoiding the visible replan
+    # hold between action chunks.
+    enable_cuda_graph: true
+    warmup: true
+  camera_server:
+    enabled: false
