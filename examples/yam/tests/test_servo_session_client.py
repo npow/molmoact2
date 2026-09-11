@@ -1102,6 +1102,9 @@ class _StubTransport:
             "safety_signal": None,
         }
 
+    def begin_episode(self):
+        return True
+
     def close(self, success=True):
         self.closes.append(success)
 
@@ -1440,6 +1443,29 @@ def _install_fake_servo_direct(test, *, attach_hook=None, metadata=None,
         def __init__(self, **kwargs):
             self.grant = _FakeGrant()
             self.camera_inputs = {}
+            native_format = {
+                "height": 480,
+                "width": 640,
+                "channels": 3,
+                "dtype": "uint8",
+                "layout": "hwc",
+                "color_space": "rgb",
+                "color_range": "full",
+                "value_range": {"minimum": 0.0, "maximum": 255.0},
+            }
+            self.observation_route = SimpleNamespace(
+                camera_ids=("top", "left", "right"),
+                by_camera_id={
+                    name: SimpleNamespace(
+                        sensor={
+                            "camera_id": name,
+                            "native_format": native_format,
+                            "capture_rate_hz": 15.0,
+                        }
+                    )
+                    for name in ("top", "left", "right")
+                },
+            )
             self.kwargs = kwargs
             self.acts = []
 
@@ -1561,7 +1587,7 @@ class ServoDirectHostOpenTests(unittest.TestCase):
         self.assertEqual(identity["session_id"], "actsession_fake_1")
         self.assertEqual(identity["generation_id"], "gen_test_1")
         self.assertEqual(identity["deployment_id"], "dep_fake")
-        self.assertEqual(identity["observation_encoding"], "jpeg")
+        self.assertEqual(identity["observation_encoding"], "h264")
 
     def test_open_publishes_the_endpoint_dimensions_and_horizon(self):
         metadata = {
@@ -1577,6 +1603,15 @@ class ServoDirectHostOpenTests(unittest.TestCase):
         self.assertEqual(identity["state_dim"], ARM_DIM)
         self.assertEqual(identity["action_dim"], ARM_DIM)
         self.assertEqual(identity["action_horizon"], 15)
+
+    def test_open_publishes_signed_native_camera_sources_separately_from_model_fit(self):
+        _install_fake_servo_direct(self)
+        identity = ServoDirectHost(grant=self.grant).open()
+
+        self.assertEqual(identity["camera_inputs"], {})
+        self.assertEqual(identity["camera_sources"]["top"]["native_format"]["width"], 640)
+        self.assertEqual(identity["camera_sources"]["top"]["native_format"]["height"], 480)
+        self.assertEqual(identity["camera_sources"]["top"]["capture_rate_hz"], 15.0)
 
     def test_a_stale_grant_fails_at_open_not_at_act(self):
         state = _install_fake_servo_direct(
@@ -1627,7 +1662,9 @@ class ServoDirectHostOpenTests(unittest.TestCase):
 
     def test_a_crf_without_the_codec_wire_is_refused(self):
         with self.assertRaisesRegex(ServoBridgeError, "h264_crf only applies"):
-            ServoDirectHost(grant=self.grant, h264_crf=27)
+            ServoDirectHost(
+                grant=self.grant, observation_encoding="jpeg", h264_crf=27
+            )
 
     def test_a_generation_switch_under_a_direct_session_is_refused(self):
         # Populating generation_id at open is what arms the inherited fence
@@ -1694,7 +1731,7 @@ class MolmoActServoWireTests(unittest.TestCase):
         return captured, _act
 
     def test_the_jpeg_wire_still_mints_jpeg_bytes(self):
-        policy = self._policy()
+        policy = self._policy(observation_encoding="jpeg")
         prepared = policy.prepare_input(self._observation(), "pick up the red lid")
         captured = {}
         with unittest.mock.patch.object(

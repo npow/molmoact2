@@ -467,7 +467,7 @@ class ServoSessionTransport:
         act_timeout_sec: float = 120.0,
         logger: Optional[logging.Logger] = None,
         bridge_env: Optional[Dict[str, str]] = None,
-        observation_encoding: str = "jpeg",
+        observation_encoding: Optional[str] = None,
         h264_crf: Optional[int] = None,
     ):
         # Cold starts documented for this deployment family run 26s-550s
@@ -479,6 +479,7 @@ class ServoSessionTransport:
         if act_timeout_sec <= 0:
             raise ValueError("act_timeout_sec must be positive")
         self.bridge_env = dict(bridge_env or {})
+        observation_encoding = observation_encoding or ("h264" if grant else "jpeg")
         if observation_encoding not in OBSERVATION_ENCODINGS:
             raise ServoBridgeError(
                 f"observation_encoding must be one of {list(OBSERVATION_ENCODINGS)}, "
@@ -871,7 +872,7 @@ class MolmoActServo(PolicyBase):
         jpeg_quality: int = 85,
         image_size: Optional[int] = None,
         image_fit: str = "pad",
-        observation_encoding: str = "jpeg",
+        observation_encoding: Optional[str] = None,
         h264_crf: Optional[int] = None,
         seed: Optional[int] = None,
         single_arm_side: Optional[str] = None,
@@ -896,7 +897,9 @@ class MolmoActServo(PolicyBase):
         self._endpoint_single_arm_side: Optional[str] = None
         self.jpeg_quality = int(jpeg_quality)
         self.image_size = int(image_size) if image_size is not None else None
-        self.observation_encoding = str(observation_encoding)
+        self.observation_encoding = str(
+            observation_encoding or ("h264" if grant else "jpeg")
+        )
         self.h264_crf = int(h264_crf) if h264_crf is not None else None
         self.action_horizon = ACTION_HORIZON
         # Seeding mirrors MolmoActLocal exactly -- same RolloutSeedPlan, same

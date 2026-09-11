@@ -1062,5 +1062,59 @@ robot:
         self.assertEqual(primary_robot.closed, 1)
         self.assertEqual([camera.closed for camera in cameras], [1, 1, 1])
 
+    def test_v4l2_capture_uses_servo_native_camera_contract(self):
+        cameras = [_ClosableCamera(), _ClosableCamera(), _ClosableCamera()]
+        source = {
+            "native_format": {
+                "width": 640,
+                "height": 480,
+                "channels": 3,
+                "dtype": "uint8",
+                "layout": "hwc",
+                "color_space": "rgb",
+            },
+            "capture_rate_hz": 15.0,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            left_cfg, right_cfg = self._write_configs(Path(temp_dir))
+            args = SimpleNamespace(
+                config_path=str(left_cfg), right_config_path=str(right_cfg)
+            )
+            with (
+                patch.object(
+                    launcher, "V4L2Camera", side_effect=cameras
+                ) as camera_constructor,
+                patch.object(
+                    launcher, "wait_for_camera_visual_preflight"
+                ) as preflight,
+                patch.object(
+                    launcher,
+                    "instantiate_from_dict",
+                    side_effect=RuntimeError("stop before motor open"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop before motor open"):
+                    launcher._build_env(
+                        args,
+                        camera_sources={
+                            "top": source,
+                            "left": source,
+                            "right": source,
+                        },
+                    )
+
+        self.assertEqual(camera_constructor.call_count, 3)
+        for call in camera_constructor.call_args_list:
+            self.assertEqual(call.kwargs, {"width": 640, "height": 480, "fps": 15})
+        self.assertEqual(
+            preflight.call_args.kwargs["expected_shapes"],
+            {
+                "left_camera": (480, 640, 3),
+                "front_camera": (480, 640, 3),
+                "right_camera": (480, 640, 3),
+            },
+        )
+        self.assertEqual([camera.closed for camera in cameras], [1, 1, 1])
+
 if __name__ == "__main__":
     unittest.main()

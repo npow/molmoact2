@@ -70,8 +70,9 @@ SDK_CREDENTIAL_SCHEMA = "servo.sdk-credentials.v1"
 #: official ``servo`` package, used when the robot runtime cannot.
 SERVO_PYTHON_ENV = "SERVO_PYTHON"
 
-#: Observation wires an action session can negotiate. ``jpeg`` is the default
-#: and the fallback; ``h264`` is the codec wire, available only on a direct
+#: Observation wires an action session can negotiate. ``h264`` is the direct
+#: endpoint default; ``jpeg`` remains the managed-session compatibility wire.
+#: H.264 is available only on a direct
 #: (``servo serve`` grant) session because the encoder is owned by that
 #: session's transport.
 OBSERVATION_ENCODINGS: Tuple[str, ...] = ("jpeg", "h264")
@@ -579,7 +580,7 @@ class ServoDirectHost(ServoSessionHost):
         grant: str,
         instruction: Optional[str] = None,
         timeout_sec: Optional[float] = 600.0,
-        observation_encoding: str = "jpeg",
+        observation_encoding: str = "h264",
         h264_crf: Optional[int] = None,
     ):
         # Deliberately NOT calling super().__init__: this host has no
@@ -671,6 +672,10 @@ class ServoDirectHost(ServoSessionHost):
             "base_url": getattr(policy.grant, "endpoint_url", None),
             "cameras": sorted(dict(getattr(policy, "camera_inputs", None) or {})),
             "camera_inputs": dict(getattr(policy, "camera_inputs", None) or {}),
+            # ``camera_inputs`` is the model-side fit (224x224 here), not the
+            # local hardware source.  Keep the signed native declarations so
+            # the parent can configure V4L2 before enabling either arm.
+            "camera_sources": _camera_sources(policy),
             "observation_encoding": self.observation_encoding,
             "h264_crf": self.h264_crf,
             "control_profile": dict(getattr(policy.grant, "control_profile", None) or {}),
@@ -746,6 +751,18 @@ class ServoDirectHost(ServoSessionHost):
             pass
 
 
+def _camera_sources(policy: Any) -> Dict[str, Any]:
+    """Project signed native camera declarations from a direct policy route."""
+    route = getattr(policy, "observation_route", None)
+    if route is None:
+        return {}
+    sources: Dict[str, Any] = {}
+    for camera_id in tuple(getattr(route, "camera_ids", ()) or ()):
+        resolved = route.by_camera_id[camera_id]
+        sources[str(camera_id)] = _jsonable(resolved.sensor)
+    return sources
+
+
 def _jsonable(value: Any) -> Any:
     """Reduce SDK payloads to JSON the 3.11 parent can read back verbatim.
 
@@ -777,7 +794,9 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
     if op == "open":
         if host is not None:
             raise ServoBridgeError("a Servo session is already open on this bridge")
-        observation_encoding = header.get("observation_encoding") or "jpeg"
+        observation_encoding = header.get("observation_encoding") or (
+            "h264" if header.get("grant") else "jpeg"
+        )
         if header.get("grant"):
             host = ServoDirectHost(
                 grant=header["grant"],

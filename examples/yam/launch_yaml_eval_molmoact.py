@@ -501,8 +501,9 @@ class Args:
 
     observation_encoding: Optional[Literal["jpeg", "h264"]] = None
     """``direct`` mode only: the observation wire the action session negotiates.
-    ``jpeg`` (default) mints one JPEG per camera on this machine and is the
-    comparison arm; ``h264`` sends the same pixels and lets the session's own
+    ``h264`` is the self-hosted direct default and sends fitted pixels through
+    the session-owned encoder; ``jpeg`` is the explicit comparison/fallback and
+    mints one JPEG per camera on this machine. H.264 lets the session's own
     transport encode them into a per-camera stateful stream -- measured ~21 KB
     per act against ~88 KB on jpeg. Overrides eval.direct.observation_encoding."""
 
@@ -603,6 +604,7 @@ def wait_for_camera_visual_preflight(
     timeout_sec: float = 10.0,
     required_consecutive_frames: int = 2,
     expected_shape: Tuple[int, int, int] = (360, 640, 3),
+    expected_shapes: Optional[Mapping[str, Tuple[int, int, int]]] = None,
     max_clipped_white_fraction: float = 0.15,
     min_mean_luma: float = 15.0,
     max_mean_luma: float = 240.0,
@@ -635,9 +637,15 @@ def wait_for_camera_visual_preflight(
             try:
                 rgb, _ = camera.read()
                 image = np.asarray(rgb)
-                if image.shape != expected_shape or image.dtype != np.uint8:
+                camera_expected_shape = (
+                    tuple(expected_shapes[name])
+                    if expected_shapes is not None and name in expected_shapes
+                    else expected_shape
+                )
+                if image.shape != camera_expected_shape or image.dtype != np.uint8:
                     raise RuntimeError(
-                        f"expected uint8 {expected_shape}, got {image.dtype} {image.shape}"
+                        f"expected uint8 {camera_expected_shape}, "
+                        f"got {image.dtype} {image.shape}"
                     )
                 luma = float(
                     np.mean(
@@ -774,6 +782,8 @@ def _reset_can_channel(channel: str) -> None:
 
 def _build_env(
     args: Args,
+    *,
+    camera_sources: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Tuple[RobotEnv, Dict[str, Any], Optional[Dict[str, Any]], bool]:
     """Build cameras + robot(s) + RobotEnv from the launch configs.
 
@@ -826,13 +836,57 @@ def _build_env(
     else:
         camera_cfg = left_cfg["sensors"]["cameras"]
         camera_names = ("left_camera", "front_camera", "right_camera")
+        sensor_ids = {
+            "left_camera": "left",
+            "front_camera": "top",
+            "right_camera": "right",
+        }
         device_ids = [str(camera_cfg[name]["device_id"]) for name in camera_names]
+        capture_shapes: Dict[str, Tuple[int, int, int]] = {}
         if all(device.startswith("/dev/") for device in device_ids):
-            camera_dict = {
-                name: (_DisabledCamera() if not bool(camera_cfg[name].get("enabled", True)) else V4L2Camera(device, fps=int(camera_cfg[name].get("fps", 5))))
-                for name, device in zip(camera_names, device_ids)
-            }
-            print(f"Using Jetson V4L2 RGB cameras: {device_ids} (disabled={[n for n in camera_names if not bool(camera_cfg[n].get('enabled', True))]})")
+            camera_dict = {}
+            capture_descriptions = []
+            for name, device in zip(camera_names, device_ids):
+                cfg = camera_cfg[name]
+                if not bool(cfg.get("enabled", True)):
+                    camera_dict[name] = _DisabledCamera()
+                    capture_descriptions.append(f"{name}=disabled")
+                    continue
+                source = dict((camera_sources or {}).get(sensor_ids[name]) or {})
+                native = dict(source.get("native_format") or {})
+                width = int(native.get("width", cfg.get("width", 640)))
+                height = int(native.get("height", cfg.get("height", 360)))
+                channels = int(native.get("channels", 3))
+                dtype = str(native.get("dtype", "uint8"))
+                layout = str(native.get("layout", "hwc"))
+                color_space = str(native.get("color_space", "rgb"))
+                if (
+                    width <= 0
+                    or height <= 0
+                    or channels != 3
+                    or dtype != "uint8"
+                    or layout != "hwc"
+                    or color_space != "rgb"
+                ):
+                    raise RuntimeError(
+                        f"Servo camera source {sensor_ids[name]!r} is incompatible "
+                        f"with the YAM V4L2 RGB capture path: {native}"
+                    )
+                fps = int(cfg.get("fps", source.get("capture_rate_hz", 5)))
+                camera_dict[name] = V4L2Camera(
+                    device,
+                    width=width,
+                    height=height,
+                    fps=fps,
+                )
+                capture_shapes[name] = (height, width, channels)
+                capture_descriptions.append(
+                    f"{name}={device} {width}x{height}@{fps}"
+                )
+            print(
+                "Using Jetson V4L2 RGB cameras: "
+                + "; ".join(capture_descriptions)
+            )
         else:
             ids = get_device_ids()
             print(f"Found {len(ids)} camera devices: {ids}")
@@ -852,6 +906,7 @@ def _build_env(
                         preflight_cfg.get("required_consecutive_frames", 2)
                     ),
                     expected_shape=tuple(preflight_cfg.get("expected_shape", (360, 640, 3))),
+                    expected_shapes=capture_shapes or None,
                     max_clipped_white_fraction=float(
                         preflight_cfg.get("max_clipped_white_fraction", 0.15)
                     ),
@@ -2191,7 +2246,10 @@ def main() -> None:
         both_arm_max_delta=bimanual_cfg.get("both_arm_max_delta"),
     )
 
-    env, left_cfg, right_cfg, bimanual = _build_env(args)
+    env, left_cfg, right_cfg, bimanual = _build_env(
+        args,
+        camera_sources=identity.get("camera_sources") or None,
+    )
 
     global _env, _bimanual, _left_cfg, _right_cfg, _bimanual_execution_mask
     _env = env
