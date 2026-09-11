@@ -1243,6 +1243,26 @@ class MolmoActServoTests(unittest.TestCase):
 
         self.assertEqual(policy._transport.closes, [False])
 
+    def test_active_arm_hint_does_not_slice_a_native_bimanual_endpoint(self):
+        policy = self._policy(single_arm_side="left")
+        policy._transport.identity.update(
+            {
+                "state_dim": STATE_DIM,
+                "action_dim": STATE_DIM,
+                "action_horizon": ACTION_HORIZON,
+                "control_profile": {"exec_steps": ACTION_HORIZON, "fps": 30.0},
+            }
+        )
+
+        policy.open()
+        prepared = policy.prepare_input(self._observation(), "pick up the red cap")
+        result = policy.inference(prepared)
+
+        self.assertIsNone(policy._endpoint_single_arm_side)
+        self.assertEqual(prepared["state"].shape, (STATE_DIM,))
+        self.assertEqual(result["actions"].shape, (ACTION_HORIZON, STATE_DIM))
+        self.assertEqual(policy._transport.calls[0]["state"], list(map(float, range(STATE_DIM))))
+
     def test_cameras_map_onto_the_servo_keys(self):
         from PIL import Image
 

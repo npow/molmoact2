@@ -948,6 +948,33 @@ class _ClosableCamera:
         self.closed += 1
 
 
+class RuntimeConfigOverrideTests(unittest.TestCase):
+    def test_selected_arm_executes_by_default(self):
+        self.assertEqual(
+            launcher.Args(config_path="left.yaml").execution_mode,
+            "active_arm_hold",
+        )
+
+    def test_timing_overrides_reuse_existing_hardware_config(self):
+        config = {
+            "hz": 30,
+            "max_steps": 5000,
+            "lerobot": {"fps": 30},
+            "eval": {"rerun": {"image_stride": 6}},
+        }
+
+        launcher._apply_runtime_config_overrides(
+            config,
+            control_hz=15,
+            max_steps=600,
+        )
+
+        self.assertEqual(config["hz"], 15)
+        self.assertEqual(config["max_steps"], 600)
+        self.assertEqual(config["lerobot"]["fps"], 15)
+        self.assertEqual(config["eval"]["rerun"]["image_stride"], 3)
+
+
 class RuntimeCleanupTests(unittest.TestCase):
     def test_env_close_releases_robot_and_every_camera(self):
         robot = _ClosableRobot()

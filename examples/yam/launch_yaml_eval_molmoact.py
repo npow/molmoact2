@@ -475,8 +475,14 @@ class Args:
     active_arm_side: Optional[Literal["left", "right", "both"]] = None
     """Bimanual mode only: execute the selected policy half, or both 7-DoF halves."""
 
-    execution_mode: Optional[Literal["active_arm_hold", "shadow"]] = None
-    """Bimanual mode only: ``shadow`` holds both arms; ``active_arm_hold`` executes active halves."""
+    execution_mode: Literal["active_arm_hold", "shadow"] = "active_arm_hold"
+    """Bimanual mode: execute the selected arm by default; pass ``shadow`` explicitly to hold."""
+
+    control_hz: Optional[int] = None
+    """Override the robot and recorded-dataset cadence without copying a hardware YAML."""
+
+    max_steps: Optional[int] = None
+    """Override the rollout step budget without copying a hardware YAML."""
 
     molmoact_server: Optional[str] = None
     """``http`` mode only: override eval.molmoact_server for the self-hosted server."""
@@ -558,6 +564,32 @@ def has_explicit_both_arm_cli_opt_in(args: Args) -> bool:
         and args.execution_mode == "active_arm_hold"
         and args.confirm_bimanual_clearance
     )
+
+
+def _apply_runtime_config_overrides(
+    config: Dict[str, Any],
+    *,
+    control_hz: Optional[int],
+    max_steps: Optional[int],
+) -> None:
+    """Apply per-run timing limits while leaving the hardware YAML reusable."""
+    if control_hz is not None:
+        if control_hz < 1:
+            raise ValueError("control_hz must be positive")
+        previous_hz = float(config.get("hz", control_hz))
+        config["hz"] = int(control_hz)
+        lerobot = config.setdefault("lerobot", {})
+        lerobot["fps"] = int(control_hz)
+        rerun = (config.get("eval") or {}).get("rerun") or {}
+        if previous_hz > 0 and rerun.get("image_stride") is not None:
+            rerun["image_stride"] = max(
+                1,
+                round(float(rerun["image_stride"]) * control_hz / previous_hz),
+            )
+    if max_steps is not None:
+        if max_steps < 1:
+            raise ValueError("max_steps must be positive")
+        config["max_steps"] = int(max_steps)
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +790,17 @@ def _build_env(
         OmegaConf.to_container(OmegaConf.load(args.right_config_path), resolve=True)
         if bimanual else None
     )
+    _apply_runtime_config_overrides(
+        left_cfg,
+        control_hz=getattr(args, "control_hz", None),
+        max_steps=getattr(args, "max_steps", None),
+    )
+    if right_cfg is not None:
+        _apply_runtime_config_overrides(
+            right_cfg,
+            control_hz=getattr(args, "control_hz", None),
+            max_steps=getattr(args, "max_steps", None),
+        )
 
     cam_server_cfg = ((left_cfg.get("eval") or {}).get("camera_server") or {})
     use_server = bool(cam_server_cfg.get("enabled", False))
@@ -1988,6 +2031,11 @@ def main() -> None:
     # model may take seconds to load; leaving an active CAN control loop running
     # during that window makes intermittent motor replies much more likely.
     raw_left_cfg = OmegaConf.to_container(OmegaConf.load(args.config_path), resolve=True)
+    _apply_runtime_config_overrides(
+        raw_left_cfg,
+        control_hz=args.control_hz,
+        max_steps=args.max_steps,
+    )
     eval_cfg = raw_left_cfg.get("eval") or {}
     reproducibility_cfg = eval_cfg.get("reproducibility") or {}
     seed_plan = RolloutSeedPlan(
@@ -2014,6 +2062,12 @@ def main() -> None:
         if args.right_config_path is not None
         else None
     )
+    if raw_right_cfg is not None:
+        _apply_runtime_config_overrides(
+            raw_right_cfg,
+            control_hz=args.control_hz,
+            max_steps=args.max_steps,
+        )
     bimanual_requested = raw_right_cfg is not None
     bimanual_cfg = eval_cfg.get("bimanual") or {}
     active_arm_side = (
@@ -2091,6 +2145,14 @@ def main() -> None:
                 "direct mode needs a `servo serve` grant file: pass "
                 "--servo-grant or set eval.direct.grant"
             )
+        if (
+            direct_options.get("single_arm_side") is None
+            and execution_mask.active_arm_side in {"left", "right"}
+        ):
+            # A 7-D endpoint still needs one physical placement decision, but
+            # the execution mask already carries it. Reuse that choice instead
+            # of requiring a duplicate task-specific YAML field.
+            direct_options["single_arm_side"] = execution_mask.active_arm_side
         policy = MolmoActServo(**direct_options)
     elif mode == "http":
         policy = MolmoActHTTP(

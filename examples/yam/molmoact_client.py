@@ -893,6 +893,7 @@ class MolmoActServo(PolicyBase):
         if single_arm_side not in (None, "left", "right"):
             raise ValueError("single_arm_side must be 'left', 'right', or None")
         self.single_arm_side = single_arm_side
+        self._endpoint_single_arm_side: Optional[str] = None
         self.jpeg_quality = int(jpeg_quality)
         self.image_size = int(image_size) if image_size is not None else None
         self.observation_encoding = str(observation_encoding)
@@ -960,21 +961,41 @@ class MolmoActServo(PolicyBase):
     def open(self) -> Dict[str, Any]:
         """Open the session up front so credential/deployment errors surface early."""
         identity = self._transport.open()
-        expected_dim = ARM_DIM if self.single_arm_side else STATE_DIM
-        for field in ("state_dim", "action_dim"):
-            advertised = identity.get(field)
-            if self.single_arm_side and advertised is None:
+        advertised_state = identity.get("state_dim")
+        advertised_action = identity.get("action_dim")
+        if advertised_state is None and advertised_action is None:
+            if self.single_arm_side:
                 self._transport.close(success=False)
                 raise ServoBridgeError(
-                    f"Servo endpoint did not advertise {field}; refusing to guess a "
-                    f"7-D contract for single_arm_side={self.single_arm_side!r}"
+                    "Servo endpoint did not advertise state/action dimensions; "
+                    "refusing to guess a 7-D contract"
                 )
-            if advertised is not None and int(advertised) != expected_dim:
+        elif advertised_state is None or advertised_action is None:
+            self._transport.close(success=False)
+            raise ServoBridgeError(
+                "Servo endpoint must advertise state_dim and action_dim together"
+            )
+        else:
+            state_dim = int(advertised_state)
+            action_dim = int(advertised_action)
+            if state_dim != action_dim or state_dim not in (ARM_DIM, STATE_DIM):
                 self._transport.close(success=False)
                 raise ServoBridgeError(
-                    f"Servo endpoint advertises {field}={advertised}, but this client "
-                    f"expects {expected_dim} for single_arm_side={self.single_arm_side!r}"
+                    "Servo endpoint has unsupported state/action dimensions: "
+                    f"state_dim={state_dim}, action_dim={action_dim}"
                 )
+            if state_dim == ARM_DIM:
+                if self.single_arm_side is None:
+                    self._transport.close(success=False)
+                    raise ServoBridgeError(
+                        "7-D Servo endpoint needs a left/right physical arm placement"
+                    )
+                self._endpoint_single_arm_side = self.single_arm_side
+            else:
+                # The launcher's active-arm selection is also the placement
+                # hint for a 7-D endpoint. A native 14-D endpoint ignores the
+                # hint and keeps both policy halves intact.
+                self._endpoint_single_arm_side = None
         profile_horizon = (identity.get("control_profile") or {}).get("exec_steps")
         advertised_horizon = identity.get("action_horizon")
         if (
@@ -1061,7 +1082,7 @@ class MolmoActServo(PolicyBase):
             # here with a seed requested is a run whose seed was honoured.
             "deterministic_generator": self._seed_proven,
             "seed_requested": self._rollout_seed is not None,
-            "single_arm_side": self.single_arm_side,
+            "single_arm_side": self._endpoint_single_arm_side,
         }
 
     def prepare_input(self, obs: Dict[str, Any], instruction: str) -> Dict[str, Any]:
@@ -1070,9 +1091,9 @@ class MolmoActServo(PolicyBase):
         bimanual_state = require_bimanual_state(
             obs["joint_positions"], source="MolmoActServo"
         )
-        if self.single_arm_side == "left":
+        if self._endpoint_single_arm_side == "left":
             endpoint_state = bimanual_state[:ARM_DIM].copy()
-        elif self.single_arm_side == "right":
+        elif self._endpoint_single_arm_side == "right":
             endpoint_state = bimanual_state[ARM_DIM:].copy()
         else:
             endpoint_state = bimanual_state
@@ -1107,7 +1128,7 @@ class MolmoActServo(PolicyBase):
         else:
             images = {key: self._raw_pixels(value) for key, value in sources.items()}
         encode_ms = (time.perf_counter() - encode_started) * 1000.0
-        endpoint_dim = ARM_DIM if self.single_arm_side else STATE_DIM
+        endpoint_dim = ARM_DIM if self._endpoint_single_arm_side else STATE_DIM
         state = np.asarray(input_dict["state"], dtype=np.float32).reshape(-1)
         if state.shape != (endpoint_dim,):
             raise ValueError(
@@ -1141,14 +1162,14 @@ class MolmoActServo(PolicyBase):
                 f"Servo returned a malformed action chunk: shape {endpoint_actions.shape}, "
                 f"expected ({expected_horizon}, {endpoint_dim})"
             )
-        if self.single_arm_side:
+        if self._endpoint_single_arm_side:
             bimanual_state = require_bimanual_state(
                 input_dict["bimanual_state"], source="MolmoActServo execution state"
             )
             actions = np.repeat(bimanual_state[None, :], expected_horizon, axis=0)
             active = (
                 slice(0, ARM_DIM)
-                if self.single_arm_side == "left"
+                if self._endpoint_single_arm_side == "left"
                 else slice(ARM_DIM, STATE_DIM)
             )
             actions[:, active] = endpoint_actions
