@@ -140,6 +140,16 @@ Responses are validated client-side: a 30x14 chunk, action space
 `joint_position`, decoded, finite, and served by the same binding generation the
 session opened against.
 
+The full pi0.5 red-cap checkpoint is instead a native **15x7** single-arm YAM
+policy. `configs/pi05_red_cap_left_physical.yaml` sets
+`eval.direct.single_arm_side: left`: the client selects the left seven values
+from live 14-D feedback, sends only those seven, and reinserts each returned
+7-D action into the left half of a 14-D executor command. The right half is
+filled from the same live feedback and the existing active-arm hold mask owns
+the final actuation gate. All three cameras are still required. Gripper values
+remain native YAM values (`0 = closed`, `1 = open`); the client performs no
+second inversion.
+
 Measured three-camera payload from this rig:
 
 | Encoding | Bytes for all three frames | Encode time | Notes |
@@ -174,6 +184,24 @@ examples/yam/launch_yaml_eval_molmoact.py \
 `--servo-python` can be dropped if `SERVO_PYTHON` is exported or the launcher
 already runs on a 3.12 interpreter that has `servo-client`.
 `--servo-credentials` can be dropped to accept the default path above.
+
+**Launch the self-hosted full pi0.5 red-cap endpoint (shadow first):**
+
+```bash
+SSL_CERT_FILE=/home/npow/code/gello_software/artifacts/servo-vast/full-7500-vast.crt \
+PYTHONPATH=examples/yam:/home/npow/code/i2rt \
+/home/npow/molmoact2-venv/bin/python \
+examples/yam/launch_yaml_eval_molmoact.py \
+  --config-path examples/yam/configs/pi05_red_cap_left_physical.yaml \
+  --right-config-path examples/yam/configs/pi05_red_cap_right_hold.yaml \
+  --num-rollouts 1
+```
+
+The committed default is `execution_mode: shadow`, so neither arm follows the
+policy during the first end-to-end check. After verifying the endpoint banner,
+camera views, and predicted chunk, add `--execution-mode active_arm_hold` to
+enable only the left arm. Keep the right arm connected: its real feedback is
+used for the held half of the bimanual executor rather than fabricating state.
 
 **State of play (2026-08-02).** The client side is complete, but a live run
 also needs the *remote* Servo control plane to expose a managed MolmoAct2

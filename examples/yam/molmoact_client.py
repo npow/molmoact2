@@ -103,6 +103,7 @@ DEFAULT_SERVER = "http://127.0.0.1:8202"
 REPO_ID = "allenai/MolmoAct2-BimanualYAM"
 NORM_TAG = "yam_dual_molmoact2"
 DEFAULT_NUM_STEPS = 10
+ARM_DIM = 7
 
 # ``STATE_DIM`` / ``ACTION_HORIZON`` / ``CAMERA_KEYS`` are the BimanualYAM
 # contract facts and live in ``servo_session_bridge`` so the robot process and
@@ -846,12 +847,15 @@ class ServoSessionTransport:
 
 
 class MolmoActServo(PolicyBase):
-    """Hosted MolmoAct2-BimanualYAM over one official Servo action session.
+    """A Servo-hosted policy over one official action session.
 
     The session opens on the first query and is reused for every action chunk
     of the run: the control plane issues one signed offer/lease, and each
     observation rides the SDK's protobuf action-session transport with the
-    three camera frames as JPEG bytes — no base64, no custom endpoint.
+    three camera frames as JPEG bytes — no base64, no custom endpoint. Native
+    7-D single-arm endpoints can be adapted to the launcher's safe 14-D YAM
+    executor by naming ``single_arm_side``; no joint or gripper values are
+    otherwise transformed.
     """
 
     def __init__(
@@ -870,6 +874,7 @@ class MolmoActServo(PolicyBase):
         observation_encoding: str = "jpeg",
         h264_crf: Optional[int] = None,
         seed: Optional[int] = None,
+        single_arm_side: Optional[str] = None,
     ):
         self.logger = get_molmoact_logger()
         if image_fit not in ("pad", "stretch"):
@@ -885,6 +890,9 @@ class MolmoActServo(PolicyBase):
             raise ValueError("jpeg_quality must be between 1 and 100")
         if image_size is not None and image_size <= 0:
             raise ValueError("image_size must be positive or None")
+        if single_arm_side not in (None, "left", "right"):
+            raise ValueError("single_arm_side must be 'left', 'right', or None")
+        self.single_arm_side = single_arm_side
         self.jpeg_quality = int(jpeg_quality)
         self.image_size = int(image_size) if image_size is not None else None
         self.observation_encoding = str(observation_encoding)
@@ -926,12 +934,61 @@ class MolmoActServo(PolicyBase):
         """Control-plane identity of the open session (empty until it opens)."""
         return dict(self._transport.identity)
 
+    def _expected_action_horizon(self) -> int:
+        """The served model's own action horizon, not this file's default.
+
+        Checkpoints in this family do not all share one horizon (e.g. the
+        30-row lerobot-exported pi0.5 checkpoints vs. a 16-row raw JAX/openpi
+        one) -- the grant's control_profile.exec_steps already carries the
+        served model's real chunk length once the session is open, so read
+        it instead of trusting the constructor-time ACTION_HORIZON default.
+        Mirrors ``ServoSessionHost._expected_action_horizon`` in
+        servo_session_bridge.py, which validates the same field on the far
+        side of the bridge subprocess -- this is the second, independent
+        copy of that check, in this process, and must resolve the same way.
+        """
+        control_profile = self.identity.get("control_profile") or {}
+        exec_steps = control_profile.get("exec_steps")
+        advertised = self.identity.get("action_horizon")
+        return int(exec_steps or advertised or self.action_horizon)
+
     def get_action_horizon(self) -> int:
+        if self.identity:
+            return self._expected_action_horizon()
         return self.action_horizon
 
     def open(self) -> Dict[str, Any]:
         """Open the session up front so credential/deployment errors surface early."""
-        return self._transport.open()
+        identity = self._transport.open()
+        expected_dim = ARM_DIM if self.single_arm_side else STATE_DIM
+        for field in ("state_dim", "action_dim"):
+            advertised = identity.get(field)
+            if self.single_arm_side and advertised is None:
+                self._transport.close(success=False)
+                raise ServoBridgeError(
+                    f"Servo endpoint did not advertise {field}; refusing to guess a "
+                    f"7-D contract for single_arm_side={self.single_arm_side!r}"
+                )
+            if advertised is not None and int(advertised) != expected_dim:
+                self._transport.close(success=False)
+                raise ServoBridgeError(
+                    f"Servo endpoint advertises {field}={advertised}, but this client "
+                    f"expects {expected_dim} for single_arm_side={self.single_arm_side!r}"
+                )
+        profile_horizon = (identity.get("control_profile") or {}).get("exec_steps")
+        advertised_horizon = identity.get("action_horizon")
+        if (
+            profile_horizon is not None
+            and advertised_horizon is not None
+            and int(profile_horizon) != int(advertised_horizon)
+        ):
+            self._transport.close(success=False)
+            raise ServoBridgeError(
+                "Servo endpoint advertises inconsistent action horizons: "
+                f"control_profile.exec_steps={profile_horizon}, "
+                f"action_horizon={advertised_horizon}"
+            )
+        return identity
 
     def close(self, success: bool = True) -> None:
         self._transport.close(success=success)
@@ -1004,19 +1061,28 @@ class MolmoActServo(PolicyBase):
             # here with a seed requested is a run whose seed was honoured.
             "deterministic_generator": self._seed_proven,
             "seed_requested": self._rollout_seed is not None,
+            "single_arm_side": self.single_arm_side,
         }
 
     def prepare_input(self, obs: Dict[str, Any], instruction: str) -> Dict[str, Any]:
         self.logger.info("Preparing input for MolmoActServo inference")
         self.logger.info(f"Instruction: '{instruction}'")
+        bimanual_state = require_bimanual_state(
+            obs["joint_positions"], source="MolmoActServo"
+        )
+        if self.single_arm_side == "left":
+            endpoint_state = bimanual_state[:ARM_DIM].copy()
+        elif self.single_arm_side == "right":
+            endpoint_state = bimanual_state[ARM_DIM:].copy()
+        else:
+            endpoint_state = bimanual_state
         return {
             "left_camera_rgb": obs["left_camera_rgb"],
             "front_camera_rgb": obs["front_camera_rgb"],
             "right_camera_rgb": obs["right_camera_rgb"],
             "instruction": instruction,
-            "state": require_bimanual_state(
-                obs["joint_positions"], source="MolmoActServo"
-            ),
+            "state": endpoint_state,
+            "bimanual_state": bimanual_state,
         }
 
     def inference(self, input_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -1041,9 +1107,15 @@ class MolmoActServo(PolicyBase):
         else:
             images = {key: self._raw_pixels(value) for key, value in sources.items()}
         encode_ms = (time.perf_counter() - encode_started) * 1000.0
-        state = require_bimanual_state(
-            input_dict["state"], source="MolmoActServo request"
-        )
+        endpoint_dim = ARM_DIM if self.single_arm_side else STATE_DIM
+        state = np.asarray(input_dict["state"], dtype=np.float32).reshape(-1)
+        if state.shape != (endpoint_dim,):
+            raise ValueError(
+                f"MolmoActServo request state must be shape ({endpoint_dim},), "
+                f"got {state.shape}"
+            )
+        if not np.isfinite(state).all():
+            raise ValueError("MolmoActServo request state contains non-finite values")
 
         noise_seed, seed_metadata = self._noise_seed_for_next_query()
         act_started = time.perf_counter()
@@ -1059,11 +1131,29 @@ class MolmoActServo(PolicyBase):
         # silently stops being the run its manifest describes.
         self._inference_index += 1
 
-        actions = np.asarray(prediction["actions"], dtype=np.float32)
-        if actions.shape != (ACTION_HORIZON, STATE_DIM) or not np.isfinite(actions).all():
+        endpoint_actions = np.asarray(prediction["actions"], dtype=np.float32)
+        expected_horizon = self._expected_action_horizon()
+        if endpoint_actions.shape != (
+            expected_horizon,
+            endpoint_dim,
+        ) or not np.isfinite(endpoint_actions).all():
             raise RuntimeError(
-                f"Servo returned a malformed action chunk: shape {actions.shape}"
+                f"Servo returned a malformed action chunk: shape {endpoint_actions.shape}, "
+                f"expected ({expected_horizon}, {endpoint_dim})"
             )
+        if self.single_arm_side:
+            bimanual_state = require_bimanual_state(
+                input_dict["bimanual_state"], source="MolmoActServo execution state"
+            )
+            actions = np.repeat(bimanual_state[None, :], expected_horizon, axis=0)
+            active = (
+                slice(0, ARM_DIM)
+                if self.single_arm_side == "left"
+                else slice(ARM_DIM, STATE_DIM)
+            )
+            actions[:, active] = endpoint_actions
+        else:
+            actions = endpoint_actions
         telemetry = prediction.get("telemetry") or {}
         # The serve reports the mechanism it actually sampled under. The SDK
         # already refuses a seeded act whose response carries no scheme, so

@@ -62,10 +62,11 @@ except Exception:  # pragma: no cover - numpy is a hard dep of the robot runtime
     _HAVE_NUMPY = False
 
 try:  # ``molmoact_client`` pulls torch/transformers; the bridge itself does not.
-    from molmoact_client import MolmoActServo, ServoSessionTransport
+    from molmoact_client import ARM_DIM, MolmoActServo, ServoSessionTransport
 
     _CLIENT_IMPORT_ERROR = None
 except Exception as exc:  # noqa: BLE001 - reported through skipUnless below
+    ARM_DIM = 7
     MolmoActServo = None  # type: ignore[assignment]
     ServoSessionTransport = None  # type: ignore[assignment]
     _CLIENT_IMPORT_ERROR = exc
@@ -1183,6 +1184,65 @@ class MolmoActServoTests(unittest.TestCase):
             sum(len(blob) for blob in call["images"].values()),
         )
 
+    def test_single_arm_endpoint_is_repacked_into_the_live_bimanual_state(self):
+        horizon = 15
+        endpoint_actions = [
+            [float(row) + column / 100.0 for column in range(ARM_DIM)]
+            for row in range(horizon)
+        ]
+        prediction = {
+            "actions": endpoint_actions,
+            "horizon": horizon,
+            "action_space": "joint_position",
+            "telemetry": {"server_infer_ms": 42.0},
+            "binding": {"deploy_generation": "gen_stub_1"},
+            "safety_signal": None,
+        }
+
+        for side, endpoint_state, active, held in (
+            ("left", range(ARM_DIM), slice(0, ARM_DIM), slice(ARM_DIM, STATE_DIM)),
+            ("right", range(ARM_DIM, STATE_DIM), slice(ARM_DIM, STATE_DIM), slice(0, ARM_DIM)),
+        ):
+            with self.subTest(side=side):
+                policy = self._policy(prediction=prediction, single_arm_side=side)
+                policy._transport.identity.update(
+                    {
+                        "state_dim": ARM_DIM,
+                        "action_dim": ARM_DIM,
+                        "action_horizon": horizon,
+                        "control_profile": {"exec_steps": horizon, "fps": 15.0},
+                    }
+                )
+                policy.open()
+                prepared = policy.prepare_input(self._observation(), "pick up the red cap")
+                self.assertEqual(prepared["state"].tolist(), [float(i) for i in endpoint_state])
+
+                result = policy.inference(prepared)
+                actions = result["actions"]
+                self.assertEqual(actions.shape, (horizon, STATE_DIM))
+                self.assertTrue(
+                    self.np.array_equal(
+                        actions[:, active], self.np.asarray(endpoint_actions, dtype=self.np.float32)
+                    )
+                )
+                expected_hold = self.np.repeat(
+                    prepared["bimanual_state"][None, held], horizon, axis=0
+                )
+                self.assertTrue(self.np.array_equal(actions[:, held], expected_hold))
+                self.assertEqual(
+                    policy._transport.calls[0]["state"],
+                    [float(i) for i in endpoint_state],
+                )
+
+    def test_single_arm_endpoint_contract_mismatch_fails_closed(self):
+        policy = self._policy(single_arm_side="left")
+        policy._transport.identity.update({"state_dim": STATE_DIM, "action_dim": ARM_DIM})
+
+        with self.assertRaisesRegex(ServoBridgeError, "state_dim=14"):
+            policy.open()
+
+        self.assertEqual(policy._transport.closes, [False])
+
     def test_cameras_map_onto_the_servo_keys(self):
         from PIL import Image
 
@@ -1482,6 +1542,21 @@ class ServoDirectHostOpenTests(unittest.TestCase):
         self.assertEqual(identity["generation_id"], "gen_test_1")
         self.assertEqual(identity["deployment_id"], "dep_fake")
         self.assertEqual(identity["observation_encoding"], "jpeg")
+
+    def test_open_publishes_the_endpoint_dimensions_and_horizon(self):
+        metadata = {
+            "manifest_hash": "sha256:manifest-a",
+            "observation": {"state_dim": ARM_DIM},
+            "action": {"dim": ARM_DIM, "horizon": 15},
+        }
+        _install_fake_servo_direct(self, metadata=metadata)
+        host = ServoDirectHost(grant=self.grant)
+
+        identity = host.open()
+
+        self.assertEqual(identity["state_dim"], ARM_DIM)
+        self.assertEqual(identity["action_dim"], ARM_DIM)
+        self.assertEqual(identity["action_horizon"], 15)
 
     def test_a_stale_grant_fails_at_open_not_at_act(self):
         state = _install_fake_servo_direct(

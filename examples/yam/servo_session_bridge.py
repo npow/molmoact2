@@ -408,9 +408,11 @@ class ServoSessionHost:
         if missing:
             raise ServoBridgeError(f"Servo observation is missing camera bytes: {missing}")
         state_values = [float(value) for value in state]
-        if len(state_values) != STATE_DIM:
+        expected_state_dim = self._expected_state_dim()
+        if len(state_values) != expected_state_dim:
             raise ServoBridgeError(
-                f"BimanualYAM state must be {STATE_DIM} floats, got {len(state_values)}"
+                f"Servo endpoint state must be {expected_state_dim} floats, "
+                f"got {len(state_values)}"
             )
         observation = {
             "images": {key: _observation_frame(images[key]) for key in CAMERA_KEYS},
@@ -477,12 +479,37 @@ class ServoSessionHost:
                 return False
         return False
 
+    def _expected_action_horizon(self) -> int:
+        """The served model's own action horizon, not this file's default.
+
+        Checkpoints in this family do not all share one horizon (e.g. the
+        30-row lerobot-exported pi0.5 checkpoints vs. a 16-row raw JAX/openpi
+        one) -- the grant's control_profile.exec_steps already carries the
+        served model's real chunk length, so read it instead of assuming
+        every endpoint returns ACTION_HORIZON rows.
+        """
+        control_profile = self.identity.get("control_profile") or {}
+        exec_steps = control_profile.get("exec_steps")
+        return int(exec_steps) if exec_steps else ACTION_HORIZON
+
+    def _expected_state_dim(self) -> int:
+        """Return the endpoint-advertised state width, with the legacy default."""
+        return int(self.identity.get("state_dim") or STATE_DIM)
+
+    def _expected_action_dim(self) -> int:
+        """Return the endpoint-advertised action width, with the legacy default."""
+        return int(self.identity.get("action_dim") or STATE_DIM)
+
     def _validated_prediction(self, prediction: Any) -> Dict[str, Any]:
+        expected_horizon = self._expected_action_horizon()
+        expected_action_dim = self._expected_action_dim()
         actions = [[float(value) for value in row] for row in (prediction.actions or [])]
-        if len(actions) != ACTION_HORIZON or any(len(row) != STATE_DIM for row in actions):
+        if len(actions) != expected_horizon or any(
+            len(row) != expected_action_dim for row in actions
+        ):
             raise ServoBridgeError(
                 "Servo returned an action chunk that is not "
-                f"{ACTION_HORIZON}x{STATE_DIM}: "
+                f"{expected_horizon}x{expected_action_dim}: "
                 f"{len(actions)}x{len(actions[0]) if actions else 0}"
             )
         if any(not math.isfinite(value) for row in actions for value in row):
@@ -622,7 +649,7 @@ class ServoDirectHost(ServoSessionHost):
         # which in a real run is AFTER the arms are live. The launcher's
         # contract is that a bad credential, deployment or lease fails with the
         # arms still cold, so this is the only place it can be honoured.
-        served, expected = self._verify_endpoint(policy)
+        served, expected, metadata = self._verify_endpoint(policy)
         transport = self._open_session(policy)
         lease = getattr(transport, "lease", None)
         # DirectPolicy.act(observation, instruction=...) matches the hosted
@@ -647,6 +674,9 @@ class ServoDirectHost(ServoSessionHost):
             "observation_encoding": self.observation_encoding,
             "h264_crf": self.h264_crf,
             "control_profile": dict(getattr(policy.grant, "control_profile", None) or {}),
+            "state_dim": (metadata.get("observation") or {}).get("state_dim"),
+            "action_dim": (metadata.get("action") or {}).get("dim"),
+            "action_horizon": (metadata.get("action") or {}).get("horizon"),
             # Where each control number came from. A generic bracket and a
             # measured one are indistinguishable from the profile alone, and
             # inheriting another model family's numbers silently is exactly the
@@ -657,7 +687,9 @@ class ServoDirectHost(ServoSessionHost):
         })
         return dict(self.identity)
 
-    def _verify_endpoint(self, policy: Any) -> Tuple[Optional[str], Optional[str]]:
+    def _verify_endpoint(
+        self, policy: Any
+    ) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
         """Prove the endpoint answers, authenticates, and serves THIS manifest."""
         endpoint = getattr(policy.grant, "endpoint_url", "the endpoint")
         try:
@@ -677,7 +709,7 @@ class ServoDirectHost(ServoSessionHost):
                 f"Servo endpoint {endpoint} serves manifest {served} but the grant "
                 f"names {expected}; this grant belongs to a previous serve"
             )
-        return served, expected
+        return served, expected, metadata
 
     def _open_session(self, policy: Any) -> Any:
         """Open the action session itself, with the arms cold.

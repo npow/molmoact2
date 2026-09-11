@@ -1,0 +1,59 @@
+# Secondary config for the inactive physical right arm. Supply this as
+# --right-config-path with pi05_red_cap_left_physical.yaml; its live encoder
+# feedback fills fields 7:14 while the hold mask prevents policy-driven motion.
+model_arm_side: right
+
+sensors:
+  cameras:
+    left_camera:
+      device_id: "/dev/yam-cameras/left"
+    front_camera:
+      device_id: "/dev/yam-cameras/middle"
+    right_camera:
+      device_id: "/dev/yam-cameras/right"
+
+robot:
+  _target_: gello_min.yam.YAMRobot
+  channel: can_right
+
+agent:
+  start_joints: null
+
+hz: 15
+max_steps: 600
+
+storage:
+  base_dir: "./yam_eval_runs"
+  task_directory: "pi05_red_cap_full_7500_right_hold"
+  language_instruction: "pick up the red cap and place it in the black box"
+  saver_max_workers: 2
+  png_compress_level: 1
+
+lerobot:
+  fps: 15
+  robot_type: "pi05_yam_single_right_hold"
+  hf_repo_id: "local/yam_eval_session"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 2
+  image_writer_threads: 2
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+
+eval:
+  live_view_enabled: false
+  camera_preflight:
+    enabled: true
+    timeout_sec: 10
+    min_warmup_sec: 2.0
+    required_consecutive_frames: 2
+    expected_shape: [480, 640, 3]
+    max_clipped_white_fraction: 0.15
+  rerun:
+    enabled: true
+    image_stride: 3
+    jpeg_quality: 75
+    action_chunk_size: 15
+  mode: direct
+  camera_server:
+    enabled: false
