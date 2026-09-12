@@ -325,10 +325,11 @@ class ServoSessionHost:
             return dict(self.identity)
         try:
             from servo import Servo
+            import PIL.Image  # noqa: F401
         except ImportError as exc:  # pragma: no cover - environment dependent
             raise ServoBridgeError(
-                "the official servo SDK is not importable in this interpreter "
-                f"({sys.executable}); install servo-client or point "
+                "the official servo SDK or its image dependency (Pillow/PIL) is not importable in this interpreter "
+                f"({sys.executable}); install servo-client and pillow or point "
                 f"{SERVO_PYTHON_ENV} at a Python >= 3.12 that has it"
             ) from exc
 
@@ -610,10 +611,11 @@ class ServoDirectHost(ServoSessionHost):
             return dict(self.identity)
         try:
             from servo.direct import attach
+            import PIL.Image  # noqa: F401
         except ImportError as exc:  # pragma: no cover - environment dependent
             raise ServoBridgeError(
-                "the official servo SDK is not importable in this interpreter "
-                f"({sys.executable}); install servo-client or point "
+                "the official servo SDK or its image dependency (Pillow/PIL) is not importable in this interpreter "
+                f"({sys.executable}); install servo-client and pillow or point "
                 f"{SERVO_PYTHON_ENV} at a Python >= 3.12 that has it"
             ) from exc
         grant_path = Path(self._grant_path).expanduser()
@@ -854,6 +856,7 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
     if op == "ping":
         try:
             import servo  # noqa: F401
+            import PIL.Image  # noqa: F401
 
             servo_importable = True
         except ImportError:

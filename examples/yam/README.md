@@ -166,7 +166,7 @@ runtime owns model-specific resize/padding; it is a diagnostic override only.
 **Launch a hosted run:**
 
 ```bash
-PYTHONPATH=examples/yam:/home/npow/code/i2rt \
+PYTHONPATH=examples/yam \
 /home/npow/molmoact2-venv/bin/python \
 examples/yam/launch_yaml_eval_molmoact.py \
   --config-path examples/yam/configs/yam_left_physical.yaml \
@@ -187,15 +187,13 @@ already runs on a 3.12 interpreter that has `servo-client`.
 **Launch the self-hosted full pi0.5 red-cap endpoint:**
 
 ```bash
-SSL_CERT_FILE=/home/npow/code/gello_software/artifacts/servo-vast/full-7500-vast.crt \
-PYTHONPATH=examples/yam:/home/npow/code/i2rt \
+PYTHONPATH=examples/yam \
 /home/npow/molmoact2-venv/bin/python \
 examples/yam/launch_yaml_eval_molmoact.py \
   --config-path examples/yam/configs/pi05_bimanual_physical.yaml \
   --right-config-path examples/yam/configs/pi05_right_primary.yaml \
   --policy-mode direct \
   --servo-grant ~/.config/servo/pi05-yam-full-7500-grant.json \
-  --servo-python /home/npow/code/servo-yam-redcap/.venv/bin/python \
   --active-arm-side left \
   --control-hz 15 \
   --max-steps 600 \
