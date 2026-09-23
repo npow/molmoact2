@@ -325,10 +325,11 @@ class ServoSessionHost:
             return dict(self.identity)
         try:
             from servo import Servo
+            import PIL.Image  # noqa: F401
         except ImportError as exc:  # pragma: no cover - environment dependent
             raise ServoBridgeError(
-                "the official servo SDK is not importable in this interpreter "
-                f"({sys.executable}); install servo-client or point "
+                "the official servo SDK or its image dependency (Pillow/PIL) is not importable in this interpreter "
+                f"({sys.executable}); install servo-client and pillow or point "
                 f"{SERVO_PYTHON_ENV} at a Python >= 3.12 that has it"
             ) from exc
 
@@ -415,26 +416,46 @@ class ServoSessionHost:
                 f"Servo endpoint state must be {expected_state_dim} floats, "
                 f"got {len(state_values)}"
             )
-        observation = {
-            "images": {key: _observation_frame(images[key]) for key in CAMERA_KEYS},
-            "state": state_values,
-            "instruction": instruction or self.instruction,
-        }
-        if noise_seed is None:
-            prediction = self._session.act(observation, instruction=instruction)
-        else:
-            if not self._session_accepts_noise_seed():
+        # The current SDK takes checkpoint-named NumPy inputs and returns a typed
+        # ActionPrediction.  Keep camera buffers as arrays all the way to the
+        # SDK; its negotiated action-session transport owns encoding and avoids
+        # the old JSON/base64 observation path.
+        import numpy as np
+
+        if hasattr(self._session, "predict"):
+            inputs = {
+                "observation.images.top": np.asarray(_observation_frame(images["top"])),
+                "observation.images.left": np.asarray(_observation_frame(images["left"])),
+                "observation.images.right": np.asarray(_observation_frame(images["right"])),
+                "observation.state": np.asarray(state_values, dtype=np.float32),
+            }
+            if noise_seed is not None:
                 raise ServoBridgeError(
-                    "a per-query noise seed was requested but this session cannot "
-                    f"carry one ({type(self._session).__name__}.act has no "
-                    "'noise_seed' parameter). Seeded remote rollouts need a servo "
-                    "checkout with DirectPolicy seeding (PR #227 or later) in the "
-                    f"bridge interpreter ({sys.executable}); re-run unseeded, or "
-                    "update that checkout"
+                    "the current Servo predict API does not expose per-query noise_seed; "
+                    "seeded hosted rollouts require a server-side prediction option"
                 )
-            prediction = self._session.act(
-                observation, instruction=instruction, noise_seed=int(noise_seed)
+            prediction = self._session.predict(
+                inputs=inputs,
+                instruction=instruction or self.instruction,
             )
+        else:
+            # DirectPolicy is a separate self-hosted grant path and still owns
+            # its observation codec; managed deployments use predict() above.
+            observation = {
+                "images": {key: _observation_frame(images[key]) for key in CAMERA_KEYS},
+                "state": state_values,
+                "instruction": instruction or self.instruction,
+            }
+            if noise_seed is None:
+                prediction = self._session.act(observation, instruction=instruction)
+            else:
+                if not self._session_accepts_noise_seed():
+                    raise ServoBridgeError(
+                        "a per-query noise seed was requested but this session cannot carry it"
+                    )
+                prediction = self._session.act(
+                    observation, instruction=instruction, noise_seed=int(noise_seed)
+                )
         return self._validated_prediction(prediction)
 
     def begin_episode(self) -> bool:
@@ -610,10 +631,11 @@ class ServoDirectHost(ServoSessionHost):
             return dict(self.identity)
         try:
             from servo.direct import attach
+            import PIL.Image  # noqa: F401
         except ImportError as exc:  # pragma: no cover - environment dependent
             raise ServoBridgeError(
-                "the official servo SDK is not importable in this interpreter "
-                f"({sys.executable}); install servo-client or point "
+                "the official servo SDK or its image dependency (Pillow/PIL) is not importable in this interpreter "
+                f"({sys.executable}); install servo-client and pillow or point "
                 f"{SERVO_PYTHON_ENV} at a Python >= 3.12 that has it"
             ) from exc
         grant_path = Path(self._grant_path).expanduser()
@@ -854,6 +876,7 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
     if op == "ping":
         try:
             import servo  # noqa: F401
+            import PIL.Image  # noqa: F401
 
             servo_importable = True
         except ImportError:

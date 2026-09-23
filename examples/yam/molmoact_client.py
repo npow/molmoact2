@@ -189,12 +189,83 @@ class MolmoActHTTP(PolicyBase):
         self.url = _normalize_server_url(server)
         self._http = requests.Session()
         self.multi_views = True
+        # Provisional default -- host_server_yam.py's `--repo-id` can point at
+        # a checkpoint whose native action horizon is NOT 30 (confirmed on
+        # disk: MolmoAct2-LIBERO ships max_action_horizon=10), so this must
+        # be corrected from the server's own advertised value, not trusted.
         self.action_horizon = ACTION_HORIZON
+        self._action_horizon_confirmed = False
+        self._sync_action_horizon_from_health()
 
         # Log configuration
         self.logger.info(f"MolmoActHTTP initialized with URL: {self.url}")
         self.logger.info(f"Multi-views enabled: {self.multi_views}")
-        self.logger.info(f"Action horizon: {self.action_horizon}")
+        self.logger.info(
+            f"Action horizon: {self.action_horizon} "
+            f"({'confirmed by server' if self._action_horizon_confirmed else 'DEFAULT, unconfirmed'})"
+        )
+
+    def _sync_action_horizon_from_health(self) -> None:
+        """Best-effort GET health check to learn the served checkpoint's real
+        action horizon before the first act, instead of assuming this file's
+        BimanualYAM default. Never fatal -- the server may not be up yet in
+        every eval flow, and every act response also carries its own
+        ``action_horizon`` (see ``send_request``), which corrects this from
+        the first real inference call onward either way.
+        """
+        try:
+            # Capped independently of `request_timeout_sec` (which may be
+            # set high for real inference calls): a blackholed health probe
+            # at construction time should fail fast, not hang for a full act
+            # timeout before falling back to the provisional default.
+            response = self._http.get(self.url, timeout=min(self.request_timeout_sec, 5.0))
+            if response.status_code != 200:
+                self.logger.warning(
+                    "health check at %s returned %s; action_horizon defaults "
+                    "to %d until the first successful /act response",
+                    self.url, response.status_code, self.action_horizon,
+                )
+                return
+            payload = json_numpy.loads(response.text)
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(
+                "could not reach %s for a health check (%s); action_horizon "
+                "defaults to %d until the first successful /act response",
+                self.url, e, self.action_horizon,
+            )
+            return
+        advertised = payload.get("action_horizon") if isinstance(payload, dict) else None
+        if advertised:
+            self.action_horizon = int(advertised)
+            self._action_horizon_confirmed = True
+        else:
+            self.logger.warning(
+                "server at %s did not advertise action_horizon in its health "
+                "response; action_horizon defaults to %d (BimanualYAM) until "
+                "the first successful /act response -- if --repo-id points at "
+                "a different checkpoint this may be wrong until then",
+                self.url, self.action_horizon,
+            )
+
+    def _observe_action_horizon(self, response_data: Dict[str, Any]) -> None:
+        """Self-heal from every real ``/act`` response -- ground truth over
+        any cached/derived value, mirroring ``Policy.predict``'s self-heal on
+        the server side in ``host_server_yam.py``.
+        """
+        advertised = (
+            response_data.get("action_horizon") if isinstance(response_data, dict) else None
+        )
+        if not advertised:
+            return
+        advertised = int(advertised)
+        if advertised != self.action_horizon or not self._action_horizon_confirmed:
+            if self._action_horizon_confirmed and advertised != self.action_horizon:
+                self.logger.warning(
+                    "server-advertised action_horizon changed %d -> %d",
+                    self.action_horizon, advertised,
+                )
+            self.action_horizon = advertised
+            self._action_horizon_confirmed = True
 
     def get_action_horizon(self):
         return self.action_horizon
@@ -413,6 +484,7 @@ class MolmoActHTTP(PolicyBase):
             parse_time = time.time() - start_time
             self.logger.info(f"Response parsed in {parse_time:.3f}s")
 
+            self._observe_action_horizon(response_data)
             self.logger.info("Server request completed successfully")
             return response_data
 
@@ -1124,12 +1196,11 @@ class MolmoActServo(PolicyBase):
             "left": input_dict["left_camera_rgb"],
             "right": input_dict["right_camera_rgb"],
         }
-        if self.observation_encoding == "jpeg":
-            images: Dict[str, Any] = {
-                key: self._jpeg_bytes(value) for key, value in sources.items()
-            }
-        else:
-            images = {key: self._raw_pixels(value) for key, value in sources.items()}
+        # The current Servo SDK accepts checkpoint-named NumPy inputs and owns
+        # the action-session encoding.  Always hand it raw pixels; pre-encoding
+        # JPEG here would route around the negotiated transport and the SDK's
+        # NumPy validation.
+        images = {key: self._raw_pixels(value) for key, value in sources.items()}
         encode_ms = (time.perf_counter() - encode_started) * 1000.0
         endpoint_dim = ARM_DIM if self._endpoint_single_arm_side else STATE_DIM
         state = np.asarray(input_dict["state"], dtype=np.float32).reshape(-1)
@@ -1316,6 +1387,49 @@ class MolmoActServo(PolicyBase):
 _local_log = logging.getLogger("molmoact.local")
 
 
+def _resolve_checkpoint_action_horizon(model: Any, norm_tag: str) -> int:
+    """The loaded checkpoint's own real action horizon for ``norm_tag``.
+
+    Mirrors ``host_server_yam.py``'s function of the same name -- keep both
+    in sync, same as the rest of the `_LocalPolicy` block per the module
+    docstring above. Reads the exact resolution ``predict_action`` itself
+    performs internally (``action_horizon = stats.get_action_horizon(norm_tag)
+    or self.model._resolve_action_horizon()``) rather than re-parsing
+    ``norm_stats.json``/``config.json`` independently, so this can never
+    silently disagree with what a real inference call returns. ``repo_id`` is
+    a constructor parameter here too (default MolmoAct2-BimanualYAM, but
+    overridable), and checkpoints in this family do NOT share one horizon
+    (confirmed on disk: BimanualYAM/SO100_101 ship 30, LIBERO ships 10).
+    """
+    max_horizon: Optional[int] = None
+    for accessor in (
+        lambda: model._resolve_action_horizon(),
+        lambda: model.model._resolve_action_horizon(),
+    ):
+        try:
+            max_horizon = int(accessor())
+            break
+        except Exception:
+            continue
+    if max_horizon is None:
+        _local_log.warning(
+            "could not call _resolve_action_horizon() on the loaded model "
+            "(checked both the top-level wrapper and model.model); falling "
+            "back to config.max_action_horizon"
+        )
+        max_horizon = int(getattr(model.config, "max_action_horizon", None) or ACTION_HORIZON)
+    try:
+        tag_horizon = model._get_robot_stats().get_action_horizon(norm_tag)
+    except Exception:
+        _local_log.warning(
+            "model._get_robot_stats() unavailable; using checkpoint max_action_horizon=%d "
+            "as the resolved action horizon (norm_tag=%r may override this)",
+            max_horizon, norm_tag,
+        )
+        tag_horizon = None
+    return int(tag_horizon) if tag_horizon else max_horizon
+
+
 def _patch_modeling_for_bf16(local_dir: str) -> None:
     """Idempotently rewrite the cached ``modeling_molmoact2.py`` so bf16 works.
 
@@ -1433,6 +1547,12 @@ class _LocalPolicy:
         self.model._move_inputs_to_device = _move_and_cast
         self._lock = threading.Lock()
 
+        self.action_horizon = _resolve_checkpoint_action_horizon(self.model, NORM_TAG)
+        _local_log.info(
+            "Resolved action_horizon=%d for repo_id=%s (norm_tag=%r)",
+            self.action_horizon, self.repo_id, NORM_TAG,
+        )
+
     @torch.inference_mode()
     def predict(
         self,
@@ -1472,6 +1592,16 @@ class _LocalPolicy:
         actions = np.asarray(raw, dtype=np.float32)
         if actions.ndim == 3 and actions.shape[0] == 1:
             actions = actions[0]
+        if actions.shape[0] != self.action_horizon:
+            # A real returned chunk is ground truth over the load-time
+            # resolution -- self-heal loudly rather than let every caller
+            # silently keep trusting a now-known-wrong cached number.
+            _local_log.warning(
+                "actual returned action chunk length %d != resolved "
+                "action_horizon %d; updating cached value",
+                actions.shape[0], self.action_horizon,
+            )
+            self.action_horizon = int(actions.shape[0])
         return actions
 
 
@@ -1491,6 +1621,11 @@ class MolmoActLocal(PolicyBase):
     ) -> None:
         self.logger = get_molmoact_logger()
         self.multi_views = True
+        # Provisional default until `self.policy` (below) loads the real
+        # checkpoint and resolves its own native action horizon -- `repo_id`
+        # is overridable here too, and this family does NOT share one
+        # horizon (confirmed on disk: BimanualYAM/SO100_101 ship 30, LIBERO
+        # ships 10).
         self.action_horizon = ACTION_HORIZON
         self.num_steps = int(num_steps)
         self.enable_cuda_graph = bool(enable_cuda_graph)
@@ -1531,6 +1666,7 @@ class MolmoActLocal(PolicyBase):
             dtype=dtype_map[dtype],
             enable_cuda_graph=self.enable_cuda_graph,
         )
+        self.action_horizon = self.policy.action_horizon
         self.logger.info(
             f"MolmoActLocal ready. action_horizon={self.action_horizon}, "
             f"num_steps={self.num_steps}, enable_cuda_graph={self.enable_cuda_graph}, "
@@ -1560,6 +1696,10 @@ class MolmoActLocal(PolicyBase):
         self.logger.info(f"MolmoActLocal warmup OK ({time.time() - t0:.1f}s)")
 
     def get_action_horizon(self) -> int:
+        # Read the live source of truth: `_LocalPolicy.predict` self-heals
+        # its own `action_horizon` from real returned chunks, and a cached
+        # copy here would go stale if that ever fires after construction.
+        self.action_horizon = self.policy.action_horizon
         return self.action_horizon
 
     def begin_rollout(self, rollout_seed: Optional[int]) -> Dict[str, Any]:
