@@ -36,7 +36,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Optional
+from typing import Any
 
 import json_numpy
 import numpy as np
@@ -63,12 +63,6 @@ NORM_TAG = "yam_dual_molmoact2"
 STATE_DIM = 14
 NUM_CAMERAS = 3
 DEFAULT_NUM_STEPS = 10
-#: Only a last-resort fallback if the loaded checkpoint's own config cannot be
-#: introspected (see `_resolve_checkpoint_action_horizon`) -- `--repo-id` can
-#: point at a checkpoint whose native action horizon is NOT 30 (e.g.
-#: allenai/MolmoAct2-LIBERO ships max_action_horizon=10). Never trust this
-#: constant once a real Policy has loaded; use `policy.action_horizon`.
-ACTION_HORIZON = 30
 
 
 def _patch_modeling_for_bf16(local_dir: str) -> None:
@@ -119,53 +113,6 @@ def _patch_modeling_for_bf16(local_dir: str) -> None:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(new_src)
             log.info("Applied patches %s in %s", applied, path)
-
-
-def _resolve_checkpoint_action_horizon(model: Any, norm_tag: str) -> int:
-    """The loaded checkpoint's own real action horizon for ``norm_tag``.
-
-    Mirrors, field for field, the exact resolution ``predict_action`` itself
-    performs internally (``modeling_molmoact2.py``:
-    ``action_horizon = stats.get_action_horizon(norm_tag) or
-    self.model._resolve_action_horizon()``) so this can never disagree with
-    what a real inference call actually returns -- a second, independently
-    hand-rolled reader of ``norm_stats.json``/``config.json`` here would risk
-    exactly the "duplicated/inconsistent check" bug class this function
-    exists to avoid. ``--repo-id`` can point at a checkpoint with a
-    genuinely different horizon (confirmed on disk: BimanualYAM/SO100_101
-    ship 30, LIBERO ships 10), so this must be read per-load, never assumed.
-    """
-    max_horizon: Optional[int] = None
-    # `_resolve_action_horizon` lives on the inner `MolmoAct2Model`
-    # (`model.model`) as of the currently pinned revision, but try the
-    # top-level wrapper first in case a future/older revision moves it --
-    # either way this stays a live introspection, never a hardcoded guess.
-    for accessor in (
-        lambda: model._resolve_action_horizon(),
-        lambda: model.model._resolve_action_horizon(),
-    ):
-        try:
-            max_horizon = int(accessor())
-            break
-        except Exception:
-            continue
-    if max_horizon is None:
-        log.warning(
-            "could not call _resolve_action_horizon() on the loaded model "
-            "(checked both the top-level wrapper and model.model); falling "
-            "back to config.max_action_horizon"
-        )
-        max_horizon = int(getattr(model.config, "max_action_horizon", None) or ACTION_HORIZON)
-    try:
-        tag_horizon = model._get_robot_stats().get_action_horizon(norm_tag)
-    except Exception:
-        log.warning(
-            "model._get_robot_stats() unavailable; using checkpoint max_action_horizon=%d "
-            "as the advertised action horizon (norm_tag=%r may override this)",
-            max_horizon, norm_tag,
-        )
-        tag_horizon = None
-    return int(tag_horizon) if tag_horizon else max_horizon
 
 
 class Policy:
@@ -229,12 +176,6 @@ class Policy:
         # calls; coarse-grained serialization is fine at ~5 Hz robot poll.
         self._lock = threading.Lock()
 
-        self.action_horizon = _resolve_checkpoint_action_horizon(self.model, NORM_TAG)
-        log.info(
-            "Resolved action_horizon=%d for repo_id=%s (norm_tag=%r)",
-            self.action_horizon, repo_id, NORM_TAG,
-        )
-
     @torch.inference_mode()
     def predict(
         self,
@@ -273,17 +214,6 @@ class Policy:
         actions = np.asarray(raw, dtype=np.float32)
         if actions.ndim == 3 and actions.shape[0] == 1:
             actions = actions[0]
-        if actions.shape[0] != self.action_horizon:
-            # The load-time resolution should make this unreachable, but a
-            # real returned chunk is ground truth over a derived value --
-            # self-heal loudly rather than let every caller silently keep
-            # trusting a now-known-wrong cached number.
-            log.warning(
-                "actual returned action chunk length %d != resolved "
-                "action_horizon %d; updating cached value",
-                actions.shape[0], self.action_horizon,
-            )
-            self.action_horizon = int(actions.shape[0])
         return actions
 
 
@@ -312,10 +242,6 @@ def build_app(policy: Policy) -> FastAPI:
                 "dtype": str(policy.model.dtype),
                 "num_cameras": NUM_CAMERAS,
                 "state_dim": STATE_DIM,
-                # The ACTUALLY loaded checkpoint's action horizon -- may
-                # differ from any client-side default if --repo-id points at
-                # a non-BimanualYAM checkpoint (e.g. MolmoAct2-LIBERO: 10).
-                "action_horizon": policy.action_horizon,
             }
         )
 
@@ -361,16 +287,7 @@ def build_app(policy: Policy) -> FastAPI:
             return _error_response(500, f"inference failed: {e}")
         dt_ms = (time.perf_counter() - t0) * 1000.0
 
-        body = json_numpy.dumps(
-            {
-                "actions": actions,
-                "dt_ms": dt_ms,
-                # Ground truth for THIS response, not a cached/derived value:
-                # exactly what the client can already see from actions.shape,
-                # surfaced explicitly so it doesn't have to re-derive it.
-                "action_horizon": int(actions.shape[0]),
-            }
-        )
+        body = json_numpy.dumps({"actions": actions, "dt_ms": dt_ms})
         return Response(content=body, media_type="application/json")
 
     return app

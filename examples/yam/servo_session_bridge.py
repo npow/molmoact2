@@ -215,6 +215,18 @@ def _observation_frame(value: Any) -> Any:
     return value
 
 
+def _pixels(value: Any) -> Any:
+    """``HxWx3`` ``uint8`` array; ``Session.predict`` takes arrays, not jpeg bytes."""
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return np.asarray(Image.open(io.BytesIO(value)).convert("RGB"))
+    return np.asarray(value, dtype=np.uint8)
+
+
 def _read_exactly(stream: Any, size: int) -> bytes:
     """Read exactly ``size`` bytes or raise; pipes may return short reads."""
     chunks: List[bytes] = []
@@ -317,6 +329,7 @@ class ServoSessionHost:
         self._timeout_sec = timeout_sec
         self._client: Any = None
         self._session: Any = None
+        self._policy: Any = None
         self.identity: Dict[str, Any] = {}
 
     def open(self) -> Dict[str, Any]:
@@ -368,6 +381,7 @@ class ServoSessionHost:
             )
         self._client = client
         self._session = session
+        self._policy = policy
         # ``_jsonable`` so the identity survives the local frame header even if
         # a future SDK returns a model object for one of these fields.
         self.identity = _jsonable({
@@ -416,46 +430,44 @@ class ServoSessionHost:
                 f"Servo endpoint state must be {expected_state_dim} floats, "
                 f"got {len(state_values)}"
             )
-        # The current SDK takes checkpoint-named NumPy inputs and returns a typed
-        # ActionPrediction.  Keep camera buffers as arrays all the way to the
-        # SDK; its negotiated action-session transport owns encoding and avoids
-        # the old JSON/base64 observation path.
-        import numpy as np
-
-        if hasattr(self._session, "predict"):
-            inputs = {
-                "observation.images.top": np.asarray(_observation_frame(images["top"])),
-                "observation.images.left": np.asarray(_observation_frame(images["left"])),
-                "observation.images.right": np.asarray(_observation_frame(images["right"])),
-                "observation.state": np.asarray(state_values, dtype=np.float32),
-            }
+        policy = self._policy
+        if (
+            policy is not None
+            and policy.observation_contract is None
+            and policy.active_binding.checkpoint_input_contract is not None
+        ):
+            # Same test Session.predict makes: no camera contract, so the SDK
+            # wants checkpoint-named arrays instead of an images/state dict.
             if noise_seed is not None:
-                raise ServoBridgeError(
-                    "the current Servo predict API does not expose per-query noise_seed; "
-                    "seeded hosted rollouts require a server-side prediction option"
-                )
+                raise ServoBridgeError("Session.predict cannot carry a per-query noise seed")
+            import numpy as np
+
+            inputs = {f"observation.images.{key}": _pixels(images[key]) for key in CAMERA_KEYS}
+            inputs["observation.state"] = np.asarray(state_values, dtype=np.float32)
             prediction = self._session.predict(
-                inputs=inputs,
-                instruction=instruction or self.instruction,
+                inputs=inputs, instruction=instruction or self.instruction
             )
+            return self._validated_prediction(prediction)
+        observation = {
+            "images": {key: _observation_frame(images[key]) for key in CAMERA_KEYS},
+            "state": state_values,
+            "instruction": instruction or self.instruction,
+        }
+        if noise_seed is None:
+            prediction = self._session.act(observation, instruction=instruction)
         else:
-            # DirectPolicy is a separate self-hosted grant path and still owns
-            # its observation codec; managed deployments use predict() above.
-            observation = {
-                "images": {key: _observation_frame(images[key]) for key in CAMERA_KEYS},
-                "state": state_values,
-                "instruction": instruction or self.instruction,
-            }
-            if noise_seed is None:
-                prediction = self._session.act(observation, instruction=instruction)
-            else:
-                if not self._session_accepts_noise_seed():
-                    raise ServoBridgeError(
-                        "a per-query noise seed was requested but this session cannot carry it"
-                    )
-                prediction = self._session.act(
-                    observation, instruction=instruction, noise_seed=int(noise_seed)
+            if not self._session_accepts_noise_seed():
+                raise ServoBridgeError(
+                    "a per-query noise seed was requested but this session cannot "
+                    f"carry one ({type(self._session).__name__}.act has no "
+                    "'noise_seed' parameter). Seeded remote rollouts need a servo "
+                    "checkout with DirectPolicy seeding (PR #227 or later) in the "
+                    f"bridge interpreter ({sys.executable}); re-run unseeded, or "
+                    "update that checkout"
                 )
+            prediction = self._session.act(
+                observation, instruction=instruction, noise_seed=int(noise_seed)
+            )
         return self._validated_prediction(prediction)
 
     def begin_episode(self) -> bool:
@@ -623,6 +635,7 @@ class ServoDirectHost(ServoSessionHost):
         self.h264_crf = int(h264_crf) if h264_crf is not None else None
         self._client = None
         self._session = None
+        self._policy = None
         self.identity: Dict[str, Any] = {}
 
     def open(self) -> Dict[str, Any]:

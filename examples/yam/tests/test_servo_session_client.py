@@ -340,6 +340,7 @@ class _FakeBinding:
         self.manifest_hash = manifest_hash
         self.binding_revision = binding_revision
         self.deployment_id = deployment_id
+        self.checkpoint_input_contract = None
 
     def model_dump(self, mode="json"):
         return {
@@ -392,6 +393,7 @@ def _install_fake_servo(
             self.instruction = instruction
             self.deployment_id = deployment.id
             self.active_binding = deployment.binding
+            self.observation_contract = None
 
     class _FakeDeployment:
         def __init__(self, deployment_id):
@@ -731,6 +733,7 @@ class _Binding:
     checkpoint_digest = "sha256:" + "c" * 64
     manifest_hash = "sha256:" + "d" * 64
     binding_revision = 11
+    checkpoint_input_contract = None
 
     def model_dump(self, mode="json"):
         return {
@@ -748,6 +751,7 @@ class _Policy:
         self.deployment_id = deployment_id
         self.instruction = instruction
         self.active_binding = _Binding()
+        self.observation_contract = None
 
 
 class _Deployment:
@@ -1959,3 +1963,31 @@ def _seeded_prediction_dict():
     prediction["telemetry"] = dict(prediction["telemetry"])
     prediction["telemetry"]["noise_scheme"] = "torch-generator-v1"
     return prediction
+
+
+class SessionHostPredictTests(unittest.TestCase):
+    """A policy without a camera contract gets checkpoint-named arrays via predict."""
+
+    def test_jpeg_bytes_reach_predict_as_arrays(self):
+        from PIL import Image
+
+        seen = {}
+
+        class _Session:
+            def predict(self, *, inputs, instruction=None):
+                seen.update(inputs)
+                return _fake_prediction()
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 8)).save(buffer, format="JPEG")
+        host = ServoSessionHost.__new__(ServoSessionHost)
+        host._session = _Session()
+        host._policy = SimpleNamespace(
+            observation_contract=None,
+            active_binding=SimpleNamespace(checkpoint_input_contract={}),
+        )
+        host.instruction = "pick up the red lid"
+        host.identity = {}
+        host.act({key: buffer.getvalue() for key in CAMERA_KEYS}, [0.0] * STATE_DIM)
+        self.assertEqual(seen["observation.images.top"].shape, (8, 8, 3))
+        self.assertEqual(seen["observation.state"].shape, (STATE_DIM,))
