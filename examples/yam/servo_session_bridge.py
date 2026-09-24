@@ -227,6 +227,54 @@ def _pixels(value: Any) -> Any:
     return np.asarray(value, dtype=np.uint8)
 
 
+def _checkpoint_input_contract(policy: Any) -> Any:
+    """The contract ``Session.predict`` validates against, or ``None`` for ``act``.
+
+    Servo exposes no public "takes checkpoint-named inputs" predicate, so this
+    mirrors the rule in servo's ``src/servo/execution/session.py``
+    (``Session.predict``): a policy with no physical observation contract but a
+    binding carrying a checkpoint input contract wants checkpoint-named arrays
+    instead of an images/state dict. Keep the two in step.
+    """
+    if policy is None or policy.observation_contract is not None:
+        return None
+    binding = policy.active_binding
+    return binding.checkpoint_input_contract if binding is not None else None
+
+
+def _checkpoint_input_names(contract: Any) -> Tuple[Dict[str, str], str]:
+    """Map ``CAMERA_KEYS`` and the state vector onto the contract's input names.
+
+    Cameras match an image input whose name ends in ``.<key>`` (or is ``<key>``);
+    the state matches the single state input. Anything this embodiment cannot
+    fill, or leaves unfilled, is refused here rather than by the SDK's
+    validator, whose message would not say which side is wrong.
+    """
+    features = list(contract.inputs or ())
+    if not features or any(f.name is None for f in features):
+        raise ServoBridgeError(
+            f"checkpoint input contract is not fully named (resolution={contract.resolution!r})"
+        )
+    images = [f.name for f in features if f.modality == "image"]
+    states = [f.name for f in features if f.modality == "state"]
+    cameras: Dict[str, str] = {}
+    for key in CAMERA_KEYS:
+        matches = [name for name in images if name.rsplit(".", 1)[-1] == key]
+        if len(matches) != 1:
+            raise ServoBridgeError(
+                f"checkpoint input contract has {len(matches)} image inputs for camera "
+                f"{key!r} (image inputs: {images})"
+            )
+        cameras[key] = matches[0]
+    unused = sorted(set(images) - set(cameras.values()))
+    if unused or len(states) != 1:
+        raise ServoBridgeError(
+            f"checkpoint input contract does not match cameras {list(CAMERA_KEYS)} plus "
+            f"one state vector: unmatched image inputs {unused}, state inputs {states}"
+        )
+    return cameras, states[0]
+
+
 def _read_exactly(stream: Any, size: int) -> bytes:
     """Read exactly ``size`` bytes or raise; pipes may return short reads."""
     chunks: List[bytes] = []
@@ -430,20 +478,15 @@ class ServoSessionHost:
                 f"Servo endpoint state must be {expected_state_dim} floats, "
                 f"got {len(state_values)}"
             )
-        policy = self._policy
-        if (
-            policy is not None
-            and policy.observation_contract is None
-            and policy.active_binding.checkpoint_input_contract is not None
-        ):
-            # Same test Session.predict makes: no camera contract, so the SDK
-            # wants checkpoint-named arrays instead of an images/state dict.
+        contract = _checkpoint_input_contract(self._policy)
+        if contract is not None:
             if noise_seed is not None:
                 raise ServoBridgeError("Session.predict cannot carry a per-query noise seed")
             import numpy as np
 
-            inputs = {f"observation.images.{key}": _pixels(images[key]) for key in CAMERA_KEYS}
-            inputs["observation.state"] = np.asarray(state_values, dtype=np.float32)
+            camera_names, state_name = _checkpoint_input_names(contract)
+            inputs = {camera_names[key]: _pixels(images[key]) for key in CAMERA_KEYS}
+            inputs[state_name] = np.asarray(state_values, dtype=np.float32)
             prediction = self._session.predict(
                 inputs=inputs, instruction=instruction or self.instruction
             )

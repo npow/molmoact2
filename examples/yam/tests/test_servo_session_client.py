@@ -1965,12 +1965,41 @@ def _seeded_prediction_dict():
     return prediction
 
 
+class _ContractFeature:
+    """``CheckpointInputFeature``: the two fields the bridge reads."""
+
+    def __init__(self, name, modality):
+        self.name = name
+        self.modality = modality
+
+
+class _CheckpointContract:
+    """``CheckpointInputContract``: ``inputs`` and ``resolution``."""
+
+    def __init__(self, inputs, resolution="resolved"):
+        self.inputs = inputs
+        self.resolution = resolution
+
+
+def _lerobot_contract(prefix="observation.images.", state="observation.state"):
+    return _CheckpointContract(
+        tuple(_ContractFeature(f"{prefix}{key}", "image") for key in CAMERA_KEYS)
+        + (_ContractFeature(state, "state"),)
+    )
+
+
+class _PredictPolicy:
+    """Servo ``Policy`` members the predict/act routing reads."""
+
+    def __init__(self, contract, observation_contract=None):
+        self.observation_contract = observation_contract
+        self.active_binding = SimpleNamespace(checkpoint_input_contract=contract)
+
+
 class SessionHostPredictTests(unittest.TestCase):
     """A policy without a camera contract gets checkpoint-named arrays via predict."""
 
-    def test_jpeg_bytes_reach_predict_as_arrays(self):
-        from PIL import Image
-
+    def _host(self, policy):
         seen = {}
 
         class _Session:
@@ -1978,16 +2007,67 @@ class SessionHostPredictTests(unittest.TestCase):
                 seen.update(inputs)
                 return _fake_prediction()
 
-        buffer = io.BytesIO()
-        Image.new("RGB", (8, 8)).save(buffer, format="JPEG")
+            def act(self, observation, instruction=None):
+                seen["act"] = observation
+                return _fake_prediction()
+
         host = ServoSessionHost.__new__(ServoSessionHost)
         host._session = _Session()
-        host._policy = SimpleNamespace(
-            observation_contract=None,
-            active_binding=SimpleNamespace(checkpoint_input_contract={}),
-        )
+        host._policy = policy
         host.instruction = "pick up the red lid"
         host.identity = {}
-        host.act({key: buffer.getvalue() for key in CAMERA_KEYS}, [0.0] * STATE_DIM)
+        return host, seen
+
+    @staticmethod
+    def _jpeg_images():
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 8)).save(buffer, format="JPEG")
+        return {key: buffer.getvalue() for key in CAMERA_KEYS}
+
+    def test_jpeg_bytes_reach_predict_as_arrays(self):
+        host, seen = self._host(_PredictPolicy(_lerobot_contract()))
+        host.act(self._jpeg_images(), [0.0] * STATE_DIM)
         self.assertEqual(seen["observation.images.top"].shape, (8, 8, 3))
         self.assertEqual(seen["observation.state"].shape, (STATE_DIM,))
+
+    def test_input_names_come_from_the_contract(self):
+        host, seen = self._host(_PredictPolicy(_lerobot_contract("cam.", "robot_state")))
+        host.act(self._jpeg_images(), [0.0] * STATE_DIM)
+        self.assertEqual(
+            sorted(seen), sorted([f"cam.{key}" for key in CAMERA_KEYS] + ["robot_state"])
+        )
+
+    def test_contract_missing_a_camera_is_refused(self):
+        contract = _lerobot_contract()
+        contract.inputs = tuple(f for f in contract.inputs if f.name != "observation.images.left")
+        host, seen = self._host(_PredictPolicy(contract))
+        with self.assertRaisesRegex(ServoBridgeError, "camera 'left'"):
+            host.act(self._jpeg_images(), [0.0] * STATE_DIM)
+        self.assertEqual(seen, {})
+
+    def test_contract_with_extra_image_is_refused(self):
+        contract = _lerobot_contract()
+        contract.inputs += (_ContractFeature("observation.images.wrist", "image"),)
+        host, _ = self._host(_PredictPolicy(contract))
+        with self.assertRaisesRegex(ServoBridgeError, "observation.images.wrist"):
+            host.act(self._jpeg_images(), [0.0] * STATE_DIM)
+
+    def test_unnamed_contract_is_refused(self):
+        contract = _CheckpointContract(None, resolution="unresolved")
+        host, _ = self._host(_PredictPolicy(contract))
+        with self.assertRaisesRegex(ServoBridgeError, "not fully named"):
+            host.act(self._jpeg_images(), [0.0] * STATE_DIM)
+
+    def test_observation_contract_routes_to_act(self):
+        host, seen = self._host(_PredictPolicy(_lerobot_contract(), observation_contract={}))
+        host.act(self._jpeg_images(), [0.0] * STATE_DIM)
+        self.assertEqual(list(seen), ["act"])
+
+    def test_missing_binding_routes_to_act(self):
+        policy = _PredictPolicy(None)
+        policy.active_binding = None
+        host, seen = self._host(policy)
+        host.act(self._jpeg_images(), [0.0] * STATE_DIM)
+        self.assertEqual(list(seen), ["act"])
