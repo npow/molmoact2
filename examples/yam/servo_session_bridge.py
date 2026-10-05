@@ -62,10 +62,6 @@ STATE_DIM = 14
 ACTION_HORIZON = 30
 ACTION_SPACE = "joint_position"
 
-#: Credential file written for machine (SDK) use, e.g.
-#: ``~/.config/servo/molmoact2-yam-sdk.json``.
-SDK_CREDENTIAL_SCHEMA = "servo.sdk-credentials.v1"
-
 #: Environment variable naming a Python >= 3.12 interpreter that can import the
 #: official ``servo`` package, used when the robot runtime cannot.
 SERVO_PYTHON_ENV = "SERVO_PYTHON"
@@ -318,42 +314,6 @@ def write_frame(stream: Any, header: Mapping[str, Any], buffers: Sequence[bytes]
 
 
 # ---------------------------------------------------------------------------
-# Credentials
-# ---------------------------------------------------------------------------
-
-
-def load_sdk_credentials(path: str) -> Dict[str, Any]:
-    """Load and validate an SDK machine-key bundle. The secret never leaves here."""
-    credential_path = Path(path).expanduser()
-    try:
-        payload = json.loads(credential_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ServoBridgeError(f"Servo SDK credentials cannot be read: {credential_path}") from exc
-    if not isinstance(payload, dict) or payload.get("schema") != SDK_CREDENTIAL_SCHEMA:
-        raise ServoBridgeError(
-            "Servo SDK credentials must use schema "
-            f"{SDK_CREDENTIAL_SCHEMA!r} (got {payload.get('schema') if isinstance(payload, dict) else type(payload).__name__!r}); "
-            "the browser session token in credentials.json is not a machine API key"
-        )
-    api_key = payload.get("api_key")
-    base_url = payload.get("base_url")
-    if not isinstance(api_key, str) or not api_key:
-        raise ServoBridgeError("Servo SDK credentials are missing api_key")
-    if not isinstance(base_url, str) or not base_url.startswith("https://"):
-        raise ServoBridgeError("Servo SDK credentials must carry an https base_url")
-    try:
-        mode = credential_path.stat().st_mode
-    except OSError:  # pragma: no cover - stat cannot fail after a successful read
-        mode = 0
-    if mode & 0o077:
-        raise ServoBridgeError(
-            f"Servo SDK credentials {credential_path} are group/world readable; "
-            "run `chmod 600` on the file"
-        )
-    return payload
-
-
-# ---------------------------------------------------------------------------
 # The official-SDK half
 # ---------------------------------------------------------------------------
 
@@ -364,17 +324,13 @@ class ServoSessionHost:
     def __init__(
         self,
         *,
-        credentials: str,
         deployment_id: str,
         instruction: Optional[str] = None,
-        timeout_sec: Optional[float] = 600.0,
     ):
         if not deployment_id:
             raise ServoBridgeError("a managed Servo deployment id is required")
-        self._credentials_path = credentials
         self.deployment_id = str(deployment_id)
         self.instruction = instruction
-        self._timeout_sec = timeout_sec
         self._client: Any = None
         self._session: Any = None
         self._policy: Any = None
@@ -394,12 +350,7 @@ class ServoSessionHost:
                 f"{SERVO_PYTHON_ENV} at a Python >= 3.12 that has it"
             ) from exc
 
-        credentials = load_sdk_credentials(self._credentials_path)
-        client = Servo(
-            base_url=credentials["base_url"],
-            api_key=credentials["api_key"],
-            timeout=self._timeout_sec,
-        )
+        client = Servo()
         deployment = client.deployments.get(self.deployment_id)
         policy = deployment.policy(instruction=self.instruction)
         binding = policy.active_binding
@@ -442,8 +393,7 @@ class ServoSessionHost:
             "checkpoint_digest": getattr(binding, "checkpoint_digest", None),
             "manifest_hash": getattr(binding, "manifest_hash", None),
             "binding_revision": getattr(binding, "binding_revision", None),
-            "base_url": credentials["base_url"],
-            "key_id": credentials.get("key_id"),
+            "base_url": str(client._http.base_url),
             "advisory": getattr(deployment, "advisory", None),
         })
         return dict(self.identity)
@@ -891,10 +841,8 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
                     "by a self-hosted `servo serve` grant (direct mode)"
                 )
             host = ServoSessionHost(
-                credentials=header["credentials"],
                 deployment_id=header["deployment_id"],
                 instruction=header.get("instruction"),
-                timeout_sec=header.get("timeout_sec"),
             )
         identity = host.open()
         host_ref["host"] = host

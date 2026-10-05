@@ -111,10 +111,6 @@ ARM_DIM = 7
 # absolute-pose targets per query; the rollout executor validates and uses the
 # actual returned chunk length.
 
-#: Machine (SDK) credential bundle written for this robot. Mode 0600.
-DEFAULT_SERVO_CREDENTIALS = "~/.config/servo/molmoact2-yam-sdk.json"
-
-
 def require_bimanual_state(state: Any, *, source: str) -> np.ndarray:
     """Validate native checkpoint state order without inventing an arm state.
 
@@ -458,7 +454,6 @@ class ServoSessionTransport:
     def __init__(
         self,
         *,
-        credentials: Optional[str] = None,
         deployment_id: Optional[str] = None,
         grant: Optional[str] = None,
         instruction: Optional[str] = None,
@@ -497,21 +492,21 @@ class ServoSessionTransport:
         self.h264_crf = int(h264_crf) if h264_crf is not None else None
         self.grant = str(Path(grant).expanduser()) if grant else None
         if self.grant is None:
-            # Hosted mode: both halves of the control-plane identity are required.
-            if not credentials or not deployment_id:
+            # Servo resolves the signed-in user or robot-agent identity itself;
+            # only the deployment is specific to this run.
+            if not deployment_id:
                 raise ServoBridgeError(
-                    "hosted mode needs credentials and deployment_id; "
+                    "hosted mode needs deployment_id; configure Servo using its "
+                    "quickstart instructions; "
                     "self-hosted mode needs grant="
                 )
-            self.credentials = str(Path(credentials).expanduser())
             self.deployment_id = str(deployment_id)
         else:
-            if credentials or deployment_id:
+            if deployment_id:
                 raise ServoBridgeError(
                     "grant= names the entire endpoint identity; do not combine it "
-                    "with credentials/deployment_id (no fallback path exists)"
+                    "with deployment_id (no fallback path exists)"
                 )
-            self.credentials = None
             self.deployment_id = "self-hosted"
         self.instruction = instruction
         self.open_timeout_sec = float(open_timeout_sec)
@@ -558,9 +553,9 @@ class ServoSessionTransport:
         """Open the single action session; returns its control-plane identity."""
         if self.identity:
             return dict(self.identity)
-        # The SDK client's own httpx timeout is set once, from the (longer)
-        # open budget, and then covers the rest of the session's calls too —
-        # act() bounds itself with the parent-side queue wait below.
+        # Self-hosted sessions receive a timeout inside the parent's open
+        # budget. Managed sessions use Servo's defaults; subprocess calls
+        # are still bounded by the parent-side queue wait below.
         sdk_timeout = self._child_timeout(self.open_timeout_sec)
         if self._python is None:
             if self.grant is not None:
@@ -573,10 +568,8 @@ class ServoSessionTransport:
                 )
             else:
                 self._host = ServoSessionHost(
-                    credentials=self.credentials,
                     deployment_id=self.deployment_id,
                     instruction=self.instruction,
-                    timeout_sec=sdk_timeout,
                 )
             identity = self._host.open()
         else:
@@ -584,14 +577,13 @@ class ServoSessionTransport:
             header = {
                 "op": "open",
                 "instruction": self.instruction,
-                "timeout_sec": sdk_timeout,
                 "observation_encoding": self.observation_encoding,
                 "h264_crf": self.h264_crf,
             }
             if self.grant is not None:
                 header["grant"] = self.grant
+                header["timeout_sec"] = sdk_timeout
             else:
-                header["credentials"] = self.credentials
                 header["deployment_id"] = self.deployment_id
             identity = self._request(header, timeout=self.open_timeout_sec)["identity"]
         self.identity = dict(identity)
@@ -863,7 +855,6 @@ class MolmoActServo(PolicyBase):
         self,
         deployment: Optional[str] = None,
         *,
-        credentials: Optional[str] = None,
         grant: Optional[str] = None,
         instruction: Optional[str] = None,
         servo_python: Optional[str] = None,
@@ -914,7 +905,6 @@ class MolmoActServo(PolicyBase):
         self._inference_index = 0
         self._seed_proven = False
         self._transport = ServoSessionTransport(
-            credentials=(credentials or DEFAULT_SERVO_CREDENTIALS) if not grant else None,
             deployment_id=deployment,
             grant=grant,
             instruction=instruction,
@@ -928,7 +918,7 @@ class MolmoActServo(PolicyBase):
         self.logger.info(
             "MolmoActServo bound to %s (%s wire, %s SDK)",
             f"grant {grant} (self-hosted, no fallback)" if grant else
-            f"deployment {deployment} (credentials {self._transport.credentials})",
+            f"deployment {deployment}",
             self.observation_encoding,
             self._transport.mode,
         )

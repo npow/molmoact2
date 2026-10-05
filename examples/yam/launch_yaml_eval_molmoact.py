@@ -490,9 +490,6 @@ class Args:
     servo_deployment: Optional[str] = None
     """Managed Servo deployment id serving MolmoAct2 on YAM (``server`` mode)."""
 
-    servo_credentials: Optional[str] = None
-    """Servo SDK machine-key file; default ~/.config/servo/molmoact2-yam-sdk.json."""
-
     servo_grant: Optional[str] = None
     """Self-hosted `servo serve` grant file (``direct`` mode); no control plane, no fallback."""
 
@@ -2171,7 +2168,6 @@ def main() -> None:
         server_options = dict(eval_cfg.get("server") or {})
         for cli_value, key in (
             (args.servo_deployment, "deployment"),
-            (args.servo_credentials, "credentials"),
             (args.servo_python, "servo_python"),
         ):
             if cli_value is not None:
