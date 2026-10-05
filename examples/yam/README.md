@@ -91,19 +91,18 @@ There is no custom endpoint, no bespoke wire format, and no client-side token
 signing — the control plane owns authentication, the signed offer/lease, and
 generation fencing.
 
-**Credentials.** The client reads a machine (SDK) API key from
-`~/.config/servo/molmoact2-yam-sdk.json`, mode `0600`, schema
-`servo.sdk-credentials.v1` (`api_key`, `base_url`, `key_id`, `label`). Never
-commit it, never print its `api_key`, and keep the file owner-only — the client
-refuses a group/world-readable bundle and refuses the browser/CLI session token
-in `~/.config/servo/credentials.json`, which is not a machine API key.
-`SERVO_UNKEY_ROOT_KEY` (exported from `~/.bashrc`) is an Unkey
-provider/operator secret; it is **not** a robot client credential and must not
-be used here.
+**Servo identity.** On the robot computer, enroll the machine once with
+`servo agent install --name yam-cell-01`. Approve the printed code from an
+authenticated administrator computer with
+`servo robot approve CODE --name yam-cell-01`. Keep the agent running on the
+robot. The rollout uses `servo.Servo()` with no credential arguments: Servo
+gets the robot identity through its local agent. On your own computer, use
+`servo login` for account access and deployment management. See Servo's
+[identity guide](https://servo.mintlify.app/guides/identity) and
+[Python API](https://servo.mintlify.app/reference/python-api).
 
-**Interpreter split.** The robot runtime (`/home/npow/molmoact2-venv`) is
-Python 3.11 because of i2rt/pyrealsense2/torch; the official SDK requires
-Python >= 3.12. `servo_session_bridge.py` resolves that locally: it holds the
+**Interpreter split.** The official SDK requires Python >= 3.12.
+`servo_session_bridge.py` resolves that locally: it holds the
 SDK session code (`ServoSessionHost`) and can also run as a small stdio helper
 process under a 3.12 interpreter. If `servo` is importable in the running
 interpreter, the session runs in-process; otherwise you must name the
@@ -172,16 +171,14 @@ examples/yam/launch_yaml_eval_molmoact.py \
   --right-config-path examples/yam/configs/yam_right_primary.yaml \
   --policy-mode server \
   --servo-deployment dep_xxxxxxxxxxxx \
-  --servo-credentials ~/.config/servo/molmoact2-yam-sdk.json \
-  --servo-python /home/npow/code/servo/.venv/bin/python \
   --active-arm-side left \
   --execution-mode active_arm_hold \
   --num-rollouts 1
 ```
 
-`--servo-python` can be dropped if `SERVO_PYTHON` is exported or the launcher
-already runs on a 3.12 interpreter that has `servo-client`.
-`--servo-credentials` can be dropped to accept the default path above.
+If the rollout interpreter already has Servo installed, no `--servo-python`
+option is needed. On a Python 3.11 robot runtime, point `--servo-python` (or
+`SERVO_PYTHON`) at the Python 3.12 interpreter with Servo installed.
 
 **Launch the self-hosted full pi0.5 red-cap endpoint:**
 
@@ -353,7 +350,6 @@ PYTHONPATH=examples/yam /home/npow/molmoact2-venv/bin/python \
 |---|---|
 | `eval.mode` | `server` (one Servo action session), `http` (self-hosted `host_server_yam.py`), or `local` (in-process). Defaults to `server` when unset. CLI: `--policy-mode`. |
 | `eval.server.deployment` | Managed Servo deployment id (`dep_...`) for `mode: server`; required. CLI: `--servo-deployment`. |
-| `eval.server.credentials` | Servo SDK machine-key file (mode `0600`); default `~/.config/servo/molmoact2-yam-sdk.json`. CLI: `--servo-credentials`. |
 | `eval.server.servo_python` | Python >= 3.12 interpreter with `servo-client`, used when this runtime cannot import `servo`. CLI: `--servo-python`; env `SERVO_PYTHON`. |
 | `eval.server.jpeg_quality` | Camera JPEG quality for the action session; default `85` (~87 KiB for three frames; `75` gives ~65 KiB). |
 | `eval.server.image_size` | Optional client-side padded resize; default `null` so the Servo runtime owns preprocessing. |

@@ -62,10 +62,9 @@ eval:
   # Used when mode == server. The deployment must be a managed Servo hosted
   # deployment serving MolmoAct2 on the YAM embodiment; the SDK opens one
   # action session against it and reuses it for every action chunk.
-  # CLI overrides: --servo-deployment / --servo-credentials / --servo-python.
+  # CLI overrides: --servo-deployment / --servo-python.
   server:
     deployment: null                                       # dep_...
-    credentials: "~/.config/servo/molmoact2-yam-sdk.json"  # SDK machine key, mode 0600
     # Interpreter with servo-client installed; only needed when the robot
     # runtime is older than Python 3.12.
     servo_python: null
