@@ -23,7 +23,6 @@ kept (teleop, data collection, and the Gello leader-arm code are omitted).
 ```
 examples/yam/
 ├── host_server_yam.py            # self-hosted inference server (separate; see top-level README §5)
-├── host_servo_yam.py             # superseded self-hosted Servo endpoint (no client speaks it)
 ├── launch_yaml_eval_molmoact.py  # eval launcher — main entry point
 ├── molmoact_client.py            # MolmoActServo (Servo session) + MolmoActHTTP + MolmoActLocal policies
 ├── servo_session_bridge.py       # official Servo SDK session host + Python 3.11 -> 3.12 bridge
@@ -213,35 +212,6 @@ machine key still advertises the single-arm/SO-101 view, and runtime
 `action_sessions_enabled` defaults to false. Until it is created, `server` mode
 fails at session open (before any motor is enabled, by design). Use `http` or
 `local` mode in the meantime.
-
-### Superseded: the self-hosted Servo endpoint (`host_servo_yam.py`)
-
-`host_servo_yam.py` and its Odin systemd/observability units are **superseded**
-and no client in this tree speaks their protocol any more. They served a custom
-authenticated `/act` endpoint with a locally signed endpoint token, replaced by
-the official action-session path above. The client-side endpoint code and its
-token-signing dependency are gone from `molmoact_client.py` and
-`requirements.txt`; the endpoint credential/verifier bundles still sitting in
-`~/.config/servo/` are no longer read by anything here — the only Servo
-credential this client uses is `molmoact2-yam-sdk.json`.
-
-The file is still on disk and its long-lived user unit may still be running on
-Odin. If you find that unit serving traffic, it has no client here — inspect or
-retire it with:
-
-```bash
-ssh odin
-systemctl --user status molmoact2-yam-servo.service
-journalctl --user -u molmoact2-yam-servo.service -n 50
-# stop it once nothing depends on it:
-systemctl --user disable --now molmoact2-yam-servo.service
-```
-
-Its Prometheus/Grafana sidecar (root unit
-`molmoact2-yam-observability.service`, tailnet-only Grafana at
-`https://odin.tail17f7a4.ts.net/grafana/`, credentials in the mode-`0600` file
-`~/.config/servo/molmoact2-grafana.env`, which must not be committed) only ever
-scraped that endpoint and has no consumer in the current path.
 
 ## Hardware setup
 
