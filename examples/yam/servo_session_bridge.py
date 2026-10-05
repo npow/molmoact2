@@ -326,9 +326,13 @@ class ServoSessionHost:
         *,
         deployment_id: str,
         instruction: Optional[str] = None,
+        observation_encoding: str = "h264",
     ):
         if not deployment_id:
             raise ServoBridgeError("a managed Servo deployment id is required")
+        if observation_encoding not in OBSERVATION_ENCODINGS:
+            raise ServoBridgeError(f"unsupported observation encoding: {observation_encoding!r}")
+        self.observation_encoding = observation_encoding
         self.deployment_id = str(deployment_id)
         self.instruction = instruction
         self._client: Any = None
@@ -354,11 +358,18 @@ class ServoSessionHost:
         deployment = client.deployments.get(self.deployment_id)
         policy = deployment.policy(instruction=self.instruction)
         binding = policy.active_binding
-        session = client.session(policy)
+        session = client.session(policy, observation_encoding=self.observation_encoding)
         session.open()
-        if getattr(session, "_action_transport", None) is None:
-            # ``Session.open`` swallows CapabilityNotAvailable from the direct
-            # data plane and falls back to the central OpenPI WebSocket, which
+        # Current SDKs defer transport creation until the first predict when
+        # checkpoint image dimensions are dynamic. This is an H.264 path, not
+        # the legacy WebSocket fallback rejected below.
+        deferred_h264 = (
+            self.observation_encoding == "h264"
+            and getattr(session, "_deferred_image_geometry", False) is True
+        )
+        if getattr(session, "_action_transport", None) is None and not deferred_h264:
+            # Older SDKs swallow CapabilityNotAvailable from the direct
+            # data plane and fall back to the central OpenPI WebSocket, which
             # re-introduces base64-encoded JPEG frames and a control-plane
             # hairpin. That is silent unless we check for it here, and it must
             # fail closed: this client exists specifically to avoid base64.
@@ -394,6 +405,7 @@ class ServoSessionHost:
             "manifest_hash": getattr(binding, "manifest_hash", None),
             "binding_revision": getattr(binding, "binding_revision", None),
             "base_url": str(client._http.base_url),
+            "observation_encoding": self.observation_encoding,
             "advisory": getattr(deployment, "advisory", None),
         })
         return dict(self.identity)
@@ -822,9 +834,7 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
     if op == "open":
         if host is not None:
             raise ServoBridgeError("a Servo session is already open on this bridge")
-        observation_encoding = header.get("observation_encoding") or (
-            "h264" if header.get("grant") else "jpeg"
-        )
+        observation_encoding = header.get("observation_encoding") or "h264"
         if header.get("grant"):
             host = ServoDirectHost(
                 grant=header["grant"],
@@ -834,15 +844,10 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
                 h264_crf=header.get("h264_crf"),
             )
         else:
-            if observation_encoding != "jpeg":
-                raise ServoBridgeError(
-                    "a managed control-plane session sends jpeg observations; the "
-                    f"{observation_encoding!r} wire is negotiated per action session "
-                    "by a self-hosted `servo serve` grant (direct mode)"
-                )
             host = ServoSessionHost(
                 deployment_id=header["deployment_id"],
                 instruction=header.get("instruction"),
+                observation_encoding=observation_encoding,
             )
         identity = host.open()
         host_ref["host"] = host

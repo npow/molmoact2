@@ -281,7 +281,8 @@ def _fake_prediction(**overrides):
 
 
 def _install_fake_servo(
-    test, *, prediction_factory=None, advisory="p95 480 ms", direct_transport=True
+    test, *, prediction_factory=None, advisory="p95 480 ms", direct_transport=True,
+    deferred_geometry=False
 ):
     """Inject a fake ``servo`` module and return a recorder for what it saw."""
 
@@ -342,6 +343,7 @@ def _install_fake_servo(
             # here is exactly the state that must make ServoSessionHost.open
             # refuse the central-WebSocket/base64 fallback.
             self._action_transport = "fake-direct-transport" if direct_transport else None
+            self._deferred_image_geometry = deferred_geometry
 
         def open(self):
             self.opens += 1
@@ -363,7 +365,8 @@ def _install_fake_servo(
             self._http = _FakeHttp()
             state.clients.append(self)
 
-        def session(self, policy):
+        def session(self, policy, *, observation_encoding):
+            state.observation_encoding = observation_encoding
             session = _FakeSession(policy)
             state.sessions.append(session)
             return session
@@ -389,6 +392,36 @@ class ServoSessionHostTests(unittest.TestCase):
         kwargs.setdefault("deployment_id", "dep_test")
         kwargs.setdefault("instruction", "pick up the red cap")
         return ServoSessionHost(**kwargs)
+
+    def test_managed_session_explicitly_negotiates_h264(self):
+        state = _install_fake_servo(self)
+        identity = self._host().open()
+        self.assertEqual(state.observation_encoding, "h264")
+        self.assertEqual(identity["observation_encoding"], "h264")
+
+    @unittest.skipUnless(_HAVE_CLIENT and _HAVE_NUMPY, "client and numpy required")
+    def test_managed_h264_in_process_predict_receives_original_pixels(self):
+        state = _install_fake_servo(self)
+        transport = ServoSessionTransport(deployment_id="dep_test", logger=_QUIET_LOGGER)
+        self.addCleanup(transport.close)
+        transport.open()
+        state.policies[0].active_binding.checkpoint_input_contract = _lerobot_contract()
+        images = {key: np.full((8, 8, 3), i, dtype=np.uint8)
+                  for i, key in enumerate(CAMERA_KEYS)}
+        with unittest.mock.patch.object(
+            state.sessions[0], "predict", create=True, return_value=_fake_prediction()
+        ) as predict:
+            transport.act(images, [0.0] * STATE_DIM)
+        self.assertEqual(state.observation_encoding, "h264")
+        for key, frame in images.items():
+            np.testing.assert_array_equal(
+                predict.call_args.kwargs["inputs"][f"observation.images.{key}"], frame
+            )
+
+    def test_dynamic_image_geometry_can_defer_h264_transport(self):
+        state = _install_fake_servo(self, direct_transport=False, deferred_geometry=True)
+        self.assertEqual(self._host().open()["observation_encoding"], "h264")
+        self.assertEqual(state.sessions[0].opens, 1)
 
     def test_a_deployment_id_is_required(self):
         with self.assertRaisesRegex(ServoBridgeError, "deployment id"):
@@ -710,6 +743,8 @@ class _Session:
         if _SLEEP:
             time.sleep(_SLEEP)
         images = observation["images"]
+        images = {name: blob.tobytes() if hasattr(blob, "tobytes") else blob
+                  for name, blob in images.items()}
         for name, blob in images.items():
             if not isinstance(blob, (bytes, bytearray)):
                 raise AssertionError("camera %r arrived as %s" % (name, type(blob).__name__))
@@ -757,7 +792,8 @@ class Servo:
             base_url=self.base_url,
         )
 
-    def session(self, policy):
+    def session(self, policy, *, observation_encoding):
+        _trace("session.encoding", observation_encoding=observation_encoding)
         return _Session(policy)
 '''
 
@@ -776,6 +812,7 @@ class ServoSessionTransportTests(unittest.TestCase):
 
     def _transport(self, **kwargs):
         kwargs.setdefault("deployment_id", "dep_test")
+        kwargs.setdefault("observation_encoding", "jpeg")  # Legacy framing coverage.
         kwargs.setdefault("instruction", "pick up the red cap")
         kwargs.setdefault("servo_python", sys.executable)
         kwargs.setdefault("logger", _QUIET_LOGGER)
@@ -819,6 +856,18 @@ class ServoSessionTransportTests(unittest.TestCase):
 
             self.assertEqual(request.call_args.kwargs["timeout"], 45.0)
             self.assertEqual(host_class.call_args.kwargs["timeout_sec"], 35.0)
+
+    def test_managed_h264_pixels_survive_the_subprocess_bridge(self):
+        transport = self._transport(observation_encoding="h264")
+        self.assertEqual(transport.open()["observation_encoding"], "h264")
+        images = {key: np.full((8, 8, 3), i, dtype=np.uint8)
+                  for i, key in enumerate(CAMERA_KEYS)}
+        prediction = transport.act(images, [0.0] * STATE_DIM)
+        self.assertEqual(prediction["telemetry"]["image_digests"], {
+            key: hashlib.sha256(frame.tobytes()).hexdigest() for key, frame in images.items()
+        })
+        encoding = [e for e in self._trace_events() if e["event"] == "session.encoding"]
+        self.assertEqual(encoding[0]["observation_encoding"], "h264")
 
     def test_one_session_serves_every_chunk_through_the_child_interpreter(self):
         transport = self._transport()
@@ -1036,6 +1085,7 @@ class MolmoActServoTests(unittest.TestCase):
         self.np = np
 
     def _policy(self, *, prediction=None, **kwargs):
+        kwargs.setdefault("observation_encoding", "jpeg")  # Legacy encoder coverage.
         kwargs.setdefault("servo_python", sys.executable)
         kwargs.setdefault("instruction", "pick up the red cap")
         policy = MolmoActServo("dep_test", **kwargs)
@@ -1677,13 +1727,15 @@ class MolmoActServoWireTests(unittest.TestCase):
             self.assertEqual(frame.shape, (8, 8, 3))
             self.assertTrue(frame.flags["C_CONTIGUOUS"])
 
-    def test_the_codec_wire_needs_a_self_hosted_grant(self):
-        with self.assertRaisesRegex(ServoBridgeError, "self-hosted|grant="):
-            MolmoActServo(
-                deployment="dep_hosted",
-                servo_python=sys.executable,
-                observation_encoding="h264",
-            )
+    def test_managed_sessions_default_to_h264_and_never_encode_jpeg(self):
+        policy = MolmoActServo(deployment="dep_hosted", servo_python=sys.executable)
+        self.assertEqual(policy.observation_encoding, "h264")
+        policy._transport = _StubTransport()
+        with unittest.mock.patch.object(policy, "_jpeg_bytes", side_effect=AssertionError("JPEG")):
+            policy.inference(policy.prepare_input(self._observation(), "pick up the red lid"))
+        for frame in policy._transport.calls[0]["images"].values():
+            self.assertIsInstance(frame, np.ndarray)
+            self.assertEqual(frame.dtype, np.uint8)
 
     def test_every_declared_encoding_is_constructible(self):
         for encoding in OBSERVATION_ENCODINGS:

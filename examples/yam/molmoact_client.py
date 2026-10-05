@@ -474,7 +474,7 @@ class ServoSessionTransport:
         if act_timeout_sec <= 0:
             raise ValueError("act_timeout_sec must be positive")
         self.bridge_env = dict(bridge_env or {})
-        observation_encoding = observation_encoding or ("h264" if grant else "jpeg")
+        observation_encoding = observation_encoding or "h264"
         if observation_encoding not in OBSERVATION_ENCODINGS:
             raise ServoBridgeError(
                 f"observation_encoding must be one of {list(OBSERVATION_ENCODINGS)}, "
@@ -482,12 +482,8 @@ class ServoSessionTransport:
             )
         if h264_crf is not None and observation_encoding != "h264":
             raise ServoBridgeError("h264_crf only applies to observation_encoding='h264'")
-        if observation_encoding != "jpeg" and not grant:
-            raise ServoBridgeError(
-                f"the {observation_encoding!r} observation wire is negotiated per action "
-                "session by a self-hosted `servo serve` endpoint; it needs grant= "
-                "(--servo-grant / eval.direct.grant), not a managed deployment"
-            )
+        if h264_crf is not None and not grant:
+            raise ServoBridgeError("h264_crf is only supported for direct sessions")
         self.observation_encoding = observation_encoding
         self.h264_crf = int(h264_crf) if h264_crf is not None else None
         self.grant = str(Path(grant).expanduser()) if grant else None
@@ -570,6 +566,7 @@ class ServoSessionTransport:
                 self._host = ServoSessionHost(
                     deployment_id=self.deployment_id,
                     instruction=self.instruction,
+                    observation_encoding=self.observation_encoding,
                 )
             identity = self._host.open()
         else:
@@ -889,7 +886,7 @@ class MolmoActServo(PolicyBase):
         self.jpeg_quality = int(jpeg_quality)
         self.image_size = int(image_size) if image_size is not None else None
         self.observation_encoding = str(
-            observation_encoding or ("h264" if grant else "jpeg")
+            observation_encoding or "h264"
         )
         self.h264_crf = int(h264_crf) if h264_crf is not None else None
         self.action_horizon = ACTION_HORIZON

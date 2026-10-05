@@ -85,8 +85,9 @@ without editing a rollout YAML.
 
 ### Servo action sessions
 
-`server` mode is pure official Servo SDK: `Servo(base_url, api_key)` ->
-`deployments.get(...)` -> `deployment.policy(...)` -> `sv.session(policy)`.
+`server` mode is pure official Servo SDK: `Servo()` ->
+`deployments.get(...)` -> `deployment.policy(...)` ->
+`sv.session(policy, observation_encoding="h264")`.
 There is no custom endpoint, no bespoke wire format, and no client-side token
 signing — the control plane owns authentication, the signed offer/lease, and
 generation fencing.
@@ -147,19 +148,11 @@ from live feedback. All three cameras remain required. Gripper values stay in
 the native YAM convention (`0 = closed`, `1 = open`); the client performs no
 second inversion.
 
-Measured three-camera payload from this rig:
-
-| Encoding | Bytes for all three frames | Encode time | Notes |
-| --- | ---: | ---: | --- |
-| JPEG quality 85 (default) | ~87.3 KiB | ~14 ms | `eval.server.jpeg_quality: 85` |
-| JPEG quality 75 | ~64.8 KiB | ~14 ms | smaller, lower visual quality |
-| WebP quality 85 | ~51.4 KiB | ~182 ms | **not accepted** by Servo action sessions |
-
-WebP is smaller but costs an order of magnitude more CPU per query and Servo
-action sessions take JPEG or PNG only — stay on JPEG and tune
-`eval.server.jpeg_quality` if you need fewer bytes. `eval.server.image_size`
-stays `null` by default: frames go at source resolution because the Servo
-runtime owns model-specific resize/padding; it is a diagnostic override only.
+Managed and direct sessions default to **H.264**. The client passes raw RGB
+pixels to the SDK, whose session-owned encoder maintains the video stream.
+Use `--observation-encoding h264` to select it explicitly. Managed sessions
+use the SDK's encoder settings; `--h264-crf` applies only to direct sessions.
+`eval.server.image_size` defaults to `null` so the SDK/runtime owns preprocessing.
 
 **Launch a hosted run:**
 
@@ -171,6 +164,7 @@ examples/yam/launch_yaml_eval_molmoact.py \
   --right-config-path examples/yam/configs/yam_right_primary.yaml \
   --policy-mode server \
   --servo-deployment dep_xxxxxxxxxxxx \
+  --observation-encoding h264 \
   --active-arm-side left \
   --execution-mode active_arm_hold \
   --num-rollouts 1
@@ -351,7 +345,7 @@ PYTHONPATH=examples/yam /home/npow/molmoact2-venv/bin/python \
 | `eval.mode` | `server` (one Servo action session), `http` (self-hosted `host_server_yam.py`), or `local` (in-process). Defaults to `server` when unset. CLI: `--policy-mode`. |
 | `eval.server.deployment` | Managed Servo deployment id (`dep_...`) for `mode: server`; required. CLI: `--servo-deployment`. |
 | `eval.server.servo_python` | Python >= 3.12 interpreter with `servo-client`, used when this runtime cannot import `servo`. CLI: `--servo-python`; env `SERVO_PYTHON`. |
-| `eval.server.jpeg_quality` | Camera JPEG quality for the action session; default `85` (~87 KiB for three frames; `75` gives ~65 KiB). |
+| `eval.server.observation_encoding` | Defaults to `h264`; raw RGB pixels reach the SDK session encoder. CLI: `--observation-encoding`. |
 | `eval.server.image_size` | Optional client-side padded resize; default `null` so the Servo runtime owns preprocessing. |
 | `eval.molmoact_server` | `http` mode only: address of the self-hosted `host_server_yam.py`. CLI: `--molmoact-server`. |
 | `eval.local.*` | Checkpoint / device / dtype for `mode: local`. |

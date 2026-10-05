@@ -68,7 +68,7 @@ eval:
     # Interpreter with servo-client installed; only needed when the robot
     # runtime is older than Python 3.12.
     servo_python: null
-    jpeg_quality: 85           # three-camera payload ~87 KiB at 85, ~65 KiB at 75
+    observation_encoding: h264 # SDK session owns video encoding
     image_size: null           # null keeps source resolution; Servo owns preprocessing
 
   # Used when mode == http. Accepts a full URL, a bare host:port, or an
