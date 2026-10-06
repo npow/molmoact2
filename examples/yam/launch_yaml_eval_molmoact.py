@@ -2176,6 +2176,8 @@ def main() -> None:
                 "server mode needs a managed Servo deployment id: pass "
                 "--servo-deployment or set eval.server.deployment"
             )
+        if server_options.get("single_arm_side") is None and execution_mask.active_arm_side in {"left", "right"}:
+            server_options["single_arm_side"] = execution_mask.active_arm_side
         policy = MolmoActServo(**server_options)
     elif mode == "direct":
         # Self-hosted `servo serve` endpoint: the grant is the entire identity.

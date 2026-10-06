@@ -176,6 +176,14 @@ If the rollout interpreter already has Servo installed, no `--servo-python`
 option is needed. On a Python 3.11 robot runtime, point `--servo-python` (or
 `SERVO_PYTHON`) at the Python 3.12 interpreter with Servo installed.
 
+The [pi0.5 red-cap checkpoint](https://huggingface.co/npow/pi05-yam-red-cap-full-7500)
+is a single-active-arm policy: `middle`, `left`, and `right` RGB images at
+224 × 224, a 7-value state, and 15 × 7 action chunks at **15 Hz**. The adapter
+maps the overhead camera to `middle`, fits images to the declared geometry,
+and holds the inactive arm. Select `--active-arm-side left` or `right`.
+The pi0.5 hardware configs use 15 Hz; overriding them with `--control-hz 30`
+executes the trajectory twice as fast as its training cadence.
+
 **Launch the self-hosted full pi0.5 red-cap endpoint:**
 
 ```bash

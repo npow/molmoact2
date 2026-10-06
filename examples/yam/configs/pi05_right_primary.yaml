@@ -18,7 +18,7 @@ robot:
 agent:
   start_joints: null
 
-hz: 30
+hz: 15
 max_steps: 3000
 
 storage:
@@ -29,7 +29,7 @@ storage:
   png_compress_level: 1
 
 lerobot:
-  fps: 30
+  fps: 15
   robot_type: "pi05_right_arm"
   hf_repo_id: "local/yam_eval_session"
   action_mode: "next_joint_fields"

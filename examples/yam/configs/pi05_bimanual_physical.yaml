@@ -1,11 +1,9 @@
 # Primary hardware configuration for a remote pi0.5 rollout.
 # The Servo deployment or direct grant selects the model checkpoint.
 #
-# State/action field order is fixed by the checkpoint:
-#   0:7   physical left arm / can_left
-#   7:14  physical right arm / can_right
-#
-# Dual-arm motion requires explicit CLI opt-in or setting active_arm_side.
+# This rig has two arms, but the red-cap policy consumes/returns 7 values for
+# one active arm. The adapter places them in the selected half of the robot's
+# 14-value state and holds the other arm. The checkpoint runs at 15 Hz.
 model_arm_side: left
 
 sensors:
@@ -36,18 +34,18 @@ robot:
 agent:
   start_joints: null
 
-hz: 30
+hz: 15
 max_steps: 5000
 
 storage:
   base_dir: "./yam_eval_runs"
   task_directory: "pi05_red_lid_bimanual"
-  language_instruction: "Using both arms, coordinate to pick up the red lid, place it fully on top of the black box, release it, then move both arms away."
+  language_instruction: "Using the left arm, pick up the red lid, place it fully on top of the black box, release it, then move the arm away."
   saver_max_workers: 2
   png_compress_level: 1
 
 lerobot:
-  fps: 30
+  fps: 15
   robot_type: "pi05_bimanual_yam"
   hf_repo_id: "local/yam_eval_session"
   action_mode: "next_joint_fields"
@@ -59,7 +57,7 @@ lerobot:
 
 eval:
   bimanual:
-    active_arm_side: both
+    active_arm_side: left
     execution_mode: active_arm_hold
     both_arm_max_delta: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025]
   live_view_enabled: false

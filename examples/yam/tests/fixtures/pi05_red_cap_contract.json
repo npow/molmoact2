@@ -1,0 +1,62 @@
+{
+  "schema_version": "servo.checkpoint-input-contract.v1",
+  "resolution": "resolved",
+  "inputs": [
+    {
+      "name": "middle",
+      "modality": "image",
+      "shape": [
+        224,
+        224,
+        3
+      ],
+      "layout": "HWC",
+      "dtype": "uint8"
+    },
+    {
+      "name": "left",
+      "modality": "image",
+      "shape": [
+        224,
+        224,
+        3
+      ],
+      "layout": "HWC",
+      "dtype": "uint8"
+    },
+    {
+      "name": "right",
+      "modality": "image",
+      "shape": [
+        224,
+        224,
+        3
+      ],
+      "layout": "HWC",
+      "dtype": "uint8"
+    },
+    {
+      "name": "state",
+      "modality": "state",
+      "shape": [
+        7
+      ],
+      "layout": null,
+      "dtype": "float32"
+    }
+  ],
+  "outputs": {
+    "actions": {
+      "kind": "action_chunk",
+      "shape": [
+        15,
+        7
+      ]
+    }
+  },
+  "missing_metadata": [],
+  "declared": {
+    "control_rate_hz": 15.0,
+    "control_rate_source": "servo_checkpoint.json:README.md:Action chunk"
+  }
+}

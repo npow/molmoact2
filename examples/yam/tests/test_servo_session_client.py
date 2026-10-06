@@ -282,7 +282,7 @@ def _fake_prediction(**overrides):
 
 def _install_fake_servo(
     test, *, prediction_factory=None, advisory="p95 480 ms", direct_transport=True,
-    deferred_geometry=False
+    deferred_geometry=False, checkpoint_contract=None
 ):
     """Inject a fake ``servo`` module and return a recorder for what it saw."""
 
@@ -312,6 +312,7 @@ def _install_fake_servo(
             self.status = "active"
             self.advisory = advisory
             self.binding = _FakeBinding()
+            self.binding.checkpoint_input_contract = checkpoint_contract
             self.policy_instructions = []
 
         def policy(self, robot=None, *, instruction=None):
@@ -400,6 +401,57 @@ class ServoSessionHostTests(unittest.TestCase):
         ):
             identity = self._host().open()
         self.assertIs(identity["supports_noise_seed"], False)
+
+    @unittest.skipUnless(_HAVE_CLIENT and _HAVE_NUMPY, "client and numpy required")
+    def test_deployed_pi05_contract_maps_pixels_state_and_actions(self):
+        # Contract captured from dep_fd4a640d920b, HF npow/pi05-yam-red-cap-full-7500
+        # revision 39c6876521b3d8363452bed6731c8705b3944c24.
+        payload = json.loads((Path(__file__).parent / "fixtures/pi05_red_cap_contract.json").read_text())
+        payload["inputs"] = [SimpleNamespace(**feature) for feature in payload["inputs"]]
+        contract = SimpleNamespace(**payload)
+        state = _install_fake_servo(self, checkpoint_contract=contract)
+        policy = MolmoActServo(deployment="dep_test", single_arm_side="left")
+        self.addCleanup(policy.close)
+        identity = policy.open()
+        self.assertEqual((identity["state_dim"], identity["action_dim"], policy.get_action_horizon()), (7, 7, 15))
+        observation = {
+            "front_camera_rgb": np.full((480, 640, 3), 50, dtype=np.uint8),
+            "left_camera_rgb": np.full((480, 640, 3), 100, dtype=np.uint8),
+            "right_camera_rgb": np.full((480, 640, 3), 150, dtype=np.uint8),
+            "joint_positions": np.arange(14, dtype=np.float32),
+        }
+        prediction = _fake_prediction(actions=[[0.25] * 7 for _ in range(15)], horizon=15)
+        with unittest.mock.patch.object(state.sessions[0], "predict", create=True, return_value=prediction) as predict:
+            result = policy.inference(policy.prepare_input(observation, "move the red lid"))
+        inputs = predict.call_args.kwargs["inputs"]
+        self.assertEqual(set(inputs), {"middle", "left", "right", "state"})
+        np.testing.assert_array_equal(inputs["state"], observation["joint_positions"][:7])
+        for name, value in (("middle", 50), ("left", 100), ("right", 150)):
+            self.assertEqual(inputs[name].shape, (224, 224, 3))
+            self.assertEqual(inputs[name].dtype, np.uint8)
+            np.testing.assert_array_equal(inputs[name][112, 112], [value] * 3)
+            self.assertEqual(int(inputs[name][0].max()), 0)  # centered letterbox
+        self.assertEqual(result["actions"].shape, (15, 14))
+        np.testing.assert_array_equal(result["actions"][:, :7], np.full((15, 7), 0.25))
+        np.testing.assert_array_equal(result["actions"][:, 7:], np.tile(np.arange(7, 14), (15, 1)))
+
+    def test_middle_camera_contract_opens_with_h264(self):
+        contract = _CheckpointContract(
+            tuple(_ContractFeature(key, "image") for key in ("middle", "left", "right"))
+            + (_ContractFeature("state", "state"),)
+        )
+        state = _install_fake_servo(self, checkpoint_contract=contract)
+        self.assertEqual(self._host().open()["observation_encoding"], "h264")
+        self.assertEqual(state.sessions[0].opens, 1)
+
+    def test_invalid_camera_contract_fails_before_session_open(self):
+        contract = _lerobot_contract()
+        contract.inputs = tuple(f for f in contract.inputs if f.name != "observation.images.left")
+        state = _install_fake_servo(self, checkpoint_contract=contract)
+        with self.assertRaisesRegex(ServoBridgeError, "camera 'left'"):
+            self._host().open()
+        self.assertEqual(state.sessions, [])
+        self.assertEqual(state.clients[0]._http.closed, 1)
 
     def test_managed_session_explicitly_negotiates_h264(self):
         state = _install_fake_servo(self)
@@ -2025,6 +2077,29 @@ class SessionHostPredictTests(unittest.TestCase):
         self.assertEqual(
             sorted(seen), sorted([f"cam.{key}" for key in CAMERA_KEYS] + ["robot_state"])
         )
+
+    def test_pi05_middle_input_receives_overhead_pixels(self):
+        for prefix in ("", "observation.images."):
+            with self.subTest(prefix=prefix):
+                contract = _CheckpointContract(
+                    tuple(_ContractFeature(prefix + key, "image")
+                          for key in ("middle", "left", "right"))
+                    + (_ContractFeature("state", "state"),)
+                )
+                host, seen = self._host(_PredictPolicy(contract))
+                images = {key: np.full((8, 8, 3), i + 1, dtype=np.uint8)
+                          for i, key in enumerate(CAMERA_KEYS)}
+                host.act(images, [0.0] * STATE_DIM)
+                for source, target in (("top", "middle"), ("left", "left"), ("right", "right")):
+                    np.testing.assert_array_equal(seen[prefix + target], images[source])
+
+    def test_top_and_middle_together_are_ambiguous(self):
+        contract = _lerobot_contract()
+        contract.inputs += (_ContractFeature("middle", "image"),)
+        host, seen = self._host(_PredictPolicy(contract))
+        with self.assertRaisesRegex(ServoBridgeError, "2 image inputs for camera 'top'"):
+            host.act(self._jpeg_images(), [0.0] * STATE_DIM)
+        self.assertEqual(seen, {})
 
     def test_contract_missing_a_camera_is_refused(self):
         contract = _lerobot_contract()
