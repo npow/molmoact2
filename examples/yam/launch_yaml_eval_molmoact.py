@@ -497,15 +497,12 @@ class Args:
     """Python >= 3.12 interpreter with servo-client, if this runtime lacks it."""
 
     observation_encoding: Optional[Literal["jpeg", "h264"]] = None
-    """``direct`` mode only: the observation wire the action session negotiates.
-    ``h264`` is the self-hosted direct default and sends fitted pixels through
-    the session-owned encoder; ``jpeg`` is the explicit comparison/fallback and
-    mints one JPEG per camera on this machine. H.264 lets the session's own
-    transport encode them into a per-camera stateful stream -- measured ~21 KB
-    per act against ~88 KB on jpeg. Overrides eval.direct.observation_encoding."""
+    """Observation wire for server/direct mode; defaults to H.264. Raw camera
+    pixels go to the SDK's session-owned encoder. Overrides the corresponding
+    eval.server.observation_encoding or eval.direct.observation_encoding."""
 
     h264_crf: Optional[int] = None
-    """``--observation-encoding h264`` only: the encoder's rate point. Leave it
+    """Direct mode with H.264 only: the encoder's rate point. Leave it
     unset for the qualified default; the decoder is indifferent either way."""
 
     exec_steps: Optional[int] = None
@@ -2168,6 +2165,8 @@ def main() -> None:
         server_options = dict(eval_cfg.get("server") or {})
         for cli_value, key in (
             (args.servo_deployment, "deployment"),
+            (args.observation_encoding, "observation_encoding"),
+            (args.h264_crf, "h264_crf"),
             (args.servo_python, "servo_python"),
         ):
             if cli_value is not None:
@@ -2225,6 +2224,11 @@ def main() -> None:
         # to make that true -- ``DirectPolicy`` is otherwise lazy and would
         # first touch the network on the first act, with the arms already live.
         identity = policy.open()
+        try:
+            policy.validate_rollout_seed(seed_plan.rollout_seed(0))
+        except Exception:
+            policy.close(success=False)
+            raise
         print(
             f"[servo] action session {identity.get('session_id')} on "
             f"{identity.get('deployment_id')} "
