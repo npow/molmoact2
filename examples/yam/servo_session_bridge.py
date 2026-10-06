@@ -241,7 +241,9 @@ def _checkpoint_input_contract(policy: Any) -> Any:
 def _checkpoint_input_names(contract: Any) -> Tuple[Dict[str, str], str]:
     """Map ``CAMERA_KEYS`` and the state vector onto the contract's input names.
 
-    Cameras match an image input whose name ends in ``.<key>`` (or is ``<key>``);
+    Cameras match an image input whose name ends in ``.<key>`` (or is ``<key>``).
+    The physical overhead camera is called ``top`` locally and ``middle`` by
+    native pi0.5 contracts; both names refer to that same camera.
     the state matches the single state input. Anything this embodiment cannot
     fill, or leaves unfilled, is refused here rather than by the SDK's
     validator, whose message would not say which side is wrong.
@@ -255,7 +257,8 @@ def _checkpoint_input_names(contract: Any) -> Tuple[Dict[str, str], str]:
     states = [f.name for f in features if f.modality == "state"]
     cameras: Dict[str, str] = {}
     for key in CAMERA_KEYS:
-        matches = [name for name in images if name.rsplit(".", 1)[-1] == key]
+        aliases = {"top", "middle"} if key == "top" else {key}
+        matches = [name for name in images if name.rsplit(".", 1)[-1] in aliases]
         if len(matches) != 1:
             raise ServoBridgeError(
                 f"checkpoint input contract has {len(matches)} image inputs for camera "
@@ -269,6 +272,62 @@ def _checkpoint_input_names(contract: Any) -> Tuple[Dict[str, str], str]:
             f"one state vector: unmatched image inputs {unused}, state inputs {states}"
         )
     return cameras, states[0]
+
+
+def _checkpoint_geometry(contract: Any) -> Dict[str, Any]:
+    """Read physical dimensions and camera geometry from the deployed contract."""
+    camera_names, state_name = _checkpoint_input_names(contract)
+    features = {feature.name: feature for feature in contract.inputs}
+    result: Dict[str, Any] = {"camera_inputs": {}}
+    state_shape = getattr(features[state_name], "shape", None)
+    outputs = _jsonable(getattr(contract, "outputs", None) or {})
+    action_shape = (outputs.get("actions") or {}).get("shape")
+    if state_shape is not None or action_shape is not None:
+        if (not state_shape or len(state_shape) != 1 or state_shape[0] not in (7, 14)
+                or not action_shape or len(action_shape) != 2
+                or action_shape[1] != state_shape[0]
+                or not isinstance(action_shape[0], int) or action_shape[0] <= 0):
+            raise ServoBridgeError(
+                f"unsupported checkpoint state/action shapes: {state_shape}, {action_shape}"
+            )
+        result.update(state_dim=state_shape[0], action_dim=action_shape[1],
+                      action_horizon=action_shape[0])
+    for key, name in camera_names.items():
+        feature = features[name]
+        shape = getattr(feature, "shape", None)
+        if shape is None:
+            continue
+        layout = getattr(feature, "layout", None) or "HWC"
+        if len(shape) != 3 or layout not in ("HWC", "CHW"):
+            raise ServoBridgeError(f"unsupported checkpoint image shape/layout for {name}: {shape}/{layout}")
+        height, width, channels = shape if layout == "HWC" else (shape[1], shape[2], shape[0])
+        if channels != 3 or getattr(feature, "dtype", "uint8") not in (None, "uint8"):
+            raise ServoBridgeError(f"checkpoint image {name} must accept uint8 RGB")
+        result["camera_inputs"][key] = dict(height=height, width=width, layout=layout)
+    declared = _jsonable(getattr(contract, "declared", None) or {})
+    if declared.get("control_rate_hz") is not None:
+        result["control_rate_hz"] = declared["control_rate_hz"]
+    return result
+
+
+def _checkpoint_pixels(value: Any, geometry: Mapping[str, Any]) -> Any:
+    """Fit raw RGB pixels to the checkpoint tensor; H.264 encoding stays in Servo."""
+    import numpy as np
+    from PIL import Image
+
+    pixels = _pixels(value)
+    height, width = geometry.get("height"), geometry.get("width")
+    if height and width and pixels.shape[:2] != (height, width):
+        source_h, source_w = pixels.shape[:2]
+        ratio = max(source_w / width, source_h / height)
+        size = (max(1, int(source_w / ratio)), max(1, int(source_h / ratio)))
+        resized = Image.fromarray(pixels).resize(size, Image.Resampling.BILINEAR)
+        canvas = Image.new("RGB", (width, height))
+        canvas.paste(resized, ((width - size[0]) // 2, (height - size[1]) // 2))
+        pixels = np.asarray(canvas)
+    if geometry.get("layout") == "CHW":
+        pixels = pixels.transpose(2, 0, 1)
+    return np.ascontiguousarray(pixels)
 
 
 def _read_exactly(stream: Any, size: int) -> bytes:
@@ -358,6 +417,15 @@ class ServoSessionHost:
         deployment = client.deployments.get(self.deployment_id)
         policy = deployment.policy(instruction=self.instruction)
         binding = policy.active_binding
+        # Validate the camera/state mapping before a session or robot is opened.
+        # A deployment contract is available now; discovering an incompatible
+        # name on the first predict would be too late for the launcher's preflight.
+        try:
+            contract = _checkpoint_input_contract(policy)
+            geometry = _checkpoint_geometry(contract) if contract is not None else {}
+        except Exception:
+            client._http.close()
+            raise
         session = client.session(policy, observation_encoding=self.observation_encoding)
         session.open()
         # Current SDKs defer transport creation until the first predict when
@@ -395,6 +463,7 @@ class ServoSessionHost:
         # ``_jsonable`` so the identity survives the local frame header even if
         # a future SDK returns a model object for one of these fields.
         self.identity = _jsonable({
+            **geometry,
             "deployment_id": self.deployment_id,
             "session_id": session.session_id,
             "eval_run_id": session.eval_run_id,
@@ -451,7 +520,9 @@ class ServoSessionHost:
             import numpy as np
 
             camera_names, state_name = _checkpoint_input_names(contract)
-            inputs = {camera_names[key]: _pixels(images[key]) for key in CAMERA_KEYS}
+            geometry = _checkpoint_geometry(contract).get("camera_inputs", {})
+            inputs = {camera_names[key]: _checkpoint_pixels(images[key], geometry.get(key, {}))
+                      for key in CAMERA_KEYS}
             inputs[state_name] = np.asarray(state_values, dtype=np.float32)
             prediction = self._session.predict(
                 inputs=inputs, instruction=instruction or self.instruction
@@ -533,7 +604,7 @@ class ServoSessionHost:
         """
         control_profile = self.identity.get("control_profile") or {}
         exec_steps = control_profile.get("exec_steps")
-        return int(exec_steps) if exec_steps else ACTION_HORIZON
+        return int(exec_steps or self.identity.get("action_horizon") or ACTION_HORIZON)
 
     def _expected_state_dim(self) -> int:
         """Return the endpoint-advertised state width, with the legacy default."""
