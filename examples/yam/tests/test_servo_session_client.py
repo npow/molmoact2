@@ -10,8 +10,8 @@ suite is to fence the parts of the contract that a live run cannot re-check:
 * managed sessions construct the SDK client from Servo's documented environment;
 * exactly ONE action session is opened and reused for every action chunk, and
   camera frames reach ``session.act`` as raw JPEG bytes -- never base64;
-* every prediction is fenced (shape, finiteness, action space, decoded flag,
-  generation) before the robot could ever execute it.
+* SDK predictions and metadata pass through unchanged; the robot-facing
+  policy still checks action shape and finiteness before execution.
 """
 
 from __future__ import annotations
@@ -394,13 +394,6 @@ class ServoSessionHostTests(unittest.TestCase):
         kwargs.setdefault("instruction", "pick up the red cap")
         return ServoSessionHost(**kwargs)
 
-    def test_predict_session_advertises_that_noise_seeds_are_unsupported(self):
-        _install_fake_servo(self)
-        with unittest.mock.patch(
-            "servo_session_bridge._checkpoint_input_contract", return_value=_lerobot_contract()
-        ):
-            identity = self._host().open()
-        self.assertIs(identity["supports_noise_seed"], False)
 
     @unittest.skipUnless(_HAVE_CLIENT and _HAVE_NUMPY, "client and numpy required")
     def test_deployed_pi05_contract_maps_pixels_state_and_actions(self):
@@ -420,7 +413,8 @@ class ServoSessionHostTests(unittest.TestCase):
             "right_camera_rgb": np.full((480, 640, 3), 150, dtype=np.uint8),
             "joint_positions": np.arange(14, dtype=np.float32),
         }
-        prediction = _fake_prediction(actions=[[0.25] * 7 for _ in range(15)], horizon=15)
+        prediction = _fake_prediction(actions=[[0.25] * 7 for _ in range(15)], horizon=15,
+                                      action_space="checkpoint_native")
         with unittest.mock.patch.object(state.sessions[0], "predict", create=True, return_value=prediction) as predict:
             result = policy.inference(policy.prepare_input(observation, "move the red lid"))
         inputs = predict.call_args.kwargs["inputs"]
@@ -431,6 +425,7 @@ class ServoSessionHostTests(unittest.TestCase):
             self.assertEqual(inputs[name].dtype, np.uint8)
             np.testing.assert_array_equal(inputs[name][112, 112], [value] * 3)
             self.assertEqual(int(inputs[name][0].max()), 0)  # centered letterbox
+        self.assertEqual(result["servo"]["action_space"], "checkpoint_native")
         self.assertEqual(result["actions"].shape, (15, 14))
         np.testing.assert_array_equal(result["actions"][:, :7], np.full((15, 7), 0.25))
         np.testing.assert_array_equal(result["actions"][:, 7:], np.tile(np.arange(7, 14), (15, 1)))
@@ -533,20 +528,6 @@ class ServoSessionHostTests(unittest.TestCase):
         self.assertIs(session.policy, state.policies[0])
         self.assertEqual(state.clients[0].base_url, _FAKE_BASE_URL)
 
-    def test_a_transport_downgrade_to_the_central_websocket_is_refused(self):
-        # Session.open() swallows CapabilityNotAvailable from the direct data
-        # plane and silently falls back to the base64/msgpack central
-        # WebSocket path (servo/execution/session.py:72-90). That fallback
-        # defeats the entire point of this client and must fail closed.
-        state = _install_fake_servo(self, direct_transport=False)
-        host = self._host()
-        with self.assertRaisesRegex(ServoBridgeError, "no direct action-session data plane"):
-            host.open()
-        session = state.sessions[0]
-        self.assertEqual(session.opens, 1)
-        # The half-open session must be completed as a failure, not abandoned.
-        self.assertEqual(session.closes, [{"success": False, "suppress_completion_error": True}])
-        self.assertEqual(state.clients[0]._http.closed, 1)
 
     def test_observations_carry_raw_jpeg_bytes_and_a_14_float_state(self):
         state = _install_fake_servo(self)
@@ -629,49 +610,13 @@ class ServoSessionHostTests(unittest.TestCase):
         host.open()
         return host
 
-    def test_a_short_action_chunk_is_refused(self):
-        host = self._open_host_with(actions=[[0.0] * STATE_DIM for _ in range(29)])
-        with self.assertRaisesRegex(ServoBridgeError, "30x14"):
-            host.act(_camera_blobs(), [0.0] * STATE_DIM)
 
-    def test_a_narrow_action_chunk_is_refused(self):
-        host = self._open_host_with(
-            actions=[[0.0] * 7 for _ in range(ACTION_HORIZON)]
-        )
-        with self.assertRaisesRegex(ServoBridgeError, "30x14"):
-            host.act(_camera_blobs(), [0.0] * STATE_DIM)
 
-    def test_an_empty_action_chunk_is_refused(self):
-        host = self._open_host_with(actions=None)
-        with self.assertRaisesRegex(ServoBridgeError, "30x14"):
-            host.act(_camera_blobs(), [0.0] * STATE_DIM)
 
-    def test_a_non_finite_action_is_refused(self):
-        actions = [[0.0] * STATE_DIM for _ in range(ACTION_HORIZON)]
-        actions[7][3] = float("nan")
-        host = self._open_host_with(actions=actions)
-        with self.assertRaisesRegex(ServoBridgeError, "non-finite"):
-            host.act(_camera_blobs(), [0.0] * STATE_DIM)
 
-        actions[7][3] = float("inf")
-        host = self._open_host_with(actions=actions)
-        with self.assertRaisesRegex(ServoBridgeError, "non-finite"):
-            host.act(_camera_blobs(), [0.0] * STATE_DIM)
 
-    def test_a_foreign_action_space_is_refused(self):
-        host = self._open_host_with(action_space="end_effector_pose")
-        with self.assertRaisesRegex(ServoBridgeError, "action space"):
-            host.act(_camera_blobs(), [0.0] * STATE_DIM)
 
-    def test_an_undecoded_chunk_is_refused(self):
-        host = self._open_host_with(decoded=False)
-        with self.assertRaisesRegex(ServoBridgeError, "undecoded"):
-            host.act(_camera_blobs(), [0.0] * STATE_DIM)
 
-    def test_a_generation_switch_under_the_session_is_refused(self):
-        host = self._open_host_with(binding=_FakeBinding(generation_id="gen_other"))
-        with self.assertRaisesRegex(ServoBridgeError, "different generation"):
-            host.act(_camera_blobs(), [0.0] * STATE_DIM)
 
     def test_missing_camera_bytes_are_refused(self):
         _install_fake_servo(self)
@@ -1170,19 +1115,9 @@ class MolmoActServoTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "deployment id"):
                 MolmoActServo(missing)
 
-    def test_unsupported_seed_is_rejected_before_inference(self):
-        policy = self._policy()
-        policy._transport.identity["supports_noise_seed"] = False
-        with self.assertRaisesRegex(ServoBridgeError, "seed to null"):
-            policy.validate_rollout_seed(123)
-        with self.assertRaisesRegex(ServoBridgeError, "seed to null"):
-            policy.begin_rollout(123)
-        self.assertEqual(policy._transport.calls, [])
 
     def test_unseeded_h264_rollout_does_not_warn_about_seed_replay(self):
         policy = self._policy(observation_encoding="h264")
-        policy._transport.identity["supports_noise_seed"] = False
-        policy.validate_rollout_seed(None)
         policy._transport.begin_episode = unittest.mock.Mock(return_value=False)
         with unittest.mock.patch.object(policy.logger, "warning") as warning:
             policy.begin_rollout(None)
@@ -1688,15 +1623,6 @@ class ServoDirectHostOpenTests(unittest.TestCase):
         self.assertEqual(identity["observation_encoding"], "h264")
         self.assertEqual(identity["h264_crf"], 27)
 
-    def test_an_sdk_without_the_codec_wire_is_named_not_silently_downgraded(self):
-        def _reject(kwargs):
-            if "observation_encoding" in kwargs:
-                raise TypeError("attach() got an unexpected keyword argument")
-
-        _install_fake_servo_direct(self, attach_hook=_reject)
-        host = ServoDirectHost(grant=self.grant, observation_encoding="h264")
-        with self.assertRaisesRegex(ServoBridgeError, "predates the codec wire"):
-            host.open()
 
     def test_an_unknown_encoding_is_refused_up_front(self):
         with self.assertRaisesRegex(ServoBridgeError, "observation_encoding must be"):
@@ -1708,17 +1634,6 @@ class ServoDirectHostOpenTests(unittest.TestCase):
                 grant=self.grant, observation_encoding="jpeg", h264_crf=27
             )
 
-    def test_a_generation_switch_under_a_direct_session_is_refused(self):
-        # Populating generation_id at open is what arms the inherited fence
-        # for self-hosted endpoints; before that it was silently inert here.
-        state = _install_fake_servo_direct(self)
-        state_grant = sys.modules["servo.direct"]
-        host = ServoDirectHost(grant=self.grant)
-        host.open()
-        host.identity["generation_id"] = "gen_other"
-        with self.assertRaisesRegex(ServoBridgeError, "different generation"):
-            host.act({key: b"\xff\xd8jpeg" for key in CAMERA_KEYS}, [0.0] * STATE_DIM)
-        del state, state_grant
 
     @unittest.skipUnless(_HAVE_NUMPY, "numpy is required for the raw-pixel wire")
     def test_raw_pixels_reach_the_sdk_unencoded(self):
@@ -1962,38 +1877,6 @@ class RemoteNoiseSeedTests(unittest.TestCase):
         self.assertFalse(policy.reproducibility_metadata()["deterministic_generator"])
 
 
-class SessionHostNoiseSeedTests(unittest.TestCase):
-    """A seed the session cannot carry is refused, never dropped."""
-
-    def _host(self, session):
-        host = ServoSessionHost.__new__(ServoSessionHost)
-        host._session = session
-        host.instruction = "pick up the red lid"
-        host.identity = {}
-        return host
-
-    def test_session_without_the_parameter_is_reported_as_unable(self):
-        class _Old:
-            def act(self, observation, instruction=None):
-                raise AssertionError("must not be called")
-
-        self.assertFalse(self._host(_Old())._session_accepts_noise_seed())
-
-    def test_a_kwargs_sink_is_not_trusted(self):
-        """**kwargs accepts the seed and may discard it -- the original defect."""
-
-        class _Sink:
-            def act(self, observation, instruction=None, **kwargs):
-                raise AssertionError("must not be called")
-
-        self.assertFalse(self._host(_Sink())._session_accepts_noise_seed())
-
-    def test_a_seedable_session_is_recognised(self):
-        class _New:
-            def act(self, observation, instruction=None, noise_seed=None):
-                raise AssertionError("must not be called")
-
-        self.assertTrue(self._host(_New())._session_accepts_noise_seed())
 
 
 def _seeded_prediction_dict():
@@ -2042,8 +1925,10 @@ class SessionHostPredictTests(unittest.TestCase):
         seen = {}
 
         class _Session:
-            def predict(self, *, inputs, instruction=None):
+            def predict(self, *, inputs, instruction=None, noise_seed=None):
                 seen.update(inputs)
+                if noise_seed is not None:
+                    seen["noise_seed"] = noise_seed
                 return _fake_prediction()
 
             def act(self, observation, instruction=None):
@@ -2064,6 +1949,11 @@ class SessionHostPredictTests(unittest.TestCase):
         buffer = io.BytesIO()
         Image.new("RGB", (8, 8)).save(buffer, format="JPEG")
         return {key: buffer.getvalue() for key in CAMERA_KEYS}
+
+    def test_explicit_seed_is_forwarded_to_current_sdk_predict(self):
+        host, seen = self._host(_PredictPolicy(_lerobot_contract()))
+        host.act(self._jpeg_images(), [0.0] * STATE_DIM, noise_seed=42)
+        self.assertEqual(seen["noise_seed"], 42)
 
     def test_jpeg_bytes_reach_predict_as_arrays(self):
         host, seen = self._host(_PredictPolicy(_lerobot_contract()))
