@@ -1004,6 +1004,17 @@ class MolmoActServo(PolicyBase):
     def close(self, success: bool = True) -> None:
         self._transport.close(success=success)
 
+    def validate_rollout_seed(self, rollout_seed: Optional[int]) -> None:
+        """Reject unsupported deterministic sampling before robot startup."""
+        if (
+            rollout_seed is not None
+            and self._transport.identity.get("supports_noise_seed") is False
+        ):
+            raise ServoBridgeError(
+                "this Servo session does not support per-query noise seeds; "
+                "set eval.reproducibility.seed to null and omit --seed"
+            )
+
     def begin_rollout(self, rollout_seed: Optional[int]) -> Dict[str, Any]:
         """Start an isolated deterministic noise stream for this rollout.
 
@@ -1013,6 +1024,7 @@ class MolmoActServo(PolicyBase):
         on one session diverged 0.023 rad (measured thor->odin) where separate
         sessions were bit-identical.
         """
+        self.validate_rollout_seed(rollout_seed)
         self._rollout_seed = RolloutSeedPlan(rollout_seed).base_seed
         self._inference_index = 0
         self._seed_proven = False
@@ -1022,7 +1034,7 @@ class MolmoActServo(PolicyBase):
             # exists -- the first rollout's first act already starts on an IDR.
             if self._transport.identity:
                 wire_reprimed = self._transport.begin_episode()
-                if not wire_reprimed:
+                if not wire_reprimed and self._rollout_seed is not None:
                     self.logger.warning(
                         "this session cannot re-prime the %s wire at a rollout "
                         "boundary, so a seeded run will NOT replay exactly; "

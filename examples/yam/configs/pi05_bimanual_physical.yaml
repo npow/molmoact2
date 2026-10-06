@@ -1,4 +1,5 @@
-# Primary configuration for a native pi0.5 (pi05-molmoact-yam) rollout.
+# Primary hardware configuration for a remote pi0.5 rollout.
+# The Servo deployment or direct grant selects the model checkpoint.
 #
 # State/action field order is fixed by the checkpoint:
 #   0:7   physical left arm / can_left
@@ -65,7 +66,8 @@ eval:
   return_to_rest_on_exit: true
   return_to_rest_max_joint_step: 0.01
   reproducibility:
-    seed: 20260727
+    # Managed Session.predict does not accept per-query noise seeds.
+    seed: null
     deterministic_algorithms: false
   camera_preflight:
     enabled: true
@@ -82,12 +84,5 @@ eval:
   mode: direct
   direct:
     observation_encoding: h264
-  local:
-    repo_id: "helen9975/pi05-molmoact-yam"
-    device: "cuda:0"
-    dtype: "bfloat16"
-    num_steps: 10
-    enable_cuda_graph: true
-    warmup: true
   camera_server:
     enabled: false

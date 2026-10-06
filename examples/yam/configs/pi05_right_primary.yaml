@@ -1,4 +1,5 @@
-# Right arm configuration for pi0.5 (pi05-molmoact-yam) rollout.
+# Right arm hardware configuration for a remote pi0.5 rollout.
+# The Servo deployment or direct grant selects the model checkpoint.
 model_arm_side: right
 
 sensors:
@@ -54,12 +55,5 @@ eval:
     action_chunk_size: 30
   mode: direct
   direct: {}
-  local:
-    repo_id: "helen9975/pi05-molmoact-yam"
-    device: "cuda:0"
-    dtype: "bfloat16"
-    num_steps: 10
-    enable_cuda_graph: false
-    warmup: true
   camera_server:
     enabled: false

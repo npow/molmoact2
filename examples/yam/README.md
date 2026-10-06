@@ -153,6 +153,8 @@ pixels to the SDK, whose session-owned encoder maintains the video stream.
 Use `--observation-encoding h264` to select it explicitly. Managed sessions
 use the SDK's encoder settings; `--h264-crf` applies only to direct sessions.
 `eval.server.image_size` defaults to `null` so the SDK/runtime owns preprocessing.
+Managed checkpoint predictions do not accept per-query noise seeds. Leave
+`eval.reproducibility.seed: null` and omit `--seed` for these sessions.
 
 **Launch a hosted run:**
 

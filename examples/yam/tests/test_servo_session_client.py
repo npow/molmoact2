@@ -393,6 +393,14 @@ class ServoSessionHostTests(unittest.TestCase):
         kwargs.setdefault("instruction", "pick up the red cap")
         return ServoSessionHost(**kwargs)
 
+    def test_predict_session_advertises_that_noise_seeds_are_unsupported(self):
+        _install_fake_servo(self)
+        with unittest.mock.patch(
+            "servo_session_bridge._checkpoint_input_contract", return_value=_lerobot_contract()
+        ):
+            identity = self._host().open()
+        self.assertIs(identity["supports_noise_seed"], False)
+
     def test_managed_session_explicitly_negotiates_h264(self):
         state = _install_fake_servo(self)
         identity = self._host().open()
@@ -1109,6 +1117,24 @@ class MolmoActServoTests(unittest.TestCase):
         for missing in (None, ""):
             with self.assertRaisesRegex(ValueError, "deployment id"):
                 MolmoActServo(missing)
+
+    def test_unsupported_seed_is_rejected_before_inference(self):
+        policy = self._policy()
+        policy._transport.identity["supports_noise_seed"] = False
+        with self.assertRaisesRegex(ServoBridgeError, "seed to null"):
+            policy.validate_rollout_seed(123)
+        with self.assertRaisesRegex(ServoBridgeError, "seed to null"):
+            policy.begin_rollout(123)
+        self.assertEqual(policy._transport.calls, [])
+
+    def test_unseeded_h264_rollout_does_not_warn_about_seed_replay(self):
+        policy = self._policy(observation_encoding="h264")
+        policy._transport.identity["supports_noise_seed"] = False
+        policy.validate_rollout_seed(None)
+        policy._transport.begin_episode = unittest.mock.Mock(return_value=False)
+        with unittest.mock.patch.object(policy.logger, "warning") as warning:
+            policy.begin_rollout(None)
+        warning.assert_not_called()
 
     def test_encoder_settings_are_validated(self):
         with self.assertRaisesRegex(ValueError, "jpeg_quality"):

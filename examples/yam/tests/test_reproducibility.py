@@ -27,6 +27,15 @@ class _PolicyWithMetadata:
 
 
 class ReproducibilityTests(unittest.TestCase):
+    def test_pi05_remote_configs_do_not_request_unsupported_noise_seeds(self):
+        from omegaconf import OmegaConf
+
+        config_dir = Path(__file__).resolve().parents[1] / "configs"
+        for name in ("pi05_bimanual_physical.yaml", "pi05_right_primary.yaml"):
+            config = OmegaConf.to_container(OmegaConf.load(config_dir / name))
+            seed = (config["eval"].get("reproducibility") or {}).get("seed")
+            self.assertFalse(RolloutSeedPlan(seed).enabled, name)
+
     def test_seed_plan_is_stable_and_namespaces_rollouts_and_queries(self):
         plan = RolloutSeedPlan(1234)
         rollout_zero = plan.rollout_seed(0)

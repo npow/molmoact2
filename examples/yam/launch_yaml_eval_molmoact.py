@@ -2224,6 +2224,11 @@ def main() -> None:
         # to make that true -- ``DirectPolicy`` is otherwise lazy and would
         # first touch the network on the first act, with the arms already live.
         identity = policy.open()
+        try:
+            policy.validate_rollout_seed(seed_plan.rollout_seed(0))
+        except Exception:
+            policy.close(success=False)
+            raise
         print(
             f"[servo] action session {identity.get('session_id')} on "
             f"{identity.get('deployment_id')} "

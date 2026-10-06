@@ -406,6 +406,10 @@ class ServoSessionHost:
             "binding_revision": getattr(binding, "binding_revision", None),
             "base_url": str(client._http.base_url),
             "observation_encoding": self.observation_encoding,
+            "supports_noise_seed": (
+                _checkpoint_input_contract(policy) is None
+                and self._session_accepts_noise_seed()
+            ),
             "advisory": getattr(deployment, "advisory", None),
         })
         return dict(self.identity)
