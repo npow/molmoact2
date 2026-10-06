@@ -43,7 +43,6 @@ keep the module level to the standard library and import the SDK lazily.
 from __future__ import annotations
 
 import json
-import inspect
 import math
 import struct
 import sys
@@ -67,7 +66,7 @@ ACTION_SPACE = "joint_position"
 SERVO_PYTHON_ENV = "SERVO_PYTHON"
 
 #: Observation wires an action session can negotiate. ``h264`` is the direct
-#: endpoint default; ``jpeg`` remains the managed-session compatibility wire.
+#: endpoint default; ``jpeg`` remains available for older direct endpoints.
 #: H.264 is available only on a direct
 #: (``servo serve`` grant) session because the encoder is owned by that
 #: session's transport.
@@ -428,35 +427,6 @@ class ServoSessionHost:
             raise
         session = client.session(policy, observation_encoding=self.observation_encoding)
         session.open()
-        # Current SDKs defer transport creation until the first predict when
-        # checkpoint image dimensions are dynamic. This is an H.264 path, not
-        # the legacy WebSocket fallback rejected below.
-        deferred_h264 = (
-            self.observation_encoding == "h264"
-            and getattr(session, "_deferred_image_geometry", False) is True
-        )
-        if getattr(session, "_action_transport", None) is None and not deferred_h264:
-            # Older SDKs swallow CapabilityNotAvailable from the direct
-            # data plane and fall back to the central OpenPI WebSocket, which
-            # re-introduces base64-encoded JPEG frames and a control-plane
-            # hairpin. That is silent unless we check for it here, and it must
-            # fail closed: this client exists specifically to avoid base64.
-            try:
-                session.close(success=False, suppress_completion_error=True)
-            finally:
-                closer = getattr(getattr(client, "_http", None), "close", None)
-                if closer is not None:
-                    try:
-                        closer()
-                    except Exception:  # noqa: BLE001 - teardown is best effort
-                        pass
-            raise ServoBridgeError(
-                f"deployment {self.deployment_id!r} has no direct action-session "
-                "data plane; the SDK fell back to the central WebSocket path "
-                "(base64-encoded frames). Refusing to run in that mode — enable "
-                "action sessions on the deployment's provider first.",
-                error_type="ActionSessionDowngrade",
-            )
         self._client = client
         self._session = session
         self._policy = policy
@@ -475,10 +445,6 @@ class ServoSessionHost:
             "binding_revision": getattr(binding, "binding_revision", None),
             "base_url": str(client._http.base_url),
             "observation_encoding": self.observation_encoding,
-            "supports_noise_seed": (
-                _checkpoint_input_contract(policy) is None
-                and self._session_accepts_noise_seed()
-            ),
             "advisory": getattr(deployment, "advisory", None),
         })
         return dict(self.identity)
@@ -495,11 +461,7 @@ class ServoSessionHost:
         ``images`` carries pre-encoded JPEG bytes (jpeg wire) or raw ``HxWx3``
         ``uint8`` arrays (codec wire); the SDK decides what to do with each.
 
-        ``noise_seed`` seeds the serve's flow-matching noise draw for THIS
-        query, so a remote rollout can be replayed exactly the way a local one
-        can. It is refused rather than dropped when the session cannot carry
-        it: a silently unseeded run looks identical to a seeded one in every
-        artifact, and that is the failure this whole path exists to prevent.
+        Optional per-query seeds are forwarded to the SDK.
         """
         if self._session is None:
             raise ServoBridgeError("Servo session is not open")
@@ -515,8 +477,6 @@ class ServoSessionHost:
             )
         contract = _checkpoint_input_contract(self._policy)
         if contract is not None:
-            if noise_seed is not None:
-                raise ServoBridgeError("Session.predict cannot carry a per-query noise seed")
             import numpy as np
 
             camera_names, state_name = _checkpoint_input_names(contract)
@@ -524,41 +484,22 @@ class ServoSessionHost:
             inputs = {camera_names[key]: _checkpoint_pixels(images[key], geometry.get(key, {}))
                       for key in CAMERA_KEYS}
             inputs[state_name] = np.asarray(state_values, dtype=np.float32)
+            options = {} if noise_seed is None else {"noise_seed": int(noise_seed)}
             prediction = self._session.predict(
-                inputs=inputs, instruction=instruction or self.instruction
+                inputs=inputs, instruction=instruction or self.instruction, **options
             )
-            return self._validated_prediction(prediction)
+            return self._prediction_result(prediction)
         observation = {
             "images": {key: _observation_frame(images[key]) for key in CAMERA_KEYS},
             "state": state_values,
             "instruction": instruction or self.instruction,
         }
-        if noise_seed is None:
-            prediction = self._session.act(observation, instruction=instruction)
-        else:
-            if not self._session_accepts_noise_seed():
-                raise ServoBridgeError(
-                    "a per-query noise seed was requested but this session cannot "
-                    f"carry one ({type(self._session).__name__}.act has no "
-                    "'noise_seed' parameter). Seeded remote rollouts need a servo "
-                    "checkout with DirectPolicy seeding (PR #227 or later) in the "
-                    f"bridge interpreter ({sys.executable}); re-run unseeded, or "
-                    "update that checkout"
-                )
-            prediction = self._session.act(
-                observation, instruction=instruction, noise_seed=int(noise_seed)
-            )
-        return self._validated_prediction(prediction)
+        options = {} if noise_seed is None else {"noise_seed": int(noise_seed)}
+        prediction = self._session.act(observation, instruction=instruction, **options)
+        return self._prediction_result(prediction)
 
     def begin_episode(self) -> bool:
-        """Re-prime the observation wire at a rollout boundary.
-
-        Returns whether the session could honour it. On a stateful codec wire
-        the decoded pixels depend on POSITION in the stream, so without this
-        two seeded rollouts sharing one session do not replay each other. A
-        session too old to expose it is reported, not silently tolerated: the
-        caller decides whether an unreproducible codec run is acceptable.
-        """
+        """Invoke the optional episode-boundary hook on the SDK session."""
         session = self._session
         if session is None:
             raise ServoBridgeError("begin_episode requested before open")
@@ -568,96 +509,19 @@ class ServoSessionHost:
         hook()
         return True
 
-    def _session_accepts_noise_seed(self) -> bool:
-        """Whether the bound SDK session takes a per-query seed.
-
-        Introspected rather than probed with a TypeError: an internal TypeError
-        raised from deep inside a legitimately-seeded act would otherwise be
-        misreported as "this SDK is too old" and send the operator to update a
-        checkout that was never the problem.
-        """
-        session = self._session
-        if session is None:
-            return False
-        try:
-            signature = inspect.signature(session.act)
-        except (TypeError, ValueError):  # pragma: no cover - exotic callables
-            return False
-        for parameter in signature.parameters.values():
-            if parameter.name == "noise_seed":
-                return True
-            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
-                # A **kwargs sink accepts the argument and may well discard it.
-                # That is exactly the defect PR #227 removed from DirectPolicy,
-                # so treat it as "cannot carry" rather than trusting it.
-                return False
-        return False
-
-    def _expected_action_horizon(self) -> int:
-        """The served model's own action horizon, not this file's default.
-
-        Checkpoints in this family do not all share one horizon (e.g. the
-        30-row lerobot-exported pi0.5 checkpoints vs. a 16-row raw JAX/openpi
-        one) -- the grant's control_profile.exec_steps already carries the
-        served model's real chunk length, so read it instead of assuming
-        every endpoint returns ACTION_HORIZON rows.
-        """
-        control_profile = self.identity.get("control_profile") or {}
-        exec_steps = control_profile.get("exec_steps")
-        return int(exec_steps or self.identity.get("action_horizon") or ACTION_HORIZON)
-
     def _expected_state_dim(self) -> int:
         """Return the endpoint-advertised state width, with the legacy default."""
         return int(self.identity.get("state_dim") or STATE_DIM)
 
-    def _expected_action_dim(self) -> int:
-        """Return the endpoint-advertised action width, with the legacy default."""
-        return int(self.identity.get("action_dim") or STATE_DIM)
-
-    def _validated_prediction(self, prediction: Any) -> Dict[str, Any]:
-        expected_horizon = self._expected_action_horizon()
-        expected_action_dim = self._expected_action_dim()
-        actions = [[float(value) for value in row] for row in (prediction.actions or [])]
-        if len(actions) != expected_horizon or any(
-            len(row) != expected_action_dim for row in actions
-        ):
-            raise ServoBridgeError(
-                "Servo returned an action chunk that is not "
-                f"{expected_horizon}x{expected_action_dim}: "
-                f"{len(actions)}x{len(actions[0]) if actions else 0}"
-            )
-        if any(not math.isfinite(value) for row in actions for value in row):
-            raise ServoBridgeError("Servo returned a non-finite action value")
-        if prediction.action_space != ACTION_SPACE:
-            raise ServoBridgeError(
-                f"Servo action space is {prediction.action_space!r}, expected {ACTION_SPACE!r}"
-            )
-        if not prediction.decoded:
-            raise ServoBridgeError("Servo returned an undecoded action chunk")
-        binding = prediction.binding
-        binding_view = (
-            binding.model_dump(mode="json")
-            if binding is not None and hasattr(binding, "model_dump")
-            else binding
-        )
-        expected_generation = self.identity.get("generation_id")
-        # ``ActiveBindingView`` (self.identity, above) names this field
-        # ``generation_id``; the per-response ``ActionBindingIdentity`` names
-        # the same fact ``deploy_generation`` — they are not the same schema.
-        actual_generation = (
-            (binding_view or {}).get("deploy_generation") if binding_view else None
-        )
-        if expected_generation and actual_generation and actual_generation != expected_generation:
-            raise ServoBridgeError(
-                "Servo served a different generation than the session bound: "
-                f"{actual_generation} != {expected_generation}"
-            )
+    @staticmethod
+    def _prediction_result(prediction: Any) -> Dict[str, Any]:
+        """Serialize the SDK result for the local bridge without revalidating it."""
         return {
-            "actions": actions,
+            "actions": _jsonable(prediction.actions),
             "horizon": int(prediction.horizon),
             "action_space": prediction.action_space,
             "telemetry": _jsonable(prediction.telemetry),
-            "binding": _jsonable(binding_view),
+            "binding": _jsonable(prediction.binding),
             "safety_signal": _jsonable(prediction.safety_signal),
         }
 
@@ -741,24 +605,13 @@ class ServoDirectHost(ServoSessionHost):
                 f"Servo grant {grant_path} is group/world readable; it holds a "
                 "private key — chmod 600 it"
             )
-        try:
-            policy = attach(
-                grant=grant_path.read_text().strip(),
-                instruction=self.instruction,
-                timeout=float(self._timeout_sec or 600.0),
-                observation_encoding=self.observation_encoding,
-                h264_crf=self.h264_crf,
-            )
-        except TypeError as exc:
-            # An SDK that predates the codec wire. Say so by name rather than
-            # letting the run continue on a silently different wire -- an
-            # out-of-date interpreter behind this bridge is exactly how the
-            # codec wire was unreachable in the first place.
-            raise ServoBridgeError(
-                "the servo SDK behind this bridge cannot negotiate an "
-                f"observation encoding ({sys.executable}); it predates the "
-                "codec wire -- update the interpreter's servo checkout"
-            ) from exc
+        policy = attach(
+            grant=grant_path.read_text().strip(),
+            instruction=self.instruction,
+            timeout=float(self._timeout_sec or 600.0),
+            observation_encoding=self.observation_encoding,
+            h264_crf=self.h264_crf,
+        )
         # DirectPolicy is LAZY: constructing it touches no network at all, so
         # without the two round trips below a dead serve, a stale grant or a
         # revoked key opens "successfully" here and fails on the FIRST ACT --
