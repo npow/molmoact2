@@ -25,7 +25,7 @@ examples/yam/
 ├── host_server_yam.py            # self-hosted inference server (separate; see top-level README §5)
 ├── launch_yaml_eval_molmoact.py  # eval launcher — main entry point
 ├── molmoact_client.py            # MolmoActServo (Servo session) + MolmoActHTTP + MolmoActLocal policies
-├── servo_session_bridge.py       # official Servo SDK session host + Python 3.11 -> 3.12 bridge
+├── servo_session_bridge.py       # official Servo SDK session host + out-of-process bridge
 ├── camera_server.py              # long-lived ZMQ server owning the 3 RealSense cams
 ├── camera_client.py              # ZMQ client + standalone live viewer
 ├── eval_utils.py                 # per-rollout saver, cv2 viewer, labeling, conversion
@@ -51,8 +51,8 @@ pip install -r examples/yam/requirements.txt
 ```
 
 `server` mode additionally needs the official `servo-client` SDK, which
-requires Python >= 3.12 and therefore does **not** go into the 3.11 robot
-runtime — see [Servo action sessions](#servo-action-sessions) below.
+requires Python >= 3.12 — see [Servo action sessions](#servo-action-sessions)
+below.
 
 Run every command below **from the molmoact2 repo root** (the scripts add
 `examples/yam/` to `sys.path`, so `gello_min` and the sibling modules resolve).
@@ -102,16 +102,15 @@ gets the robot identity through its local agent. On your own computer, use
 [identity guide](https://servo.mintlify.app/guides/identity) and
 [Python API](https://servo.mintlify.app/reference/python-api).
 
-**Interpreter split.** The official SDK requires Python >= 3.12.
-`servo_session_bridge.py` resolves that locally: it holds the
-SDK session code (`ServoSessionHost`) and can also run as a small stdio helper
-process under a 3.12 interpreter. If `servo` is importable in the running
-interpreter, the session runs in-process; otherwise you must name the
-interpreter explicitly with `--servo-python`, `eval.server.servo_python`, or
-the `SERVO_PYTHON` environment variable — on this workstation
-`/home/npow/code/servo/.venv/bin/python`. An explicitly named interpreter is
-always used, even when `servo` is importable here. There is no silent
-fallback: if none of the three is set and `servo` is not importable, `server`
+**Interpreter requirement.** The official SDK requires Python >= 3.12.
+`servo_session_bridge.py` holds the SDK session code (`ServoSessionHost`) and
+can also run as a small stdio helper process under a separate interpreter. If
+`servo` is importable in the running interpreter, the session runs in-process;
+otherwise you must name an interpreter that has it with `--servo-python`,
+`eval.server.servo_python`, or the `SERVO_PYTHON` environment variable. An
+explicitly named interpreter is always used, even when `servo` is importable
+here. There is no silent fallback: if none of the three is set and `servo` is
+not importable, `server`
 mode fails immediately instead of choosing for you. The parent/child hop is a
 local pipe only; everything that leaves the machine is SDK transport.
 
@@ -173,8 +172,8 @@ examples/yam/launch_yaml_eval_molmoact.py \
 ```
 
 If the rollout interpreter already has Servo installed, no `--servo-python`
-option is needed. On a Python 3.11 robot runtime, point `--servo-python` (or
-`SERVO_PYTHON`) at the Python 3.12 interpreter with Servo installed.
+option is needed. Otherwise point `--servo-python` (or `SERVO_PYTHON`) at a
+Python >= 3.12 interpreter with Servo installed.
 
 The [pi0.5 red-cap checkpoint](https://huggingface.co/npow/pi05-yam-red-cap-full-7500)
 is a single-active-arm policy: `middle`, `left`, and `right` RGB images at
