@@ -50,6 +50,9 @@ robot = [
     "pyrealsense2; platform_machine == 'x86_64'",
 ]
 
+[dependency-groups]
+dev = ["pytest>=8"]
+
 [tool.uv.sources]
 # CUDA-12.1 wheels exist only for x86_64/Windows. On aarch64 (Jetson) fall
 # through to PyPI, which ships manylinux aarch64 builds of the same versions.
