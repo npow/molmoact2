@@ -436,9 +436,8 @@ _BRIDGE_EOF = object()
 class ServoSessionTransport:
     """Owns exactly one official Servo action session for a whole eval run.
 
-    The SDK requires Python >= 3.12 while the robot runtime is 3.11, so the
-    session runs in this process when ``servo`` is importable here and in a
-    helper subprocess otherwise (see :mod:`servo_session_bridge`). Both cases
+    The SDK requires Python >= 3.12, so the session runs in this process when
+    ``servo`` is importable here and in a helper subprocess otherwise (see :mod:`servo_session_bridge`). Both cases
     execute the same :class:`ServoSessionHost` code; only the local hop
     differs. The interpreter is chosen once, explicitly — there is no silent
     fallback between the two, and nothing but official SDK traffic leaves the
@@ -540,7 +539,7 @@ class ServoSessionTransport:
             f"({sys.executable}, Python {sys.version.split()[0]}; the SDK needs >= 3.12). "
             f"Set eval.server.servo_python, --servo-python, or {SERVO_PYTHON_ENV} to an "
             "interpreter that has servo-client installed, e.g. "
-            "/home/npow/code/servo/.venv/bin/python"
+            "/home/npow/molmoact2-venv/bin/python"
         )
 
     # -- lifecycle ------------------------------------------------------------
@@ -731,7 +730,7 @@ class ServoSessionTransport:
             # The child's stderr is the operator's view of SDK failures; leave
             # it attached to this process's stderr rather than swallowing it.
             bufsize=0,
-            # PYTHONPATH points at the robot runtime's 3.11 modules, which the
+            # PYTHONPATH points at the robot runtime's modules, which the
             # helper interpreter must not import. ``bridge_env`` is the only
             # way to add environment to the helper.
             env={

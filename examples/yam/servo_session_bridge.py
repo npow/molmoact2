@@ -5,13 +5,9 @@ control-plane action session (signed offer + lease) opened once and reused for
 every action chunk of the run.  There is no custom ``/act`` endpoint, no
 endpoint JWT, and no bespoke wire format on the network path.
 
-The bridge exists only because of a local interpreter split:
-
-* the robot runtime (``/home/npow/molmoact2-venv``) is Python 3.11 — it owns
-  i2rt/CAN, pyrealsense2 and torch and must not be disturbed;
-* the official ``servo`` SDK requires Python >= 3.12.
-
-So this module is both halves of that bridge:
+The official ``servo`` SDK requires Python >= 3.12. This module works either
+way, so a robot runtime that cannot import it is still able to run ``server``
+mode:
 
 * :class:`ServoSessionHost` — the actual SDK usage (``Servo`` ->
   ``deployments.get`` -> ``deployment.policy`` -> ``sv.session(policy)``).
@@ -27,8 +23,7 @@ Two payload shapes ride that framing, chosen by the wire the action session
 negotiated:
 
 * ``images`` -- one pre-encoded JPEG buffer per camera. The JPEG wire is
-  stateless, so bytes minted anywhere are valid on any session; this is the
-  original path and is unchanged.
+  stateless, so bytes minted anywhere are valid on any session.
 * ``frames`` -- one raw ``HxWx3`` ``uint8`` buffer per camera plus its shape.
   The h264 wire is session-stateful: an access unit is only valid against the
   decoder state its predecessor left, so it is minted by the transport at SEND
@@ -36,8 +31,8 @@ negotiated:
   therefore what has to cross this pipe -- see
   ``servo.execution.action_session_transport._encode_observation``.
 
-This module must stay importable on Python 3.11 with no ``servo`` installed:
-keep the module level to the standard library and import the SDK lazily.
+This module must stay importable with no ``servo`` installed: keep the module
+level to the standard library and import the SDK lazily.
 """
 
 from __future__ import annotations
@@ -148,7 +143,7 @@ def raw_frame_spec(buffer_index: int, height: int, width: int) -> Dict[str, Any]
 def raw_frame_array(data: bytes, spec: Mapping[str, Any]) -> Any:
     """Rebuild one ``HxWx3`` ``uint8`` frame from a bridge buffer, without a copy.
 
-    ``numpy`` is imported lazily: this module must stay importable on the 3.11
+    ``numpy`` is imported lazily: this module must stay importable on the
     robot runtime with nothing but the standard library at module level.
     """
     import numpy as np
@@ -732,7 +727,7 @@ def _camera_sources(policy: Any) -> Dict[str, Any]:
 
 
 def _jsonable(value: Any) -> Any:
-    """Reduce SDK payloads to JSON the 3.11 parent can read back verbatim.
+    """Reduce SDK payloads to JSON the parent process can read back verbatim.
 
     Non-finite floats (e.g. a runtime-reported ``inf`` rate) are flattened to
     ``None`` rather than left for ``json.dumps(allow_nan=False)`` to reject —
