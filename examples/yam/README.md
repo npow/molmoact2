@@ -213,6 +213,11 @@ machine key still advertises the single-arm/SO-101 view, and runtime
 fails at session open (before any motor is enabled, by design). Use `http` or
 `local` mode in the meantime.
 
+### Metrics
+
+Metrics for hosted (`server` mode) deployments are in the official Grafana at
+https://grafana.orchestrallabs.ai (Clerk SSO). This repo collects no metrics itself.
+
 ## Hardware setup
 
 1. Both YAM arms powered, e-stop released.
