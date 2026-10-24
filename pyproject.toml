@@ -23,7 +23,7 @@ dependencies = [
     "prometheus-client>=0.21",
     "tyro>=1.0.13",
     "imageio>=2.37.3",
-    "servo-client>=0.7.18",
+    "orchestral-client>=0.1.9,<0.2",
 ]
 
 [project.optional-dependencies]

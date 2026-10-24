@@ -3,11 +3,11 @@
 Three interchangeable policies, all producing an ``{"actions": ndarray}`` dict
 from an observation:
 
-* :class:`MolmoActServo` — the hosted policy, reached over **one official Servo
+* :class:`MolmoActOrchestral` — the hosted policy, reached over **one official Orchestral
   action session** (``sv.session(policy)``) that stays open for the whole run.
-  The SDK owns the network path; see :mod:`servo_session_bridge`.
+  The SDK owns the network path; see :mod:`orchestral_session_bridge`.
 * :class:`MolmoActHTTP` — the sibling ``host_server_yam.py`` ``json_numpy``
-  server on this LAN. Self-hosted development path, not a Servo transport.
+  server on this LAN. Self-hosted development path, not a Orchestral transport.
 * :class:`MolmoActLocal` — loads the checkpoint in-process via ``transformers``
   (no server). The local-policy internals are kept in sync with
   ``host_server_yam.py``; if the bf16 patch needles or the ``predict_action``
@@ -40,16 +40,16 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 from gello_min.logging_utils import get_molmoact_logger
 from rollout_manifest import RolloutSeedPlan, SEED_STRATEGY
-from servo_session_bridge import (
+from orchestral_session_bridge import (
     ACTION_HORIZON,
     ACTION_SPACE,
     CAMERA_KEYS,
     OBSERVATION_ENCODINGS,
-    SERVO_PYTHON_ENV,
+    ORCHESTRAL_PYTHON_ENV,
     STATE_DIM,
-    ServoBridgeError,
-    ServoDirectHost,
-    ServoSessionHost,
+    OrchestralBridgeError,
+    OrchestralDirectHost,
+    OrchestralSessionHost,
     encode_frame,
     frame_parts,
     missing_cameras,
@@ -90,7 +90,7 @@ class PolicyBase(ABC):
         """Release any policy-owned session/process. Safe to call more than once.
 
         ``success`` reports the run's outcome to policies that record it
-        remotely (e.g. completing a Servo action session) — pass the real
+        remotely (e.g. completing a Orchestral action session) — pass the real
         rollout outcome, not the default, or every aborted run looks clean on
         the control plane.
         """
@@ -106,8 +106,8 @@ DEFAULT_NUM_STEPS = 10
 ARM_DIM = 7
 
 # ``STATE_DIM`` / ``ACTION_HORIZON`` / ``CAMERA_KEYS`` are the BimanualYAM
-# contract facts and live in ``servo_session_bridge`` so the robot process and
-# the Servo SDK process cannot drift.  ``yam_dual_molmoact2`` emits 30
+# contract facts and live in ``orchestral_session_bridge`` so the robot process and
+# the Orchestral SDK process cannot drift.  ``yam_dual_molmoact2`` emits 30
 # absolute-pose targets per query; the rollout executor validates and uses the
 # actual returned chunk length.
 
@@ -153,7 +153,7 @@ class MolmoActHTTP(PolicyBase):
 
     Development/LAN path only: no authentication, no generation fencing, no
     control-plane record of the run. Hosted inference goes through
-    :class:`MolmoActServo`.
+    :class:`MolmoActOrchestral`.
     """
 
     def __init__(
@@ -427,18 +427,18 @@ class MolmoActHTTP(PolicyBase):
 
 
 # ---------------------------------------------------------------------------
-# Hosted MolmoAct over an official Servo action session
+# Hosted MolmoAct over an official Orchestral action session
 # ---------------------------------------------------------------------------
 
 _BRIDGE_EOF = object()
 
 
-class ServoSessionTransport:
-    """Owns exactly one official Servo action session for a whole eval run.
+class OrchestralSessionTransport:
+    """Owns exactly one official Orchestral action session for a whole eval run.
 
     The SDK requires Python >= 3.12, so the session runs in this process when
-    ``servo`` is importable here and in a helper subprocess otherwise (see :mod:`servo_session_bridge`). Both cases
-    execute the same :class:`ServoSessionHost` code; only the local hop
+    ``orchestral`` is importable here and in a helper subprocess otherwise (see :mod:`orchestral_session_bridge`). Both cases
+    execute the same :class:`OrchestralSessionHost` code; only the local hop
     differs. The interpreter is chosen once, explicitly — there is no silent
     fallback between the two, and nothing but official SDK traffic leaves the
     machine either way.
@@ -456,7 +456,7 @@ class ServoSessionTransport:
         deployment_id: Optional[str] = None,
         grant: Optional[str] = None,
         instruction: Optional[str] = None,
-        servo_python: Optional[str] = None,
+        orchestral_python: Optional[str] = None,
         open_timeout_sec: float = 600.0,
         act_timeout_sec: float = 120.0,
         logger: Optional[logging.Logger] = None,
@@ -475,30 +475,30 @@ class ServoSessionTransport:
         self.bridge_env = dict(bridge_env or {})
         observation_encoding = observation_encoding or "h264"
         if observation_encoding not in OBSERVATION_ENCODINGS:
-            raise ServoBridgeError(
+            raise OrchestralBridgeError(
                 f"observation_encoding must be one of {list(OBSERVATION_ENCODINGS)}, "
                 f"got {observation_encoding!r}"
             )
         if h264_crf is not None and observation_encoding != "h264":
-            raise ServoBridgeError("h264_crf only applies to observation_encoding='h264'")
+            raise OrchestralBridgeError("h264_crf only applies to observation_encoding='h264'")
         if h264_crf is not None and not grant:
-            raise ServoBridgeError("h264_crf is only supported for direct sessions")
+            raise OrchestralBridgeError("h264_crf is only supported for direct sessions")
         self.observation_encoding = observation_encoding
         self.h264_crf = int(h264_crf) if h264_crf is not None else None
         self.grant = str(Path(grant).expanduser()) if grant else None
         if self.grant is None:
-            # Servo resolves the signed-in user or robot-agent identity itself;
+            # Orchestral resolves the signed-in user or robot-agent identity itself;
             # only the deployment is specific to this run.
             if not deployment_id:
-                raise ServoBridgeError(
-                    "hosted mode needs deployment_id; configure Servo using its "
+                raise OrchestralBridgeError(
+                    "hosted mode needs deployment_id; configure Orchestral using its "
                     "quickstart instructions; "
                     "self-hosted mode needs grant="
                 )
             self.deployment_id = str(deployment_id)
         else:
             if deployment_id:
-                raise ServoBridgeError(
+                raise OrchestralBridgeError(
                     "grant= names the entire endpoint identity; do not combine it "
                     "with deployment_id (no fallback path exists)"
                 )
@@ -508,13 +508,13 @@ class ServoSessionTransport:
         self.act_timeout_sec = float(act_timeout_sec)
         self.logger = logger or get_molmoact_logger()
         self.identity: Dict[str, Any] = {}
-        self._host: Optional[ServoSessionHost] = None
+        self._host: Optional[OrchestralSessionHost] = None
         self._process: Optional[subprocess.Popen] = None
         self._responses: "queue.Queue[Any]" = queue.Queue()
         self._reader: Optional[threading.Thread] = None
         self._request_seq = 0
         self._poisoned: Optional[str] = None
-        self._python = self._resolve_python(servo_python)
+        self._python = self._resolve_python(orchestral_python)
         self.mode = "in-process" if self._python is None else "subprocess"
 
     def _child_timeout(self, parent_timeout_sec: float) -> float:
@@ -524,21 +524,21 @@ class ServoSessionTransport:
     # -- interpreter selection ------------------------------------------------
 
     @staticmethod
-    def _resolve_python(servo_python: Optional[str]) -> Optional[str]:
+    def _resolve_python(orchestral_python: Optional[str]) -> Optional[str]:
         """Return the helper interpreter, or ``None`` to run the SDK in-process."""
-        explicit = servo_python or os.environ.get(SERVO_PYTHON_ENV)
+        explicit = orchestral_python or os.environ.get(ORCHESTRAL_PYTHON_ENV)
         if explicit:
             resolved = Path(explicit).expanduser()
             if not resolved.exists():
-                raise ServoBridgeError(f"servo_python interpreter not found: {resolved}")
+                raise OrchestralBridgeError(f"orchestral_python interpreter not found: {resolved}")
             return str(resolved)
-        if importlib.util.find_spec("servo") is not None:
+        if importlib.util.find_spec("orchestral") is not None:
             return None
-        raise ServoBridgeError(
-            "the official servo SDK is not importable in the robot runtime "
+        raise OrchestralBridgeError(
+            "the official orchestral SDK is not importable in the robot runtime "
             f"({sys.executable}, Python {sys.version.split()[0]}; the SDK needs >= 3.12). "
-            f"Set eval.server.servo_python, --servo-python, or {SERVO_PYTHON_ENV} to an "
-            "interpreter that has servo-client installed, e.g. "
+            f"Set eval.server.orchestral_python, --orchestral-python, or {ORCHESTRAL_PYTHON_ENV} to an "
+            "interpreter that has orchestral-client installed, e.g. "
             "/home/npow/molmoact2-venv/bin/python"
         )
 
@@ -549,12 +549,12 @@ class ServoSessionTransport:
         if self.identity:
             return dict(self.identity)
         # Self-hosted sessions receive a timeout inside the parent's open
-        # budget. Managed sessions use Servo's defaults; subprocess calls
+        # budget. Managed sessions use Orchestral's defaults; subprocess calls
         # are still bounded by the parent-side queue wait below.
         sdk_timeout = self._child_timeout(self.open_timeout_sec)
         if self._python is None:
             if self.grant is not None:
-                self._host = ServoDirectHost(
+                self._host = OrchestralDirectHost(
                     grant=self.grant,
                     instruction=self.instruction,
                     timeout_sec=sdk_timeout,
@@ -562,7 +562,7 @@ class ServoSessionTransport:
                     h264_crf=self.h264_crf,
                 )
             else:
-                self._host = ServoSessionHost(
+                self._host = OrchestralSessionHost(
                     deployment_id=self.deployment_id,
                     instruction=self.instruction,
                     observation_encoding=self.observation_encoding,
@@ -584,7 +584,7 @@ class ServoSessionTransport:
             identity = self._request(header, timeout=self.open_timeout_sec)["identity"]
         self.identity = dict(identity)
         self.logger.info(
-            "Servo action session %s open on deployment %s (generation %s, %s wire, %s SDK)",
+            "Orchestral action session %s open on deployment %s (generation %s, %s wire, %s SDK)",
             self.identity.get("session_id"),
             self.identity.get("deployment_id"),
             self.identity.get("generation_id"),
@@ -611,11 +611,11 @@ class ServoSessionTransport:
         if not self.identity:
             self.open()
         # Both modes must fail identically: the caller only handles
-        # ServoBridgeError, and a stalled camera must not surface as a KeyError
+        # OrchestralBridgeError, and a stalled camera must not surface as a KeyError
         # from one transport and a clean error from the other.
         missing = missing_cameras(images)
         if missing:
-            raise ServoBridgeError(f"Servo observation is missing camera bytes: {missing}")
+            raise OrchestralBridgeError(f"Orchestral observation is missing camera bytes: {missing}")
         if self._host is not None:
             return self._host.act(
                 images, state, instruction=instruction, noise_seed=noise_seed
@@ -636,7 +636,7 @@ class ServoSessionTransport:
                 array = images[key]
                 shape = getattr(array, "shape", None)
                 if shape is None or len(shape) != 3 or shape[2] != 3:
-                    raise ServoBridgeError(
+                    raise OrchestralBridgeError(
                         f"the {self.observation_encoding!r} wire carries raw HxWx3 uint8 "
                         f"pixels; camera {key!r} supplied {type(array).__name__} "
                         f"shape={shape!r}"
@@ -684,7 +684,7 @@ class ServoSessionTransport:
                         timeout=self.open_timeout_sec,
                     )
                 except Exception as exc:  # noqa: BLE001 — teardown is best effort
-                    self.logger.warning("Servo session close failed: %s", exc)
+                    self.logger.warning("Orchestral session close failed: %s", exc)
             if process.stdin is not None:
                 try:
                     process.stdin.close()
@@ -693,7 +693,7 @@ class ServoSessionTransport:
             try:
                 process.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                self.logger.warning("Servo session bridge did not exit; terminating")
+                self.logger.warning("Orchestral session bridge did not exit; terminating")
                 process.terminate()
                 try:
                     process.wait(timeout=5)
@@ -715,8 +715,8 @@ class ServoSessionTransport:
     # -- helper process -------------------------------------------------------
 
     def _spawn(self) -> None:
-        bridge = Path(__file__).resolve().parent / "servo_session_bridge.py"
-        self.logger.info("Starting Servo session bridge: %s %s", self._python, bridge)
+        bridge = Path(__file__).resolve().parent / "orchestral_session_bridge.py"
+        self.logger.info("Starting Orchestral session bridge: %s %s", self._python, bridge)
         # A fresh child needs a fresh reply channel: a stale sentinel left by a
         # prior child's reader thread (e.g. the _BRIDGE_EOF put on the last
         # close) must never be handed to this child's first request.
@@ -741,7 +741,7 @@ class ServoSessionTransport:
         self._reader = threading.Thread(
             target=self._read_responses,
             args=(self._process,),
-            name="servo-bridge-reader",
+            name="orchestral-bridge-reader",
             daemon=True,
         )
         self._reader.start()
@@ -782,9 +782,9 @@ class ServoSessionTransport:
     ) -> Dict[str, Any]:
         process = process or self._process
         if process is None or process.stdin is None:
-            raise ServoBridgeError("Servo session bridge is not running")
+            raise OrchestralBridgeError("Orchestral session bridge is not running")
         if self._poisoned is not None:
-            raise ServoBridgeError(self._poisoned)
+            raise OrchestralBridgeError(self._poisoned)
         self._request_seq += 1
         request_id = self._request_seq
         header = {**header, "request_id": request_id}
@@ -794,14 +794,14 @@ class ServoSessionTransport:
         try:
             parts = frame_parts(header, buffers or ())
         except ValueError as exc:
-            raise ServoBridgeError(f"Servo observation cannot be framed: {exc}") from exc
+            raise OrchestralBridgeError(f"Orchestral observation cannot be framed: {exc}") from exc
         try:
             for part in parts:
                 self._write_all(process.stdin, part)
             process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
-            raise ServoBridgeError(
-                f"Servo session bridge exited (returncode={process.poll()})"
+            raise OrchestralBridgeError(
+                f"Orchestral session bridge exited (returncode={process.poll()})"
             ) from exc
         try:
             response = self._responses.get(timeout=timeout)
@@ -810,37 +810,37 @@ class ServoSessionTransport:
             # once a request has timed out this transport is done, and the run
             # fails closed rather than executing a stale action chunk.
             self._poisoned = (
-                f"Servo session bridge did not answer {header.get('op')!r} within "
+                f"Orchestral session bridge did not answer {header.get('op')!r} within "
                 f"{timeout:g}s; the session is no longer usable"
             )
-            raise ServoBridgeError(self._poisoned) from None
+            raise OrchestralBridgeError(self._poisoned) from None
         if response is _BRIDGE_EOF:
-            raise ServoBridgeError(
-                f"Servo session bridge exited (returncode={process.poll()}); "
+            raise OrchestralBridgeError(
+                f"Orchestral session bridge exited (returncode={process.poll()}); "
                 "its stderr is above"
             )
         if isinstance(response, BaseException):
-            raise ServoBridgeError(f"Servo session bridge read failed: {response}")
+            raise OrchestralBridgeError(f"Orchestral session bridge read failed: {response}")
         if response.get("request_id") != request_id:
             self._poisoned = (
-                "Servo session bridge answered out of order "
+                "Orchestral session bridge answered out of order "
                 f"(got request_id={response.get('request_id')!r}, expected {request_id})"
             )
-            raise ServoBridgeError(self._poisoned)
+            raise OrchestralBridgeError(self._poisoned)
         if not response.get("ok"):
-            raise ServoBridgeError(
-                str(response.get("error") or "Servo session bridge reported a failure"),
+            raise OrchestralBridgeError(
+                str(response.get("error") or "Orchestral session bridge reported a failure"),
                 error_type=response.get("error_type"),
             )
         return response
 
 
-class MolmoActServo(PolicyBase):
-    """A Servo-hosted policy over one official action session.
+class MolmoActOrchestral(PolicyBase):
+    """A Orchestral-hosted policy over one official action session.
 
     The session opens on the first query and is reused for every action chunk
     of the run: the control plane issues one signed offer/lease, and each
-    observation rides the SDK's protobuf action-session transport with the
+    observation rides the SDK's prediction transport with the
     three camera frames as JPEG bytes — no base64, no custom endpoint. Native
     7-D single-arm endpoints can be adapted to the launcher's safe 14-D YAM
     executor by naming ``single_arm_side``; no joint or gripper values are
@@ -853,7 +853,7 @@ class MolmoActServo(PolicyBase):
         *,
         grant: Optional[str] = None,
         instruction: Optional[str] = None,
-        servo_python: Optional[str] = None,
+        orchestral_python: Optional[str] = None,
         open_timeout_sec: float = 600.0,
         act_timeout_sec: float = 120.0,
         jpeg_quality: int = 85,
@@ -870,9 +870,9 @@ class MolmoActServo(PolicyBase):
         self.image_fit = image_fit
         if not deployment and not grant:
             raise ValueError(
-                "the hosted policy needs a managed Servo deployment id "
-                "(--servo-deployment or eval.server.deployment); the self-hosted "
-                "policy needs a grant (--servo-grant or eval.direct.grant)"
+                "the hosted policy needs a managed Orchestral deployment id "
+                "(--orchestral-deployment or eval.server.deployment); the self-hosted "
+                "policy needs a grant (--orchestral-grant or eval.direct.grant)"
             )
         if not 1 <= jpeg_quality <= 100:
             raise ValueError("jpeg_quality must be between 1 and 100")
@@ -892,7 +892,7 @@ class MolmoActServo(PolicyBase):
         # Seeding mirrors MolmoActLocal exactly -- same RolloutSeedPlan, same
         # per-query derivation -- because the point is a PAIRED comparison: the
         # same base seed must produce the same noise draw whether the model runs
-        # on this Jetson or on a remote GPU. Servo's raw-transformers backend
+        # on this Jetson or on a remote GPU. Orchestral's raw-transformers backend
         # seeds a torch.Generator on the serve the same way MolmoActLocal does
         # here, so identical query seeds mean identical draws.
         self._configured_seed_plan = RolloutSeedPlan(seed)
@@ -900,11 +900,11 @@ class MolmoActServo(PolicyBase):
         self._rollout_seed = self._configured_seed_plan.rollout_seed(0)
         self._inference_index = 0
         self._seed_proven = False
-        self._transport = ServoSessionTransport(
+        self._transport = OrchestralSessionTransport(
             deployment_id=deployment,
             grant=grant,
             instruction=instruction,
-            servo_python=servo_python,
+            orchestral_python=orchestral_python,
             open_timeout_sec=open_timeout_sec,
             act_timeout_sec=act_timeout_sec,
             logger=self.logger,
@@ -912,7 +912,7 @@ class MolmoActServo(PolicyBase):
             h264_crf=self.h264_crf,
         )
         self.logger.info(
-            "MolmoActServo bound to %s (%s wire, %s SDK)",
+            "MolmoActOrchestral bound to %s (%s wire, %s SDK)",
             f"grant {grant} (self-hosted, no fallback)" if grant else
             f"deployment {deployment}",
             self.observation_encoding,
@@ -932,8 +932,8 @@ class MolmoActServo(PolicyBase):
         one) -- the grant's control_profile.exec_steps already carries the
         served model's real chunk length once the session is open, so read
         it instead of trusting the constructor-time ACTION_HORIZON default.
-        Mirrors ``ServoSessionHost._expected_action_horizon`` in
-        servo_session_bridge.py, which validates the same field on the far
+        Mirrors ``OrchestralSessionHost._expected_action_horizon`` in
+        orchestral_session_bridge.py, which validates the same field on the far
         side of the bridge subprocess -- this is the second, independent
         copy of that check, in this process, and must resolve the same way.
         """
@@ -955,29 +955,29 @@ class MolmoActServo(PolicyBase):
         if advertised_state is None and advertised_action is None:
             if self.single_arm_side:
                 self._transport.close(success=False)
-                raise ServoBridgeError(
-                    "Servo endpoint did not advertise state/action dimensions; "
+                raise OrchestralBridgeError(
+                    "Orchestral endpoint did not advertise state/action dimensions; "
                     "refusing to guess a 7-D contract"
                 )
         elif advertised_state is None or advertised_action is None:
             self._transport.close(success=False)
-            raise ServoBridgeError(
-                "Servo endpoint must advertise state_dim and action_dim together"
+            raise OrchestralBridgeError(
+                "Orchestral endpoint must advertise state_dim and action_dim together"
             )
         else:
             state_dim = int(advertised_state)
             action_dim = int(advertised_action)
             if state_dim != action_dim or state_dim not in (ARM_DIM, STATE_DIM):
                 self._transport.close(success=False)
-                raise ServoBridgeError(
-                    "Servo endpoint has unsupported state/action dimensions: "
+                raise OrchestralBridgeError(
+                    "Orchestral endpoint has unsupported state/action dimensions: "
                     f"state_dim={state_dim}, action_dim={action_dim}"
                 )
             if state_dim == ARM_DIM:
                 if self.single_arm_side is None:
                     self._transport.close(success=False)
-                    raise ServoBridgeError(
-                        "7-D Servo endpoint needs a left/right physical arm placement"
+                    raise OrchestralBridgeError(
+                        "7-D Orchestral endpoint needs a left/right physical arm placement"
                     )
                 self._endpoint_single_arm_side = self.single_arm_side
             else:
@@ -993,8 +993,8 @@ class MolmoActServo(PolicyBase):
             and int(profile_horizon) != int(advertised_horizon)
         ):
             self._transport.close(success=False)
-            raise ServoBridgeError(
-                "Servo endpoint advertises inconsistent action horizons: "
+            raise OrchestralBridgeError(
+                "Orchestral endpoint advertises inconsistent action horizons: "
                 f"control_profile.exec_steps={profile_horizon}, "
                 f"action_horizon={advertised_horizon}"
             )
@@ -1042,7 +1042,7 @@ class MolmoActServo(PolicyBase):
     def reproducibility_metadata(self) -> Dict[str, Any]:
         identity = self._transport.identity
         return {
-            "backend": "servo-action-session",
+            "backend": "orchestral-action-session",
             "base_url": identity.get("base_url"),
             "deployment_id": self._transport.deployment_id,
             "session_id": identity.get("session_id"),
@@ -1068,10 +1068,10 @@ class MolmoActServo(PolicyBase):
         }
 
     def prepare_input(self, obs: Dict[str, Any], instruction: str) -> Dict[str, Any]:
-        self.logger.info("Preparing input for MolmoActServo inference")
+        self.logger.info("Preparing input for MolmoActOrchestral inference")
         self.logger.info(f"Instruction: '{instruction}'")
         bimanual_state = require_bimanual_state(
-            obs["joint_positions"], source="MolmoActServo"
+            obs["joint_positions"], source="MolmoActOrchestral"
         )
         if self._endpoint_single_arm_side == "left":
             endpoint_state = bimanual_state[:ARM_DIM].copy()
@@ -1090,7 +1090,7 @@ class MolmoActServo(PolicyBase):
 
     def inference(self, input_dict: Dict[str, Any]) -> Dict[str, Any]:
         encode_started = time.perf_counter()
-        # Servo's stable camera names for the YAM embodiment; the runtime maps
+        # Orchestral's stable camera names for the YAM embodiment; the runtime maps
         # them to the checkpoint's own keys through the deployment manifest.
         #
         # On the jpeg wire the client mints the payload (unchanged). On a codec
@@ -1114,11 +1114,11 @@ class MolmoActServo(PolicyBase):
         state = np.asarray(input_dict["state"], dtype=np.float32).reshape(-1)
         if state.shape != (endpoint_dim,):
             raise ValueError(
-                f"MolmoActServo request state must be shape ({endpoint_dim},), "
+                f"MolmoActOrchestral request state must be shape ({endpoint_dim},), "
                 f"got {state.shape}"
             )
         if not np.isfinite(state).all():
-            raise ValueError("MolmoActServo request state contains non-finite values")
+            raise ValueError("MolmoActOrchestral request state contains non-finite values")
 
         noise_seed, seed_metadata = self._noise_seed_for_next_query()
         act_started = time.perf_counter()
@@ -1141,12 +1141,12 @@ class MolmoActServo(PolicyBase):
             endpoint_dim,
         ) or not np.isfinite(endpoint_actions).all():
             raise RuntimeError(
-                f"Servo returned a malformed action chunk: shape {endpoint_actions.shape}, "
+                f"Orchestral returned a malformed action chunk: shape {endpoint_actions.shape}, "
                 f"expected ({expected_horizon}, {endpoint_dim})"
             )
         if self._endpoint_single_arm_side:
             bimanual_state = require_bimanual_state(
-                input_dict["bimanual_state"], source="MolmoActServo execution state"
+                input_dict["bimanual_state"], source="MolmoActOrchestral execution state"
             )
             actions = np.repeat(bimanual_state[None, :], expected_horizon, axis=0)
             active = (
@@ -1166,9 +1166,7 @@ class MolmoActServo(PolicyBase):
         if noise_seed is not None and noise_scheme:
             self._seed_proven = True
         seed_metadata["noise_scheme"] = noise_scheme
-        # The SDK's ``ActionPrediction.telemetry`` flattens
-        # ``runtime.inference_ms`` to the top-level key ``server_infer_ms``
-        # (servo/types.py:_telemetry_view) — there is no ``infer_ms`` key.
+        # The bridge converts Orchestral's accel_exec_us timing to milliseconds.
         server_infer_ms = telemetry.get("server_infer_ms")
         image_bytes = sum(_frame_nbytes(frame) for frame in images.values())
         # The bytes that actually left this machine. On the codec wire
@@ -1178,7 +1176,7 @@ class MolmoActServo(PolicyBase):
         # switched (~88 KB jpeg vs ~21 KB h264).
         request_bytes = telemetry.get("request_bytes")
         self.logger.info(
-            "Servo action session step in %.1fms (%s wire, capture %.1fms, "
+            "Orchestral action session step in %.1fms (%s wire, capture %.1fms, "
             "request_bytes %s, %d source bytes, server inference %sms)",
             act_ms,
             self.observation_encoding,
@@ -1190,10 +1188,10 @@ class MolmoActServo(PolicyBase):
         identity = self._transport.identity
         return {
             "actions": actions,
-            "servo": prediction,
+            "orchestral": prediction,
             "reproducibility": {**self.reproducibility_metadata(), **seed_metadata},
             "transport": {
-                "protocol": "servo-action-session",
+                "protocol": "orchestral-action-session",
                 "action_space": prediction.get("action_space", ACTION_SPACE),
                 "session_id": identity.get("session_id"),
                 "observation_encoding": self.observation_encoding,
@@ -1223,7 +1221,7 @@ class MolmoActServo(PolicyBase):
         if array.dtype != np.uint8:
             array = np.clip(array, 0, 255).astype(np.uint8)
         if array.ndim != 3 or array.shape[2] != 3:
-            raise ValueError(f"Servo camera image must be HxWx3, got {array.shape}")
+            raise ValueError(f"Orchestral camera image must be HxWx3, got {array.shape}")
         if self.image_size is not None:
             if self.image_fit == "stretch":
                 # The signed BimanualYAM camera contract is stretch; sending
@@ -1243,7 +1241,7 @@ class MolmoActServo(PolicyBase):
         if array.dtype != np.uint8:
             array = np.clip(array, 0, 255).astype(np.uint8)
         if array.ndim != 3 or array.shape[2] != 3:
-            raise ValueError(f"Servo camera image must be HxWx3, got {array.shape}")
+            raise ValueError(f"Orchestral camera image must be HxWx3, got {array.shape}")
         if self.image_size is not None:
             if self.image_fit == "stretch":
                 # The signed BimanualYAM camera contract is stretch; sending
@@ -1267,7 +1265,7 @@ class MolmoActServo(PolicyBase):
 
     @staticmethod
     def _resize_with_pad(image: np.ndarray, size: int) -> np.ndarray:
-        """Optional diagnostic resize; Servo normally owns model preprocessing."""
+        """Optional diagnostic resize; Orchestral normally owns model preprocessing."""
 
         source_h, source_w = image.shape[:2]
         scale = min(size / source_w, size / source_h)
@@ -1455,7 +1453,7 @@ class _LocalPolicy:
 
 
 class MolmoActLocal(PolicyBase):
-    """In-process MolmoAct policy. Drop-in replacement for :class:`MolmoActServo`."""
+    """In-process MolmoAct policy. Drop-in replacement for :class:`MolmoActOrchestral`."""
 
     def __init__(
         self,

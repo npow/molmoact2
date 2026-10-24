@@ -1,5 +1,5 @@
 # Primary hardware configuration for a remote pi0.5 rollout.
-# The Servo deployment or direct grant selects the model checkpoint.
+# The Orchestral deployment or direct grant selects the model checkpoint.
 #
 # This rig has two arms, but the red-cap policy consumes/returns 7 values for
 # one active arm. The adapter places them in the selected half of the robot's
@@ -64,8 +64,8 @@ eval:
   return_to_rest_on_exit: true
   return_to_rest_max_joint_step: 0.01
   reproducibility:
-    # Ordinary rollout sampling; set a seed only for reproducibility experiments.
-    seed: null
+    # Stable per-query policy noise for reproducible Orchestral rollouts.
+    seed: 20260727
     deterministic_algorithms: false
   camera_preflight:
     enabled: true

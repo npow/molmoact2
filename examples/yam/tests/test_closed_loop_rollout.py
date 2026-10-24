@@ -356,7 +356,7 @@ class ClosedLoopRolloutTests(unittest.TestCase):
         np.testing.assert_array_equal(applied[7:], action[7:])
         np.testing.assert_array_equal(applied[:7], measured[:7])
 
-    def test_both_arm_rate_limit_only_clips_the_first_tick_of_a_chunk(self):
+    def test_both_arm_rate_limit_clips_every_tick_of_a_chunk(self):
         mask = launcher.BimanualActiveArmHoldMask(
             active_arm_side="both",
             execution_mode="active_arm_hold",
@@ -370,13 +370,11 @@ class ClosedLoopRolloutTests(unittest.TestCase):
         )
         first = mask.command_target(action, measured, first_tick_of_chunk=True)
         np.testing.assert_allclose(first, np.full(14, 0.05, dtype=np.float32))
-        # A later tick in the same chunk is the checkpoint's own already-
-        # coherent within-chunk trajectory; it must reach the motors as
-        # predicted, not re-clipped against live feedback tick by tick.
+        # Later targets must also be limited against the latest feedback.
         rest = mask.command_target(action, measured, first_tick_of_chunk=False)
-        np.testing.assert_array_equal(rest, action)
+        np.testing.assert_allclose(rest, np.full(14, 0.05, dtype=np.float32))
 
-    def test_single_arm_rate_limit_only_clips_the_first_tick_of_a_chunk(self):
+    def test_single_arm_rate_limit_clips_every_tick_of_a_chunk(self):
         mask = launcher.BimanualActiveArmHoldMask(
             active_arm_side="left",
             execution_mode="active_arm_hold",
@@ -389,7 +387,7 @@ class ClosedLoopRolloutTests(unittest.TestCase):
         np.testing.assert_allclose(first[:7], np.full(7, 0.05, dtype=np.float32))
 
         rest = mask.command_target(action, measured, first_tick_of_chunk=False)
-        np.testing.assert_array_equal(rest[:7], action[:7])
+        np.testing.assert_allclose(rest[:7], np.full(7, 0.05, dtype=np.float32))
         # The held (inactive) side is unaffected by tick position either way.
         np.testing.assert_array_equal(rest[7:], measured[7:])
 
@@ -1062,7 +1060,7 @@ robot:
         self.assertEqual(primary_robot.closed, 1)
         self.assertEqual([camera.closed for camera in cameras], [1, 1, 1])
 
-    def test_v4l2_capture_uses_servo_native_camera_contract(self):
+    def test_v4l2_capture_uses_orchestral_native_camera_contract(self):
         cameras = [_ClosableCamera(), _ClosableCamera(), _ClosableCamera()]
         source = {
             "native_format": {

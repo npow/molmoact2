@@ -51,7 +51,7 @@ eval:
   # Every policy query gets a separate, recorded torch.Generator seed derived
   # from this base seed. Change it intentionally to sample a different plan.
   reproducibility:
-    seed: 20260727
+    seed: null
     # Leave CUDA-kernel determinism opt-in; the explicit policy generator is
     # deterministic either way, while forcing all kernels can reduce support/performance.
     deterministic_algorithms: false
@@ -80,8 +80,8 @@ eval:
     num_steps: 10
     enable_cuda_graph: false
     warmup: true
-  # Self-hosted `servo serve` endpoint (--policy-mode direct). The grant and
-  # servo_python come from the CLI. Client-side 224x224 stretch encoding
+  # Self-hosted `orc serve` endpoint (--policy-mode direct). The grant and
+  # orchestral_python come from the CLI. Client-side 224x224 stretch encoding
   # (image_size: 224 / image_fit: stretch) shrinks the per-act payload ~3x,
   # but the 2026-08-13 rollout that used it never committed to a grasp —
   # leave the serve to do its own preprocessing from source frames until a

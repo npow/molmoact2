@@ -50,7 +50,7 @@ from eval_utils import (
 from gello_min.robot import BimanualRobot
 from gello_min.launch_utils import instantiate_from_dict, move_to_start_position
 from gello_min.logging_utils import log_collect_demos
-from molmoact_client import MolmoActHTTP, MolmoActLocal, MolmoActServo, PolicyBase
+from molmoact_client import MolmoActHTTP, MolmoActLocal, MolmoActOrchestral, PolicyBase
 from rollout_manifest import (
     RolloutSeedPlan,
     build_rollout_manifest,
@@ -335,7 +335,7 @@ def _shutdown_runtime() -> None:
     except Exception as exc:  # noqa: BLE001 — all teardown is best-effort
         logger.warning("Runtime close failed: %s", exc)
     # The robot is released first; the policy close is a network round trip
-    # (a Servo action session is completed on the control plane) and must
+    # (a Orchestral action session is completed on the control plane) and must
     # never delay motor release.
     if _policy is not None:
         try:
@@ -345,7 +345,7 @@ def _shutdown_runtime() -> None:
             # ``_rest_return_eligible`` it is NOT also set by an operator
             # Ctrl-C: an interrupted rollout is safe to physically return to
             # rest but did not succeed, so a policy that records the outcome
-            # remotely (a Servo action session) must still see "failure".
+            # remotely (a Orchestral action session) must still see "failure".
             _policy.close(success=_session_clean_exit)
         except Exception as exc:  # noqa: BLE001 — all teardown is best-effort
             logger.warning("Policy close failed: %s", exc)
@@ -487,14 +487,14 @@ class Args:
     molmoact_server: Optional[str] = None
     """``http`` mode only: override eval.molmoact_server for the self-hosted server."""
 
-    servo_deployment: Optional[str] = None
-    """Managed Servo deployment id serving MolmoAct2 on YAM (``server`` mode)."""
+    orchestral_deployment: Optional[str] = None
+    """Managed Orchestral deployment id serving MolmoAct2 on YAM (``server`` mode)."""
 
-    servo_grant: Optional[str] = None
-    """Self-hosted `servo serve` grant file (``direct`` mode); no control plane, no fallback."""
+    orchestral_grant: Optional[str] = None
+    """Self-hosted `orc serve` grant file (``direct`` mode); no control plane, no fallback."""
 
-    servo_python: Optional[str] = None
-    """Python >= 3.12 interpreter with servo-client, if this runtime lacks it."""
+    orchestral_python: Optional[str] = None
+    """Python >= 3.12 interpreter with orchestral-client, if this runtime lacks it."""
 
     observation_encoding: Optional[Literal["jpeg", "h264"]] = None
     """Observation wire for server/direct mode; defaults to H.264. Raw camera
@@ -502,8 +502,7 @@ class Args:
     eval.server.observation_encoding or eval.direct.observation_encoding."""
 
     h264_crf: Optional[int] = None
-    """Direct mode with H.264 only: the encoder's rate point. Leave it
-    unset for the qualified default; the decoder is indifferent either way."""
+    """Unsupported by Orchestral; leave unset."""
 
     exec_steps: Optional[int] = None
     """Execute this many rows of each action chunk before replanning from a fresh
@@ -519,7 +518,7 @@ class Args:
     freeze. ON by default (18 steps = 0.6 s at 30 Hz, covering the ~0.5 s act).
     Set 0 for the legacy stop-and-replan behavior. The historical prefetch was
     reverted because it entered the new absolute-pose chunk at row 0 and drove
-    the arm backward; the elapsed-row splice is the fix (servo run_chunked's
+    the arm backward; the elapsed-row splice is the fix (orchestral run_chunked's
     design)."""
 
     replan_settle_s: float = 0.0
@@ -532,12 +531,8 @@ class Args:
     """Override eval.mode without editing the physical rollout YAML."""
 
     seed: Optional[int] = None
-    """Base seed for per-query policy noise. Overrides eval.reproducibility.seed.
-    Both the local and the remote policy derive each query's seed the same way
-    (per_rollout_per_query_v1), so the SAME base seed makes a local run and a
-    thor->odin run draw identical noise -- which is what makes them comparable
-    as anything other than two samples of a stochastic policy. Unset leaves
-    sampling stochastic."""
+    """Base seed for local policy noise. Overrides eval.reproducibility.seed.
+    Orchestral server/direct modes require this to be unset."""
 
     confirm_bimanual_clearance: bool = False
     """Required for active dual-arm motion after the operator verifies a clear, separated start pose."""
@@ -863,7 +858,7 @@ def _build_env(
                     or color_space != "rgb"
                 ):
                     raise RuntimeError(
-                        f"Servo camera source {sensor_ids[name]!r} is incompatible "
+                        f"Orchestral camera source {sensor_ids[name]!r} is incompatible "
                         f"with the YAM V4L2 RGB capture path: {native}"
                     )
                 fps = int(cfg.get("fps", source.get("capture_rate_hz", 5)))
@@ -1146,7 +1141,7 @@ class BimanualActiveArmHoldMask:
                 else ([self.active_arm_side] if self.execution_mode == "active_arm_hold" else [])
             ),
         }
-        if self.active_arm_side == "both" and self.execution_mode == "active_arm_hold":
+        if self.execution_mode == "active_arm_hold":
             result["both_arm_rate_limit"] = {
                 "enabled": self.both_arm_max_delta is not None,
             }
@@ -1188,17 +1183,15 @@ class BimanualActiveArmHoldMask:
         ``measured_state`` must be sampled immediately before this target is
         sent.  It is intentionally not a cached rollout-start state.
 
-        ``first_tick_of_chunk`` gates the per-tick rate limit (when
-        ``both_arm_max_delta`` is configured): only the first tick of a
-        freshly (re)planned chunk is clipped against live feedback, since a
-        chunk-boundary replan is exactly where an absolute-pose policy can
-        land an arbitrary discontinuity. Measured 2026-08-14: with this
-        clamp scoped to "both"-mode only, an unclamped single-arm replan
-        jumped a left-arm joint by -1.14 rad in one control tick and stalled
-        that motor's CAN response a few ticks later. Later ticks in the same
-        chunk are the checkpoint's own already-coherent within-chunk
-        trajectory and are sent unmodified, matching "both" mode's existing
-        contract.
+        ``both_arm_max_delta`` is applied on every control tick against fresh
+        measured state. A saved physical rollout showed a 0.93-rad single-tick
+        target jump on the second row of a newly predicted chunk because limiting
+        only the first row did not protect against discontinuities inside the
+        model's chunk. Large target jumps have previously preceded lost CAN motor
+        responses, so every commanded target must respect the configured bound.
+
+        ``first_tick_of_chunk`` remains in the signature for call-site
+        compatibility; it does not disable the per-tick limit.
         """
         measured = self.validate_state(measured_state, name="measured_state")
         action = self.validate_state(policy_action, name="policy_action")
@@ -1236,7 +1229,7 @@ class BimanualActiveArmHoldMask:
                     "Bimanual action guard rejected an out-of-envelope "
                     f"absolute target ({details}{suffix}); no target was sent."
                 )
-            if self.both_arm_max_delta is None or not first_tick_of_chunk:
+            if self.both_arm_max_delta is None:
                 return action.astype(np.float32, copy=True)
             delta = action - measured
             max_delta = np.asarray(self.both_arm_max_delta, dtype=np.float32)
@@ -1244,7 +1237,7 @@ class BimanualActiveArmHoldMask:
             return command.astype(np.float32, copy=False)
 
         active = self.active_slice
-        if self.both_arm_max_delta is None or not first_tick_of_chunk:
+        if self.both_arm_max_delta is None:
             command[active] = action[active]
             return command.astype(np.float32, copy=False)
         max_delta = np.asarray(self.both_arm_max_delta, dtype=np.float32)[active]
@@ -1556,7 +1549,7 @@ def run_one_rollout(
         #    so the 14-D vector reaching the saver at a chunk boundary is NOT the
         #    one this query consumed. ``input_dict`` is, and every client builds
         #    it the same way.
-        # 2. PER-ACT TRANSPORT TELEMETRY. The Servo client already measures
+        # 2. PER-ACT TRANSPORT TELEMETRY. The Orchestral client already measures
         #    act_ms / encode_ms / server_inference_ms / image_bytes per act and
         #    the launcher dropped all of it on the floor.
         #
@@ -2161,32 +2154,32 @@ def main() -> None:
     if mode == "local":
         policy = MolmoActLocal(**(eval_cfg.get("local") or {}))
     elif mode == "server":
-        # Hosted policy: one official Servo action session for the whole run.
+        # Hosted policy: one official Orchestral action session for the whole run.
         server_options = dict(eval_cfg.get("server") or {})
         for cli_value, key in (
-            (args.servo_deployment, "deployment"),
+            (args.orchestral_deployment, "deployment"),
             (args.observation_encoding, "observation_encoding"),
             (args.h264_crf, "h264_crf"),
-            (args.servo_python, "servo_python"),
+            (args.orchestral_python, "orchestral_python"),
         ):
             if cli_value is not None:
                 server_options[key] = cli_value
         if not server_options.get("deployment"):
             raise SystemExit(
-                "server mode needs a managed Servo deployment id: pass "
-                "--servo-deployment or set eval.server.deployment"
+                "server mode needs a managed Orchestral deployment id: pass "
+                "--orchestral-deployment or set eval.server.deployment"
             )
         if server_options.get("single_arm_side") is None and execution_mask.active_arm_side in {"left", "right"}:
             server_options["single_arm_side"] = execution_mask.active_arm_side
-        policy = MolmoActServo(**server_options)
+        policy = MolmoActOrchestral(**server_options)
     elif mode == "direct":
-        # Self-hosted `servo serve` endpoint: the grant is the entire identity.
+        # Self-hosted `orc serve` endpoint: the grant is the entire identity.
         # Deliberately no fallback endpoint and no control plane — a failure
         # aborts the run instead of rerouting it somewhere unmeasured.
         direct_options = dict(eval_cfg.get("direct") or {})
         for cli_value, key in (
-            (args.servo_grant, "grant"),
-            (args.servo_python, "servo_python"),
+            (args.orchestral_grant, "grant"),
+            (args.orchestral_python, "orchestral_python"),
             (args.observation_encoding, "observation_encoding"),
             (args.h264_crf, "h264_crf"),
         ):
@@ -2194,8 +2187,8 @@ def main() -> None:
                 direct_options[key] = cli_value
         if not direct_options.get("grant"):
             raise SystemExit(
-                "direct mode needs a `servo serve` grant file: pass "
-                "--servo-grant or set eval.direct.grant"
+                "direct mode needs a `orc serve` grant file: pass "
+                "--orchestral-grant or set eval.direct.grant"
             )
         if (
             direct_options.get("single_arm_side") is None
@@ -2205,7 +2198,7 @@ def main() -> None:
             # the execution mask already carries it. Reuse that choice instead
             # of requiring a duplicate task-specific YAML field.
             direct_options["single_arm_side"] = execution_mask.active_arm_side
-        policy = MolmoActServo(**direct_options)
+        policy = MolmoActOrchestral(**direct_options)
     elif mode == "http":
         policy = MolmoActHTTP(
             server=args.molmoact_server or eval_cfg.get("molmoact_server"),
@@ -2213,24 +2206,21 @@ def main() -> None:
         )
     else:
         raise SystemExit(
-            f"eval.mode must be 'server' (managed Servo action session), 'direct' "
-            f"(self-hosted `servo serve` grant), 'http' "
+            f"eval.mode must be 'server' (managed Orchestral action session), 'direct' "
+            f"(self-hosted `orc serve` grant), 'http' "
             f"(self-hosted host_server_yam.py), or 'local', got {mode!r}"
         )
     _policy = policy
     identity: Dict[str, Any] = {}
-    if isinstance(policy, MolmoActServo):
-        # Open the action session before any motor can be enabled: a bad
-        # credential, deployment or lease must fail with the arms still cold.
-        # ``ServoDirectHost.open`` forces the endpoint and session round trips
-        # to make that true -- ``DirectPolicy`` is otherwise lazy and would
-        # first touch the network on the first act, with the arms already live.
+    if isinstance(policy, MolmoActOrchestral):
+        if seed_plan.enabled:
+            raise ValueError("Orchestral does not support per-query seeds; set eval.reproducibility.seed: null and omit --seed")
+        # Resolve the contract and construct the SDK session before motor enable.
         identity = policy.open()
         print(
-            f"[servo] action session {identity.get('session_id')} on "
+            f"[orchestral] action session {identity.get('session_id')} on "
             f"{identity.get('deployment_id')} "
-            f"(generation {identity.get('generation_id')}, "
-            f"{identity.get('observation_encoding') or 'jpeg'} wire)"
+            f"({identity.get('observation_encoding') or 'jpeg'} wire)"
         )
     exec_steps = resolve_exec_steps(args.exec_steps, eval_cfg)
     print_execution_bracket(

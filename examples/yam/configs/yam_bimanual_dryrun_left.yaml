@@ -11,7 +11,7 @@
 #
 #   --config-path       configs/yam_bimanual_dryrun_left.yaml
 #   --right-config-path configs/yam_bimanual_dryrun_right.yaml
-#   --policy-mode direct --servo-grant <grant>
+#   --policy-mode direct --orchestral-grant <grant>
 #
 # State/action field order is fixed by the checkpoint:
 #   0:7   physical left arm  (this config)
@@ -73,7 +73,7 @@ eval:
   return_to_rest_on_exit: false
   return_to_rest_max_joint_step: 0.01
   reproducibility:
-    seed: 20260727
+    seed: null
     deterministic_algorithms: false
   # Kept ON deliberately. The cameras are the one piece of real hardware in a
   # dry run, and a white or unsettled frame is exactly the failure this run is
@@ -90,7 +90,7 @@ eval:
     image_stride: 6
     jpeg_quality: 75
     action_chunk_size: 15
-  # Overridden on the command line to ``direct`` with a `servo serve` grant.
+  # Overridden on the command line to ``direct`` with a `orc serve` grant.
   mode: local
   local:
     repo_id: "allenai/MolmoAct2-BimanualYAM"

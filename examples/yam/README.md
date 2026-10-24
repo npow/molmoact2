@@ -1,9 +1,9 @@
 # Bimanual YAM — MolmoAct2 closed-loop eval
 
 This directory holds the **robot/client side** of MolmoAct2 on a bimanual YAM
-setup. Inference itself runs either on Servo (a managed hosted deployment of
+setup. Inference itself runs either on Orchestral (a managed hosted deployment of
 the [`allenai/MolmoAct2-BimanualYAM`](https://huggingface.co/allenai/MolmoAct2-BimanualYAM)
-checkpoint, reached over one official Servo action session), in a self-hosted
+checkpoint, reached over one official Orchestral action session), in a self-hosted
 `host_server_yam.py` process on this LAN, or in-process from the checkpoint.
 The eval launcher here drives the two YAM arms, captures the 3-camera
 observation, queries a policy, executes the returned action chunk, records each
@@ -24,8 +24,8 @@ kept (teleop, data collection, and the Gello leader-arm code are omitted).
 examples/yam/
 ├── host_server_yam.py            # self-hosted inference server (separate; see top-level README §5)
 ├── launch_yaml_eval_molmoact.py  # eval launcher — main entry point
-├── molmoact_client.py            # MolmoActServo (Servo session) + MolmoActHTTP + MolmoActLocal policies
-├── servo_session_bridge.py       # official Servo SDK session host + out-of-process bridge
+├── molmoact_client.py            # MolmoActOrchestral (Orchestral session) + MolmoActHTTP + MolmoActLocal policies
+├── orchestral_session_bridge.py       # official Orchestral SDK session host + out-of-process bridge
 ├── camera_server.py              # long-lived ZMQ server owning the 3 RealSense cams
 ├── camera_client.py              # ZMQ client + standalone live viewer
 ├── eval_utils.py                 # per-rollout saver, cv2 viewer, labeling, conversion
@@ -50,8 +50,8 @@ pip install -r examples/yam/requirements.txt
 #   lerobot — only for the optional dataset conversion
 ```
 
-`server` mode additionally needs the official `servo-client` SDK, which
-requires Python >= 3.12 — see [Servo action sessions](#servo-action-sessions)
+`server` mode additionally needs the official `orchestral-client` SDK, which
+requires Python >= 3.12 — see [Orchestral action sessions](#orchestral-action-sessions)
 below.
 
 Run every command below **from the molmoact2 repo root** (the scripts add
@@ -62,11 +62,10 @@ Run every command below **from the molmoact2 repo root** (the scripts add
 Set `eval.mode` in the rollout YAML, or override it per run with
 `--policy-mode`:
 
-- **`server`** — hosted policy over **one official Servo action session**. The
-  SDK resolves a managed Servo deployment, opens a single action session
-  (signed offer + lease) for the whole run, and every action chunk rides that
-  session's protobuf transport. Requires a managed deployment id
-  (`--servo-deployment dep_...` or `eval.server.deployment`). This is the
+- **`server`** — hosted policy over **one official Orchestral action session**. The
+  SDK resolves a managed Orchestral deployment, opens a single action session
+  for the whole run, and every action chunk uses the SDK transport. Requires a managed deployment id
+  (`--orchestral-deployment dep_...` or `eval.server.deployment`). This is the
   launcher's default when `eval.mode` is absent from the config.
 - **`http`** — POST observations to a running `host_server_yam.py` on this LAN
   using the legacy `json_numpy` protocol. Point `eval.molmoact_server` (or
@@ -83,64 +82,55 @@ config/CLI. `configs/yam_left.yaml` ships `mode: http`; the physical-arm
 configs ship `mode: local`. Pass `--policy-mode server` to take the hosted path
 without editing a rollout YAML.
 
-### Servo action sessions
+### Orchestral action sessions
 
-`server` mode is pure official Servo SDK: `Servo()` ->
-`deployments.get(...)` -> `deployment.policy(...)` ->
-`sv.session(policy, observation_encoding="h264")`.
-There is no custom endpoint, no bespoke wire format, and no client-side token
-signing — the control plane owns authentication, the signed offer/lease, and
-generation fencing.
+`server` mode uses `orchestral.Orchestral()` → `deployments.get(id)` →
+`deployment.session(encoder="h264")` → `session.predict(inputs=...)`.
+Install with `pip install 'orchestral-client>=0.1.9,<0.2'` and authenticate with
+`orc login`. The SDK uses `~/.orchestral/robot-credentials.json` when present,
+otherwise `~/.orchestral/credentials.json`. Applications can set `ORC_API_KEY`;
+`ORC_BASE_URL` selects a separately hosted control plane.
 
-**Servo identity.** On the robot computer, enroll the machine once with
-`servo agent install --name yam-cell-01`. Approve the printed code from an
-authenticated administrator computer with
-`servo robot approve CODE --name yam-cell-01`. Keep the agent running on the
-robot. The rollout uses `servo.Servo()` with no credential arguments: Servo
-gets the robot identity through its local agent. On your own computer, use
-`servo login` for account access and deployment management. See Servo's
-[identity guide](https://servo.mintlify.app/guides/identity) and
-[Python API](https://servo.mintlify.app/reference/python-api).
+For robot enrollment, run `orc agent install --name yam-cell-01`, then approve
+from an administrator computer with `orc robot approve CODE`. See the
+[identity guide](https://docs.orchestrallabs.ai/guides/identity) and
+[Python API](https://docs.orchestrallabs.ai/reference/python-api).
 
 **Interpreter requirement.** The official SDK requires Python >= 3.12.
-`servo_session_bridge.py` holds the SDK session code (`ServoSessionHost`) and
+`orchestral_session_bridge.py` holds the SDK session code (`OrchestralSessionHost`) and
 can also run as a small stdio helper process under a separate interpreter. If
-`servo` is importable in the running interpreter, the session runs in-process;
-otherwise you must name an interpreter that has it with `--servo-python`,
-`eval.server.servo_python`, or the `SERVO_PYTHON` environment variable. An
-explicitly named interpreter is always used, even when `servo` is importable
-here. There is no silent fallback: if none of the three is set and `servo` is
+`orchestral` is importable in the running interpreter, the session runs in-process;
+otherwise you must name an interpreter that has it with `--orchestral-python`,
+`eval.server.orchestral_python`, or the `ORCHESTRAL_PYTHON` environment variable. An
+explicitly named interpreter is always used, even when `orchestral` is importable
+here. There is no silent fallback: if none of the three is set and `orchestral` is
 not importable, `server`
 mode fails immediately instead of choosing for you. The parent/child hop is a
 local pipe only; everything that leaves the machine is SDK transport.
 
-**One session per run.** The launcher opens the session right after policy
-construction and *before* any motor can be enabled, so a bad credential,
-deployment, or lease fails with the arms still cold. That same session serves
-every action chunk of every rollout in the session, and is completed on exit —
-`_shutdown_runtime()` releases the robot first and closes the policy second, so
-the session's closing network round trip never delays motor release.
+**One session per run.** The launcher resolves the deployment contract and
+constructs the session before enabling motors. Predictions reuse this session,
+and cleanup releases the robot before closing the SDK session. Session creation
+does not guarantee that a subsequent prediction will succeed.
 
-**What rides the wire.** Each request carries the three camera frames as raw
-JPEG bytes through the SDK's `EncodedObservation` (Servo accepts JPEG or PNG;
-there is **no base64 step**) plus a 14-float state vector
-`[left arm (7), right arm (7)]`. Camera roles, where "left"/"right" mean
-standing behind the arms and facing into the workspace:
+**What rides the wire.** The bridge passes RGB NumPy arrays and a float32 state
+vector to `session.predict`. The SDK encodes the images. JPEG bytes crossing the
+local subprocess pipe are decoded before prediction. The deployment's `io_spec`
+provides camera geometry, state width, action shape, and control rate.
 
-| Device alias | Servo camera key | View |
+| Device alias | Orchestral camera key | View |
 | --- | --- | --- |
 | `/dev/yam-cameras/middle` | `top` | middle/static workspace camera |
 | `/dev/yam-cameras/left` | `left` | left wrist |
 | `/dev/yam-cameras/right` | `right` | right wrist |
 
 The instruction you type at the stdin prompt rides with every action request.
-Responses are validated client-side: a 30x14 chunk, action space
-`joint_position`, decoded, finite, and served by the same binding generation the
-session opened against.
+Responses are checked for finite values and the action shape advertised by the
+deployment. The YAM executor interprets actions as joint positions.
 
 The full pi0.5 red-cap checkpoint is instead a native **15x7** single-arm YAM
 policy. Reuse the standard pi0.5 hardware configs and select its physical
-placement with `--active-arm-side`: when Servo advertises a 7-D contract, the
+placement with `--active-arm-side`: when Orchestral advertises a 7-D contract, the
 client sends that arm's seven live values and reinserts the returned actions
 into the same half of the 14-D executor command. The opposite half is filled
 from live feedback. All three cameras remain required. Gripper values stay in
@@ -149,11 +139,16 @@ second inversion.
 
 Managed and direct sessions default to **H.264**. The client passes raw RGB
 pixels to the SDK, whose session-owned encoder maintains the video stream.
-Use `--observation-encoding h264` to select it explicitly. Managed sessions
-use the SDK's encoder settings; `--h264-crf` applies only to direct sessions.
+Use `--observation-encoding h264` to select it explicitly. The `jpeg` option
+maps to Orchestral's `mjpeg` encoder. Managed sessions
+use the SDK's encoder settings. `--h264-crf` is unsupported by this SDK.
 `eval.server.image_size` defaults to `null` so the SDK/runtime owns preprocessing.
-The example defaults to unseeded sampling. Explicit `--seed` values are
-forwarded to the current Servo SDK.
+The pi0.5 physical configs use base seed `20260727`; each rollout and policy
+query gets a stable derived seed, forwarded through the Orchestral session to
+the action sampler. Set `eval.reproducibility.seed: null` for unseeded sampling,
+or pass `--seed` to override the configured base seed. The SDK validates that
+the server acknowledged each seed, and rollout metadata records the sampler's
+noise scheme.
 
 **Launch a hosted run:**
 
@@ -164,16 +159,16 @@ examples/yam/launch_yaml_eval_molmoact.py \
   --config-path examples/yam/configs/yam_left_physical.yaml \
   --right-config-path examples/yam/configs/yam_right_primary.yaml \
   --policy-mode server \
-  --servo-deployment dep_xxxxxxxxxxxx \
+  --orchestral-deployment dep_xxxxxxxxxxxx \
   --observation-encoding h264 \
   --active-arm-side left \
   --execution-mode active_arm_hold \
   --num-rollouts 1
 ```
 
-If the rollout interpreter already has Servo installed, no `--servo-python`
-option is needed. Otherwise point `--servo-python` (or `SERVO_PYTHON`) at a
-Python >= 3.12 interpreter with Servo installed.
+If the rollout interpreter already has Orchestral installed, no `--orchestral-python`
+option is needed. Otherwise point `--orchestral-python` (or `ORCHESTRAL_PYTHON`) at a
+Python >= 3.12 interpreter with Orchestral installed.
 
 The [pi0.5 red-cap checkpoint](https://huggingface.co/npow/pi05-yam-red-cap-full-7500)
 is a single-active-arm policy: `middle`, `left`, and `right` RGB images at
@@ -183,7 +178,10 @@ and holds the inactive arm. Select `--active-arm-side left` or `right`.
 The pi0.5 hardware configs use 15 Hz; overriding them with `--control-hz 30`
 executes the trajectory twice as fast as its training cadence.
 
-**Launch the self-hosted full pi0.5 red-cap endpoint:**
+**Use an Orchestral ConnectGrant token file:**
+
+Direct mode accepts a current Orchestral token, not an old Servo grant. Protect
+the file with `chmod 600`. It uses the same prediction API as managed mode.
 
 ```bash
 PYTHONPATH=examples/yam \
@@ -192,7 +190,7 @@ examples/yam/launch_yaml_eval_molmoact.py \
   --config-path examples/yam/configs/pi05_bimanual_physical.yaml \
   --right-config-path examples/yam/configs/pi05_right_primary.yaml \
   --policy-mode direct \
-  --servo-grant ~/.config/servo/pi05-yam-full-7500-grant.json \
+  --orchestral-grant ~/.config/orchestral/pi05-yam-full-7500-grant.json \
   --active-arm-side left \
   --control-hz 15 \
   --max-steps 600 \
@@ -204,14 +202,6 @@ arm connected: its real feedback supplies the held half of the bimanual
 executor rather than fabricating state. Shadow execution remains available
 only when requested explicitly with `--execution-mode shadow`.
 
-**State of play (2026-08-02).** The client side is complete, but a live run
-also needs the *remote* Servo control plane to expose a managed MolmoAct2
-deployment for the YAM embodiment with action sessions enabled on its runtime
-artifact. That deployment does not exist yet: the catalog reachable with this
-machine key still advertises the single-arm/SO-101 view, and runtime
-`action_sessions_enabled` defaults to false. Until it is created, `server` mode
-fails at session open (before any motor is enabled, by design). Use `http` or
-`local` mode in the meantime.
 
 ## Hardware setup
 
@@ -351,11 +341,11 @@ PYTHONPATH=examples/yam /home/npow/molmoact2-venv/bin/python \
 
 | Key | Meaning |
 |---|---|
-| `eval.mode` | `server` (one Servo action session), `http` (self-hosted `host_server_yam.py`), or `local` (in-process). Defaults to `server` when unset. CLI: `--policy-mode`. |
-| `eval.server.deployment` | Managed Servo deployment id (`dep_...`) for `mode: server`; required. CLI: `--servo-deployment`. |
-| `eval.server.servo_python` | Python >= 3.12 interpreter with `servo-client`, used when this runtime cannot import `servo`. CLI: `--servo-python`; env `SERVO_PYTHON`. |
+| `eval.mode` | `server` (one Orchestral action session), `http` (self-hosted `host_server_yam.py`), or `local` (in-process). Defaults to `server` when unset. CLI: `--policy-mode`. |
+| `eval.server.deployment` | Managed Orchestral deployment id (`dep_...`) for `mode: server`; required. CLI: `--orchestral-deployment`. |
+| `eval.server.orchestral_python` | Python >= 3.12 interpreter with `orchestral-client`, used when this runtime cannot import `orchestral`. CLI: `--orchestral-python`; env `ORCHESTRAL_PYTHON`. |
 | `eval.server.observation_encoding` | Defaults to `h264`; raw RGB pixels reach the SDK session encoder. CLI: `--observation-encoding`. |
-| `eval.server.image_size` | Optional client-side padded resize; default `null` so the Servo runtime owns preprocessing. |
+| `eval.server.image_size` | Optional client-side padded resize; default `null` so the Orchestral runtime owns preprocessing. |
 | `eval.molmoact_server` | `http` mode only: address of the self-hosted `host_server_yam.py`. CLI: `--molmoact-server`. |
 | `eval.local.*` | Checkpoint / device / dtype for `mode: local`. |
 | `eval.camera_server.enabled` | `true` uses the ZMQ camera server; `false` opens cameras in-process. |
