@@ -41,6 +41,10 @@ lerobot:
 
 eval:
   live_view_enabled: false
+  reproducibility:
+    # Match the pi0.5 primary config for reproducible per-query policy noise.
+    seed: 20260727
+    deterministic_algorithms: false
   camera_preflight:
     enabled: true
     timeout_sec: 10

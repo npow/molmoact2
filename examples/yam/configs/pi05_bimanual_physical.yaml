@@ -64,8 +64,8 @@ eval:
   return_to_rest_on_exit: true
   return_to_rest_max_joint_step: 0.01
   reproducibility:
-    # Ordinary rollout sampling; set a seed only for reproducibility experiments.
-    seed: null
+    # Keep paired Servo/local rollouts on the same per-query policy-noise stream.
+    seed: 20260727
     deterministic_algorithms: false
   camera_preflight:
     enabled: true

@@ -152,8 +152,12 @@ pixels to the SDK, whose session-owned encoder maintains the video stream.
 Use `--observation-encoding h264` to select it explicitly. Managed sessions
 use the SDK's encoder settings; `--h264-crf` applies only to direct sessions.
 `eval.server.image_size` defaults to `null` so the SDK/runtime owns preprocessing.
-The example defaults to unseeded sampling. Explicit `--seed` values are
-forwarded to the current Servo SDK.
+The pi0.5 physical configs use base seed `20260727`; each rollout and policy
+query gets a stable derived seed, which is forwarded through the Servo session
+to the action sampler. Set `eval.reproducibility.seed: null` for unseeded
+sampling, or pass `--seed` to override the configured base seed. Seeded remote
+requests require a Servo serving profile that supports per-query policy-noise
+seeds; the client records the returned noise scheme in rollout metadata.
 
 **Launch a hosted run:**
 
