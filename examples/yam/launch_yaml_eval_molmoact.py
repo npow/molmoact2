@@ -2213,8 +2213,6 @@ def main() -> None:
     _policy = policy
     identity: Dict[str, Any] = {}
     if isinstance(policy, MolmoActOrchestral):
-        if seed_plan.enabled:
-            raise ValueError("Orchestral does not support per-query seeds; set eval.reproducibility.seed: null and omit --seed")
         # Resolve the contract and construct the SDK session before motor enable.
         identity = policy.open()
         print(

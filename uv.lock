@@ -807,6 +807,15 @@ wheels = [
 ]
 
 [[package]]
+name = "iniconfig"
+version = "2.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/01/e1/2069291243c926a2ff1cd706c7f3eeb9b62144bf60f77c9fb9ff2fb26bd3/iniconfig-2.3.1.tar.gz", hash = "sha256:67f4b9c50da0dedf52af349e7749a80a9057a5031199791b906c3bb3ae878960", size = 21209, upload-time = "2026-10-06T22:48:38.076Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/56/43/4ca9e49d27a1fcf6bece6f6aec0ea46bb9112489b93d4b688fb415457bdb/iniconfig-2.3.1-py3-none-any.whl", hash = "sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7", size = 7552, upload-time = "2026-10-06T22:48:36.959Z" },
+]
+
+[[package]]
 name = "inquirerpy"
 version = "0.3.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1129,6 +1138,11 @@ sim = [
     { name = "transforms3d" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=1.0" },
@@ -1165,6 +1179,9 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.35" },
 ]
 provides-extras = ["sim", "robot"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]
 name = "mplib"
@@ -1552,7 +1569,7 @@ wheels = [
 
 [[package]]
 name = "orchestral-client"
-version = "0.1.9"
+version = "0.1.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aioquic" },
@@ -1570,11 +1587,11 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyjwt" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/dc/08/cae363678ffc1d5d211ce5810287a9b2205ae2287e869de19d9c2c63e7fe/orchestral_client-0.1.9.tar.gz", hash = "sha256:37171216673b8a00e3b40545c6512536f8eb3d6a2f322f79339ab0b1daf9c7cf", size = 38391708, upload-time = "2026-10-23T23:27:07.422Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/81/5d/768e4d530608971dff3d57f6d99ef454753d2a0a569a3f89842cd046fea1/orchestral_client-0.1.10.tar.gz", hash = "sha256:8e3bfaa3899017aa40d9fe26b5801cd967af6bf80ab70b860255589bb5c3f49d", size = 38392771, upload-time = "2026-10-24T01:27:29.829Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/06/1f/73f5791c0c23a4123d3de43b79caa46a2576575c2b5bc692de3c93cdb6e4/orchestral_client-0.1.9-py3-none-macosx_13_0_arm64.whl", hash = "sha256:7c2dac5bcb51e9d5a760fec6d0530f332dd89dca93bf2238b56fda4230507b35", size = 16199752, upload-time = "2026-10-23T23:26:53.944Z" },
-    { url = "https://files.pythonhosted.org/packages/9e/bd/fbeef7c5280e08cf03233084072a1f503f67f1ae0af7e19ce58e8e63b632/orchestral_client-0.1.9-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:e38c4af2087116d8e2b5428d0864d0a07ad1812aea2834f2ba249388f9a6673f", size = 35498214, upload-time = "2026-10-23T23:26:58.116Z" },
-    { url = "https://files.pythonhosted.org/packages/77/6e/33a5a4e2937907118e898e058e31c52d631e55b3d08228feb32dd51e4aba/orchestral_client-0.1.9-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:625e33330ce1c5e725b5c4512a913630780f8c06b0813df4e58cb9dee5b871fc", size = 38543866, upload-time = "2026-10-23T23:27:02.784Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/4b/4feb54c2b5a45e4fb9cf837f6bb21c0b3368a2af0a434f935455dc337992/orchestral_client-0.1.10-py3-none-macosx_13_0_arm64.whl", hash = "sha256:08a277e1560ecf6689ad8cd1281fa32159bdeb447b7c6414b482a9dfe702a050", size = 16200902, upload-time = "2026-10-24T01:27:15.628Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/21/4a7f6a0400ca34b2c0464d4aa5025a413a357909d25c66bad7f9b31ce5b6/orchestral_client-0.1.10-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:88d16541980851f9561baacef4b52bc12277c9699c5dad08b40bdf3afece4843", size = 35499363, upload-time = "2026-10-24T01:27:20.296Z" },
+    { url = "https://files.pythonhosted.org/packages/1c/b1/0fb4479eb3e74ca8d86c74b3046be22a74e937c5600bb78a929bacc41ebe/orchestral_client-0.1.10-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:9ba2278436ce5644fc7b5e89c75d7c68280d2a334b6f9854879d18e3d79fc9f3", size = 38545015, upload-time = "2026-10-24T01:27:25.07Z" },
 ]
 
 [[package]]
@@ -1631,6 +1648,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/20/20/25e0f4dc178a6bc0696793720055519a0de89e7661dae886992decbd2f81/pillow-12.3.0-cp312-cp312-win32.whl", hash = "sha256:dbce0b29841537a2fa4a214c2bbf14de3587c9680caa9b4e217568472490b28f", size = 6472684, upload-time = "2026-07-01T11:54:19.839Z" },
     { url = "https://files.pythonhosted.org/packages/45/89/da2f7971a317f83d807fdd4065c0af40208e59e692cc43d315a71a0e96d1/pillow-12.3.0-cp312-cp312-win_amd64.whl", hash = "sha256:a2b55dd6b2a4c4b7d87ffa56bdb33fdc5fdb9a462173861a7bc097f17d91cb09", size = 7227137, upload-time = "2026-07-01T11:54:22.025Z" },
     { url = "https://files.pythonhosted.org/packages/de/47/4845a0a6c0dbf1db8456bd9fc791f13c5ced7ced20606d08a0aacfd25b49/pillow-12.3.0-cp312-cp312-win_arm64.whl", hash = "sha256:331b624368d4f1d069149002f25f44bc61c8919ce8ddb3c45bdad8f6e2d89510", size = 2568267, upload-time = "2026-07-01T11:54:24.051Z" },
+]
+
+[[package]]
+name = "pluggy"
+version = "1.7.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/bf/db/7fc19e6f2dc92a966727031389fc2e08b558f0f25eb7403c1119ad4713cd/pluggy-1.7.0.tar.gz", hash = "sha256:d1eaa46ebb595891b860ab086b4d09c8588af65ebd4361b8e8f4bb8920b90ba8", size = 123304, upload-time = "2026-10-15T09:50:58.343Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/40/9e/2b38731e0fc536806f16490e1a12d7f0dc2a1235aa8cc07bcc75416a7daa/pluggy-1.7.0-py3-none-any.whl", hash = "sha256:7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c41ad2d34f9bec", size = 27082, upload-time = "2026-10-15T09:50:56.808Z" },
 ]
 
 [[package]]
@@ -1893,6 +1919,22 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/1e/7d/ae3f0a63f41e4d2f6cb66a5b57197850f919f59e558159a4dd3a818f5082/pyserial-3.5.tar.gz", hash = "sha256:3c77e014170dfffbd816e6ffc205e9842efb10be9f58ec16d3e8675b4925cddb", size = 159125, upload-time = "2020-11-23T03:59:15.045Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/07/bc/587a445451b253b285629263eb51c2d8e9bcea4fc97826266d186f96f558/pyserial-3.5-py2.py3-none-any.whl", hash = "sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0", size = 90585, upload-time = "2020-11-23T03:59:13.41Z" },
+]
+
+[[package]]
+name = "pytest"
+version = "9.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "iniconfig" },
+    { name = "packaging" },
+    { name = "pluggy" },
+    { name = "pygments" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e4/47/b9efed96c114afcfa3c9d3fe98a76a1d14c74a9e266d397cf6eb64be5e01/pytest-9.1.1.tar.gz", hash = "sha256:1088fbde8f2b49d95a549a195707afa7a76a3ce9bcadc26b6d71f0ffda5fe313", size = 1636369, upload-time = "2026-06-19T10:58:32.857Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl", hash = "sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c", size = 386536, upload-time = "2026-06-19T10:58:31.347Z" },
 ]
 
 [[package]]
