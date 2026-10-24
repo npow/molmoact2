@@ -57,7 +57,10 @@ eval:
     image_stride: 6
     jpeg_quality: 75
     action_chunk_size: 30
+  server:
+    policy_adapter: pi05_yam_red_cap
   mode: direct
-  direct: {}
+  direct:
+    policy_adapter: pi05_yam_red_cap
   camera_server:
     enabled: false

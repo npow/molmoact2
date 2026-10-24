@@ -16,9 +16,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 # BimanualYAM contract facts (single source of truth for both processes)
 # ---------------------------------------------------------------------------
 
-#: Orchestral's stable camera names for the YAM embodiment, in the order the
-#: released checkpoint consumes them. Orchestral maps these to the exact LeRobot
-#: runtime keys declared by the deployment's immutable manifest.
+#: Physical camera roles on the YAM rig. The selected client adapter maps these
+#: roles to the deployment's advertised input names.
 CAMERA_KEYS: Tuple[str, str, str] = ("top", "left", "right")
 STATE_DIM = 14
 ACTION_HORIZON = 30
@@ -182,7 +181,7 @@ def _pixels(value: Any) -> Any:
     return np.asarray(value, dtype=np.uint8)
 
 
-def _checkpoint_input_names(contract: Any) -> Tuple[Dict[str, str], str]:
+def _checkpoint_input_names(contract: Any, policy_adapter="identity") -> Tuple[Dict[str, str], str]:
     """Map ``CAMERA_KEYS`` and the state vector onto the contract's input names.
 
     Cameras match an image input whose name ends in ``.<key>`` (or is ``<key>``).
@@ -199,6 +198,11 @@ def _checkpoint_input_names(contract: Any) -> Tuple[Dict[str, str], str]:
         )
     images = [f.name for f in features if f.modality == "image"]
     states = [f.name for f in features if f.modality == "state"]
+    if policy_adapter == "pi05_yam_red_cap":
+        cameras = {"top": "base_0_rgb", "left": "left_wrist_0_rgb", "right": "right_wrist_0_rgb"}
+        if set(images) != set(cameras.values()) or states != ["state"]:
+            raise OrchestralBridgeError("pi05_yam_red_cap requires OpenPI model slots and state; import with policy_config=none")
+        return cameras, "state"
     cameras: Dict[str, str] = {}
     for key in CAMERA_KEYS:
         aliases = {"top", "middle"} if key == "top" else {key}
@@ -218,9 +222,9 @@ def _checkpoint_input_names(contract: Any) -> Tuple[Dict[str, str], str]:
     return cameras, states[0]
 
 
-def _checkpoint_geometry(contract: Any) -> Dict[str, Any]:
+def _checkpoint_geometry(contract: Any, policy_adapter="identity") -> Dict[str, Any]:
     """Read physical dimensions and camera geometry from the deployed contract."""
-    camera_names, state_name = _checkpoint_input_names(contract)
+    camera_names, state_name = _checkpoint_input_names(contract, policy_adapter)
     features = {feature.name: feature for feature in contract.inputs}
     result: Dict[str, Any] = {"camera_inputs": {}}
     state_shape = getattr(features[state_name], "shape", None)
@@ -248,9 +252,6 @@ def _checkpoint_geometry(contract: Any) -> Dict[str, Any]:
         if channels != 3 or getattr(feature, "dtype", "uint8") not in (None, "uint8"):
             raise OrchestralBridgeError(f"checkpoint image {name} must accept uint8 RGB")
         result["camera_inputs"][key] = dict(height=height, width=width, layout=layout)
-    declared = _jsonable(getattr(contract, "declared", None) or {})
-    if declared.get("control_rate_hz") is not None:
-        result["control_rate_hz"] = declared["control_rate_hz"]
     return result
 
 
@@ -324,11 +325,14 @@ def write_frame(stream: Any, header: Mapping[str, Any], buffers: Sequence[bytes]
 class OrchestralSessionHost:
     """One Orchestral prediction session for the entire evaluation."""
 
-    def __init__(self, *, deployment_id: str, instruction=None, observation_encoding="h264"):
+    def __init__(self, *, deployment_id: str, instruction=None, observation_encoding="h264", policy_adapter="identity"):
         if not deployment_id:
             raise OrchestralBridgeError("a managed Orchestral deployment id is required")
         if observation_encoding not in OBSERVATION_ENCODINGS:
             raise OrchestralBridgeError(f"unsupported observation encoding: {observation_encoding!r}")
+        if policy_adapter not in {"identity", "pi05_yam_red_cap"}:
+            raise OrchestralBridgeError(f"unsupported policy_adapter: {policy_adapter!r}")
+        self.policy_adapter = policy_adapter
         self.deployment_id = deployment_id
         self.instruction = instruction
         self.observation_encoding = observation_encoding
@@ -344,13 +348,18 @@ class OrchestralSessionHost:
                     for name, (h, w) in spec.cameras.items()] +
                    [SimpleNamespace(name="state", modality="state", shape=(spec.state_dim,))],
             outputs={"actions": {"shape": list(spec.action_shape)}},
-            declared={"control_rate_hz": spec.control_hz}, resolution="resolved",
+            declared={}, resolution="resolved",
         )
         if getattr(spec, "modalities", {}):
             raise OrchestralBridgeError("YAM cannot supply additional deployment modalities")
-        geometry = _checkpoint_geometry(contract)
-        self._camera_names, _ = _checkpoint_input_names(contract)
-        self.identity.update(geometry)
+        geometry = _checkpoint_geometry(contract, self.policy_adapter)
+        self._camera_names, _ = _checkpoint_input_names(contract, self.policy_adapter)
+        if self.policy_adapter == "pi05_yam_red_cap" and (
+            geometry["state_dim"] != 7 or geometry["action_dim"] != 7
+            or geometry["action_horizon"] != 15
+        ):
+            raise OrchestralBridgeError("pi05_yam_red_cap requires 7 state values and a 15x7 action chunk")
+        self.identity.update(geometry, policy_adapter=self.policy_adapter)
 
     def open(self):
         if self._session is not None:
@@ -382,12 +391,23 @@ class OrchestralSessionHost:
             raise OrchestralBridgeError(f"Orchestral endpoint state must be {self.identity['state_dim']} floats, got {len(state)}")
         inputs = {self._camera_names[key]: _checkpoint_pixels(images[key], self.identity["camera_inputs"][key])
                   for key in CAMERA_KEYS}
-        inputs["state"] = np.asarray(state, dtype=np.float32)
+        query_state = np.asarray(state, dtype=np.float32).copy()
+        if query_state.shape != (self.identity["state_dim"],) or not np.isfinite(query_state).all():
+            raise OrchestralBridgeError("state must be a finite vector matching the endpoint")
+        inputs["state"] = query_state.copy()
+        if self.policy_adapter == "pi05_yam_red_cap":
+            inputs["state"][6] = 1.0 - np.clip(query_state[6], 0.0, 1.0)
         result = self._session.predict(inputs=inputs, instruction=instruction or self.instruction,
                                        episode_start=self._episode_start, noise_seed=noise_seed)
         self._episode_start = False
+        actions = np.asarray(result.actions, dtype=np.float32).copy()
+        if actions.shape != (self.identity["action_horizon"], self.identity["action_dim"]) or not np.isfinite(actions).all():
+            raise OrchestralBridgeError("actions must be finite and match the endpoint shape")
+        if self.policy_adapter == "pi05_yam_red_cap":
+            actions[:, :6] += query_state[:6]
+            actions[:, 6] = np.clip(1.0 - actions[:, 6], 0.0, 1.0)
         timings = asdict(result.timings)
-        return {"actions": result.actions.tolist(), "horizon": len(result.actions),
+        return {"actions": actions.tolist(), "horizon": len(actions),
                 "action_space": ACTION_SPACE,
                 "telemetry": {**timings, "server_infer_ms": result.timings.accel_exec_us / 1000,
                               "trace_id": result.trace_id,
@@ -416,9 +436,9 @@ class OrchestralDirectHost(OrchestralSessionHost):
     """A standalone Orchestral ConnectGrant session."""
 
     def __init__(self, *, grant, instruction=None, timeout_sec=None,
-                 observation_encoding="h264", h264_crf=None):
+                 observation_encoding="h264", h264_crf=None, policy_adapter="identity"):
         super().__init__(deployment_id="self-hosted", instruction=instruction,
-                         observation_encoding=observation_encoding)
+                         observation_encoding=observation_encoding, policy_adapter=policy_adapter)
         if h264_crf is not None:
             raise OrchestralBridgeError("Orchestral does not expose h264_crf; unset this option")
         self._grant_path = grant
@@ -477,6 +497,7 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
                 instruction=header.get("instruction"),
                 timeout_sec=header.get("timeout_sec"),
                 observation_encoding=observation_encoding,
+                policy_adapter=header.get("policy_adapter", "identity"),
                 h264_crf=header.get("h264_crf"),
             )
         else:
@@ -484,6 +505,7 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
                 deployment_id=header["deployment_id"],
                 instruction=header.get("instruction"),
                 observation_encoding=observation_encoding,
+                policy_adapter=header.get("policy_adapter", "identity"),
             )
         identity = host.open()
         host_ref["host"] = host

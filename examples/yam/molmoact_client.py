@@ -463,6 +463,7 @@ class OrchestralSessionTransport:
         bridge_env: Optional[Dict[str, str]] = None,
         observation_encoding: Optional[str] = None,
         h264_crf: Optional[int] = None,
+        policy_adapter: str = "identity",
     ):
         # Cold starts documented for this deployment family run 26s-550s
         # (CLAUDE.md); ``open`` needs a materially longer budget than a
@@ -483,6 +484,7 @@ class OrchestralSessionTransport:
             raise OrchestralBridgeError("h264_crf only applies to observation_encoding='h264'")
         if h264_crf is not None and not grant:
             raise OrchestralBridgeError("h264_crf is only supported for direct sessions")
+        self.policy_adapter = policy_adapter
         self.observation_encoding = observation_encoding
         self.h264_crf = int(h264_crf) if h264_crf is not None else None
         self.grant = str(Path(grant).expanduser()) if grant else None
@@ -559,6 +561,7 @@ class OrchestralSessionTransport:
                     instruction=self.instruction,
                     timeout_sec=sdk_timeout,
                     observation_encoding=self.observation_encoding,
+                    policy_adapter=self.policy_adapter,
                     h264_crf=self.h264_crf,
                 )
             else:
@@ -566,12 +569,14 @@ class OrchestralSessionTransport:
                     deployment_id=self.deployment_id,
                     instruction=self.instruction,
                     observation_encoding=self.observation_encoding,
+                    policy_adapter=self.policy_adapter,
                 )
             identity = self._host.open()
         else:
             self._spawn()
             header = {
                 "op": "open",
+                "policy_adapter": self.policy_adapter,
                 "instruction": self.instruction,
                 "observation_encoding": self.observation_encoding,
                 "h264_crf": self.h264_crf,
@@ -843,8 +848,8 @@ class MolmoActOrchestral(PolicyBase):
     observation rides the SDK's prediction transport with the
     three camera frames as JPEG bytes — no base64, no custom endpoint. Native
     7-D single-arm endpoints can be adapted to the launcher's safe 14-D YAM
-    executor by naming ``single_arm_side``; no joint or gripper values are
-    otherwise transformed.
+    executor by naming ``single_arm_side``. ``policy_adapter`` selects any
+    checkpoint-specific joint and gripper conversions.
     """
 
     def __init__(
@@ -863,6 +868,7 @@ class MolmoActOrchestral(PolicyBase):
         h264_crf: Optional[int] = None,
         seed: Optional[int] = None,
         single_arm_side: Optional[str] = None,
+        policy_adapter: str = "identity",
     ):
         self.logger = get_molmoact_logger()
         if image_fit not in ("pad", "stretch"):
@@ -902,6 +908,7 @@ class MolmoActOrchestral(PolicyBase):
         self._seed_proven = False
         self._transport = OrchestralSessionTransport(
             deployment_id=deployment,
+            policy_adapter=policy_adapter,
             grant=grant,
             instruction=instruction,
             orchestral_python=orchestral_python,

@@ -1097,6 +1097,84 @@ class OrchestralSDKTests(unittest.TestCase):
             finally:
                 transport.close()
 
+    @unittest.skipUnless(_HAVE_CLIENT, _CLIENT_SKIP)
+    def test_red_cap_adapter_crosses_subprocess_bridge(self):
+        package_source = _FAKE_ORCHESTRAL_PACKAGE.replace(
+            'cameras={"middle": (8, 8), "left": (8, 8), "right": (8, 8)}',
+            'cameras={"base_0_rgb": (8, 8), "left_wrist_0_rgb": (8, 8), "right_wrist_0_rgb": (8, 8)}',
+        ).replace('state_dim=14, action_shape=(30, 14)', 'state_dim=7, action_shape=(15, 7)')
+        package_source = package_source.replace('np.zeros((30, 14)', 'np.zeros((15, 7)').replace('inputs["middle"]', 'inputs["base_0_rgb"]')
+        package_source = package_source.replace('        return SimpleNamespace(actions=actions,',
+            '        actions[:, 6] = inputs["state"][6]\n        return SimpleNamespace(actions=actions,')
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "orchestral"
+            package.mkdir()
+            (package / "__init__.py").write_text(package_source)
+            transport = OrchestralSessionTransport(deployment_id="dep_test", orchestral_python=sys.executable,
+                bridge_env={"PYTHONPATH": directory}, logger=_QUIET_LOGGER, policy_adapter="pi05_yam_red_cap")
+            try:
+                self.assertEqual(transport.open()["policy_adapter"], "pi05_yam_red_cap")
+                result = transport.act(self.images, [1, 2, 3, 4, 5, 6, 0.2])
+                np.testing.assert_allclose(result["actions"][0], [43, 2, 3, 4, 5, 6, 0.2], atol=1e-7)
+            finally:
+                transport.close()
+
+class RedCapAdapterTests(unittest.TestCase):
+    def make_host(self, adapter="pi05_yam_red_cap"):
+        from dataclasses import make_dataclass
+        host = OrchestralSessionHost(deployment_id="dep_test", policy_adapter=adapter)
+        host._configure(SimpleNamespace(
+            cameras={"base_0_rgb": (8, 8), "left_wrist_0_rgb": (8, 8), "right_wrist_0_rgb": (8, 8)},
+            state_dim=7, action_shape=(15, 7), modalities={},
+        ))
+        self.calls = []
+        self.actions = np.full((15, 7), 0.25, dtype=np.float32)
+        self.actions[0, 6] = -0.5
+        self.actions[1, 6] = 1.5
+        timings = make_dataclass("Timings", [("accel_exec_us", int)])(1000)
+
+        def predict(**kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(actions=self.actions, timings=timings, trace_id="trace")
+        host._session = SimpleNamespace(predict=predict)
+        return host
+
+    def test_query_state_and_actions_use_checkpoint_conversion(self):
+        host = self.make_host()
+        images = {key: np.full((8, 8, 3), i * 20, np.uint8) for i, key in enumerate(CAMERA_KEYS)}
+        for shift, grip in ((0, 0.2), (10, 1.2), (-10, -0.2)):
+            state = np.array([shift + i for i in range(6)] + [grip], dtype=np.float32)
+            original = state.copy()
+            result = host.act(images, state)
+            sent = self.calls[-1]["inputs"]
+            np.testing.assert_array_equal(state, original)
+            np.testing.assert_array_equal(sent["state"][:6], original[:6])
+            self.assertAlmostEqual(sent["state"][6], 1 - np.clip(grip, 0, 1))
+            np.testing.assert_allclose(np.asarray(result["actions"])[:, :6],
+                                       np.broadcast_to(original[:6] + 0.25, (15, 6)))
+            np.testing.assert_allclose(np.asarray(result["actions"])[:3, 6], [1, 0, 0.75])
+            for name, i in (("base_0_rgb", 0), ("left_wrist_0_rgb", 1), ("right_wrist_0_rgb", 2)):
+                self.assertEqual(int(sent[name][0, 0, 0]), i * 20)
+        self.assertEqual(self.actions[0, 0], 0.25)
+        self.assertEqual(self.actions[0, 6], -0.5)
+
+    def test_adapter_rejects_a_complete_policy_contract(self):
+        host = OrchestralSessionHost(deployment_id="dep", policy_adapter="pi05_yam_red_cap")
+        with self.assertRaisesRegex(OrchestralBridgeError, "policy_config=none"):
+            host._configure(SimpleNamespace(cameras={"middle": (8, 8), "left": (8, 8), "right": (8, 8)},
+                state_dim=7, action_shape=(15, 7), modalities={}))
+
+    def test_adapter_rejects_other_checkpoint_dimensions(self):
+        host = OrchestralSessionHost(deployment_id="dep", policy_adapter="pi05_yam_red_cap")
+        with self.assertRaisesRegex(OrchestralBridgeError, "15x7"):
+            host._configure(SimpleNamespace(cameras={"base_0_rgb": (8, 8), "left_wrist_0_rgb": (8, 8), "right_wrist_0_rgb": (8, 8)},
+                state_dim=14, action_shape=(15, 14), modalities={}))
+
+    def test_invalid_adapter_is_rejected(self):
+        with self.assertRaisesRegex(OrchestralBridgeError, "unsupported policy_adapter"):
+            OrchestralSessionHost(deployment_id="dep", policy_adapter="guessed")
+
+
 class PublishedSDKTests(unittest.TestCase):
     def test_real_sdk_encodes_predicts_and_closes_without_network(self):
         try:

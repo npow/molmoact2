@@ -367,3 +367,25 @@ Sanity-check the cameras independently of the eval loop:
 ```bash
 python examples/yam/camera_client.py --mode sub      # subscribe to the PUB stream
 ```
+
+## OpenPI red-cap checkpoint
+
+Import `npow/pi05-yam-red-cap-full-7500` with `--options policy_config=none action_horizon=15` in Orchestral. The `pi05_bimanual_physical.yaml` and
+`pi05_right_primary.yaml` configurations select `policy_adapter: pi05_yam_red_cap`
+for both managed (`eval.server`) and direct (`eval.direct`) sessions.
+
+This client adapter maps the rig's top, left, and right images to `base_0_rgb`,
+`left_wrist_0_rgb`, and `right_wrist_0_rgb`. Before prediction it clips gripper
+aperture to [0, 1] and sends `1 - aperture`. Orchestral applies the checkpoint's
+saved statistical normalization and unnormalization. On return the client adds
+the query's six joint positions to each predicted joint delta, then converts the
+gripper with `clip(1 - value, 0, 1)`. The query state is retained separately for
+each action chunk. The adapter requires a 7-value state and 15×7 action output.
+
+These conversions come from the checkpoint's published `model_processor` values
+([checkpoint metadata](https://huggingface.co/npow/pi05-yam-red-cap-full-7500/blob/main/openpi_config.json)).
+The client implements them directly; loading a sidecar file is unnecessary.
+
+Use `policy_adapter: identity` (the default) when the endpoint already returns
+robot commands through its complete upstream policy. Execution frequency comes
+from this client's `hz` setting.
