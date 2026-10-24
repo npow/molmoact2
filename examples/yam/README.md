@@ -203,6 +203,11 @@ executor rather than fabricating state. Shadow execution remains available
 only when requested explicitly with `--execution-mode shadow`.
 
 
+### Metrics
+
+Metrics for hosted (`server` mode) deployments are in the official Grafana at
+https://grafana.orchestrallabs.ai (Clerk SSO). This repo collects no metrics itself.
+
 ## Hardware setup
 
 1. Both YAM arms powered, e-stop released.
