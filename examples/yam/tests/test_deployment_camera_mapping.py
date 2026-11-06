@@ -80,8 +80,10 @@ class DeploymentCameraMappingTests(unittest.TestCase):
                 self.assertIsNone(host._session)
 
     def test_temporal_views_are_rejected_before_session_creation(self):
-        spec = IOSpec(cameras={name: (8, 8) for name in ("top", "left", "right")},
-                      camera_history={"top": (-1, 0)})
+        spec = IOSpec(cameras={name: (8, 8) for name in ("top", "left", "right")})
+        # Older installed SDKs omit this optional field; the bridge accepts
+        # their single-frame contracts and guards history when advertised.
+        spec.camera_history = {"top": (-1, 0)}
         host = OrchestralSessionHost(deployment_id="metadata-only")
         with self.assertRaisesRegex(OrchestralBridgeError, "requires camera history"):
             host._configure(spec)
