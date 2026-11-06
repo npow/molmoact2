@@ -109,6 +109,12 @@ reported without rejecting the scene. Frame shape/type, extreme mean brightness,
 and exposure-settling checks remain active. A stricter clipped-white limit can
 still be set explicitly for a particular setup.
 
+The shared 30 Hz configs use six asynchronous PNG writer threads. Three
+640x480 streams can outrun two writers on Nano, filling the bounded recorder
+queue and blocking the control loop. Keep the queue bounded; its writer count
+must sustain capture plus the additional policy-observation snapshots. Recording
+throughput checks can replay saved frames without opening a robot controller.
+
 ### Orchestral action sessions
 
 `server` mode uses `orchestral.Orchestral()` → `deployments.get(id)` →

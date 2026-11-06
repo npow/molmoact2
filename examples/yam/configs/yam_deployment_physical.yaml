@@ -37,7 +37,7 @@ storage:
   base_dir: "./yam_eval_runs"
   task_directory: "yam_deployment_bimanual"
   language_instruction: "Using the left arm, pick up the red lid, place it fully on top of the black box, release it, then move the arm away."
-  saver_max_workers: 2
+  saver_max_workers: 6  # Three 640x480 streams at 30 Hz; two writers bottleneck Nano.
   png_compress_level: 1
 
 lerobot:
