@@ -1,0 +1,83 @@
+# Hardware configuration for interchangeable YAM deployment policies.
+# The deployment selects the checkpoint; no task-specific action adapter.
+model_arm_side: left
+
+sensors:
+  cameras:
+    left_camera:
+      # D405 serial 402323071792 (model ``left_cam``)
+      device_id: "/dev/yam-cameras/left"
+      width: 640
+      height: 480
+      fps: 30
+    front_camera:
+      # D435 serial 250423122040 (model ``top_cam``)
+      device_id: "/dev/yam-cameras/middle"
+      width: 640
+      height: 480
+      fps: 30
+    right_camera:
+      # D405 serial 402323071794 (model ``right_cam``)
+      device_id: "/dev/yam-cameras/right"
+      width: 640
+      height: 480
+      fps: 30
+
+robot:
+  _target_: gello_min.yam.YAMRobot
+  channel: can_left
+
+agent:
+  start_joints: null
+
+hz: 30
+max_steps: 5000
+
+storage:
+  base_dir: "./yam_eval_runs"
+  task_directory: "yam_deployment_bimanual"
+  language_instruction: "Using the left arm, pick up the red lid, place it fully on top of the black box, release it, then move the arm away."
+  saver_max_workers: 2
+  png_compress_level: 1
+
+lerobot:
+  fps: 30
+  robot_type: "bimanual_yam"
+  hf_repo_id: "local/yam_eval_session"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 2
+  image_writer_threads: 2
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+
+eval:
+  bimanual:
+    active_arm_side: left
+    execution_mode: active_arm_hold
+    both_arm_max_delta: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.025]
+  live_view_enabled: false
+  return_to_rest_on_exit: true
+  return_to_rest_max_joint_step: 0.01
+  reproducibility:
+    # Stable per-query policy noise for reproducible Orchestral rollouts.
+    seed: 20260727
+    deterministic_algorithms: false
+  camera_preflight:
+    enabled: true
+    timeout_sec: 10
+    min_warmup_sec: 2.0
+    required_consecutive_frames: 2
+    expected_shape: [480, 640, 3]
+    max_clipped_white_fraction: 0.15
+  rerun:
+    enabled: true
+    image_stride: 6
+    jpeg_quality: 75
+    action_chunk_size: 30
+  server:
+  mode: server
+  direct:
+    observation_encoding: h264
+  camera_server:
+    enabled: false

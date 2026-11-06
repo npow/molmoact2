@@ -2220,6 +2220,8 @@ def main() -> None:
             f"{identity.get('deployment_id')} "
             f"({identity.get('observation_encoding') or 'jpeg'} wire)"
         )
+        print(f"[orchestral] camera mapping: {identity.get('camera_mapping')}")
+        print(f"[orchestral] policy adapter: {identity.get('policy_adapter', 'identity')}")
     exec_steps = resolve_exec_steps(args.exec_steps, eval_cfg)
     print_execution_bracket(
         exec_steps=exec_steps,

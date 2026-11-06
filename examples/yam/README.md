@@ -82,6 +82,25 @@ config/CLI. `configs/yam_left.yaml` ships `mode: http`; the physical-arm
 configs ship `mode: local`. Pass `--policy-mode server` to take the hosted path
 without editing a rollout YAML.
 
+### Switching deployment models
+
+For ABC-VLA, MolmoAct2, and other compatible YAM joint-position policies, use
+`configs/yam_deployment_physical.yaml` and `configs/yam_deployment_right.yaml`.
+These describe the hardware without choosing a task-specific action adapter.
+Change `--orchestral-deployment` to select the model; camera names, image sizes
+and action chunk length are resolved from the deployment and printed at startup.
+The resolver supports overhead/base and left/right wrist naming conventions;
+unknown or ambiguous views, extra modalities and camera-history requirements
+fail before motor enable. Never assign views by their position in a dictionary.
+Keep `--control-hz` matched to the checkpoint; the current deployment contract
+does not declare control rate or joint/gripper semantics.
+
+The `pi05_*` configs deliberately select `pi05_yam_red_cap`: that checkpoint
+requires joint-delta and gripper conversion. Those configs are not shared
+hardware configs and must not be reused with an ABC-VLA deployment. The adapter
+continues to reject incompatible contracts rather than applying those conversions
+to another policy.
+
 ### Orchestral action sessions
 
 `server` mode uses `orchestral.Orchestral()` → `deployments.get(id)` →

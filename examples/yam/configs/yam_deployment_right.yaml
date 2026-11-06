@@ -1,0 +1,64 @@
+# Hardware configuration for interchangeable YAM deployment policies.
+# The deployment selects the checkpoint; no task-specific action adapter.
+model_arm_side: right
+
+sensors:
+  cameras:
+    left_camera:
+      device_id: "/dev/yam-cameras/left"
+    front_camera:
+      device_id: "/dev/yam-cameras/middle"
+    right_camera:
+      device_id: "/dev/yam-cameras/right"
+
+robot:
+  _target_: gello_min.yam.YAMRobot
+  channel: can_right
+
+agent:
+  start_joints: null
+
+hz: 30
+max_steps: 3000
+
+storage:
+  base_dir: "./yam_eval_runs"
+  task_directory: "yam_deployment_right"
+  language_instruction: "Using the right arm, pick up the red lid, place it fully on top of the black box, open the gripper to release it, then move the arm away."
+  saver_max_workers: 2
+  png_compress_level: 1
+
+lerobot:
+  fps: 30
+  robot_type: "bimanual_yam"
+  hf_repo_id: "local/yam_eval_session"
+  action_mode: "next_joint_fields"
+  vcodec: "libx264"
+  image_writer_processes: 2
+  image_writer_threads: 2
+  parallel_encoding: false
+  sanitize_online_viz_meta: true
+
+eval:
+  live_view_enabled: false
+  reproducibility:
+    # Match the pi0.5 primary config for reproducible per-query policy noise.
+    seed: 20260727
+    deterministic_algorithms: false
+  camera_preflight:
+    enabled: true
+    timeout_sec: 10
+    min_warmup_sec: 2.0
+    required_consecutive_frames: 2
+    expected_shape: [360, 640, 3]
+    max_clipped_white_fraction: 0.15
+  rerun:
+    enabled: true
+    image_stride: 6
+    jpeg_quality: 75
+    action_chunk_size: 30
+  server:
+  mode: server
+  direct:
+  camera_server:
+    enabled: false

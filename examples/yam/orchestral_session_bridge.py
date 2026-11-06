@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import struct
 import sys
 from pathlib import Path
@@ -181,6 +182,27 @@ def _pixels(value: Any) -> Any:
     return np.asarray(value, dtype=np.uint8)
 
 
+def _camera_role(name: str) -> Optional[str]:
+    """Resolve a named view to this rig's physical camera, never by input order."""
+    terminal = re.split(r"[./]", name)[-1].lower()
+    tokens = set(re.split(r"[_\-]+", terminal))
+    # Camera names carry namespaces, view labels, stream numbers and encodings.
+    # Only interpret known view vocabulary: e.g. exterior_image_0_left is not
+    # evidence that an external camera is mounted on the left wrist.
+    neutral = {"cam", "camera", "image", "images", "rgb", "view", "wrist"}
+    labels = {"top", "middle", "overhead", "base", "left", "right"}
+    if any(token not in neutral | labels and not token.isdigit() for token in tokens):
+        return None
+    roles = set()
+    if tokens & {"top", "middle", "overhead", "base"}:
+        roles.add("top")
+    roles.update(tokens & {"left", "right"})
+    # An unspecified wrist and conflicting view labels must never be guessed.
+    if len(roles) != 1 or ("top" in roles and "wrist" in tokens):
+        return None
+    return roles.pop()
+
+
 def _checkpoint_input_names(contract: Any, policy_adapter="identity") -> Tuple[Dict[str, str], str]:
     """Map ``CAMERA_KEYS`` and the state vector onto the contract's input names.
 
@@ -205,12 +227,12 @@ def _checkpoint_input_names(contract: Any, policy_adapter="identity") -> Tuple[D
         return cameras, "state"
     cameras: Dict[str, str] = {}
     for key in CAMERA_KEYS:
-        aliases = {"top", "middle"} if key == "top" else {key}
-        matches = [name for name in images if name.rsplit(".", 1)[-1] in aliases]
+        matches = [name for name in images if _camera_role(name) == key]
         if len(matches) != 1:
             raise OrchestralBridgeError(
                 f"checkpoint input contract has {len(matches)} image inputs for camera "
-                f"{key!r} (image inputs: {images})"
+                f"{key!r} (image inputs: {images}); expected an unambiguous "
+                "overhead/base view and left/right wrist views"
             )
         cameras[key] = matches[0]
     unused = sorted(set(images) - set(cameras.values()))
@@ -226,7 +248,7 @@ def _checkpoint_geometry(contract: Any, policy_adapter="identity") -> Dict[str, 
     """Read physical dimensions and camera geometry from the deployed contract."""
     camera_names, state_name = _checkpoint_input_names(contract, policy_adapter)
     features = {feature.name: feature for feature in contract.inputs}
-    result: Dict[str, Any] = {"camera_inputs": {}}
+    result: Dict[str, Any] = {"camera_inputs": {}, "camera_mapping": camera_names}
     state_shape = getattr(features[state_name], "shape", None)
     outputs = _jsonable(getattr(contract, "outputs", None) or {})
     action_shape = (outputs.get("actions") or {}).get("shape")
@@ -342,6 +364,11 @@ class OrchestralSessionHost:
 
     def _configure(self, spec):
         from types import SimpleNamespace
+        history = getattr(spec, "camera_history", {}) or {}
+        if any(tuple(offsets) != (0,) for offsets in history.values()):
+            raise OrchestralBridgeError(
+                "YAM supplies current camera frames only; this deployment requires camera history"
+            )
         contract = SimpleNamespace(
             inputs=[SimpleNamespace(name=name, modality="image", shape=(h, w, 3),
                                     dtype="uint8", layout="HWC")
