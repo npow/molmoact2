@@ -52,6 +52,7 @@ class DeploymentCameraMappingTests(unittest.TestCase):
             config = yaml.safe_load((root / name).read_text())
             self.assertEqual(config["hz"], 30)
             self.assertEqual(config["eval"]["mode"], "server")
+            self.assertEqual(config["eval"]["camera_preflight"]["max_clipped_white_fraction"], 1.0)
             for mode in ("server", "direct"):
                 self.assertEqual((config["eval"].get(mode) or {}).get("policy_adapter", "identity"), "identity")
 

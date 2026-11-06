@@ -48,7 +48,7 @@ LOGGER = logging.getLogger("yam.policy_camera_preview")
 EXPECTED_SHAPE = (360, 640, 3)
 MIN_MEAN_LUMA = 15.0
 MAX_MEAN_LUMA = 240.0
-MAX_CLIPPED_WHITE_FRACTION = 0.15
+MAX_CLIPPED_WHITE_FRACTION = 1.0
 
 
 @dataclass(frozen=True)

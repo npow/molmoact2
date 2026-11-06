@@ -915,6 +915,27 @@ class CameraPreflightTests(unittest.TestCase):
             poll_sec=0,
         )
 
+    def test_white_table_is_not_treated_as_a_camera_failure(self):
+        image = np.full((360, 640, 3), 170, dtype=np.uint8)
+        image[:288] = 255  # 80% white surface, mean brightness 238.
+        launcher.wait_for_camera_visual_preflight(
+            {"top": self._Camera([image])},
+            timeout_sec=1,
+            required_consecutive_frames=2,
+            min_warmup_sec=0,
+            poll_sec=0,
+        )
+
+    def test_fully_blown_frame_still_fails_brightness_check(self):
+        image = np.full((360, 640, 3), 255, dtype=np.uint8)
+        with self.assertRaisesRegex(RuntimeError, "Camera visual preflight failed"):
+            launcher.wait_for_camera_visual_preflight(
+                {"top": self._Camera([image])},
+                timeout_sec=0.01,
+                min_warmup_sec=0,
+                poll_sec=0,
+            )
+
     def test_rejects_wrong_policy_image_shape(self):
         wrong_shape = np.full((480, 640, 3), 100, dtype=np.uint8)
         with self.assertRaisesRegex(RuntimeError, "Camera visual preflight failed"):

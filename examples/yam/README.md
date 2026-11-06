@@ -101,6 +101,11 @@ hardware configs and must not be reused with an ABC-VLA deployment. The adapter
 continues to reject incompatible contracts rather than applying those conversions
 to another policy.
 
+The shared deployment configs allow white tabletops: clipped-white coverage is
+reported without rejecting the scene. Frame shape/type, extreme mean brightness,
+and exposure-settling checks remain active. A stricter clipped-white limit can
+still be set explicitly for a particular setup.
+
 ### Orchestral action sessions
 
 `server` mode uses `orchestral.Orchestral()` → `deployments.get(id)` →

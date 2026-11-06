@@ -594,7 +594,7 @@ def wait_for_camera_visual_preflight(
     required_consecutive_frames: int = 2,
     expected_shape: Tuple[int, int, int] = (360, 640, 3),
     expected_shapes: Optional[Mapping[str, Tuple[int, int, int]]] = None,
-    max_clipped_white_fraction: float = 0.15,
+    max_clipped_white_fraction: float = 1.0,
     min_mean_luma: float = 15.0,
     max_mean_luma: float = 240.0,
     max_luma_delta: float = 15.0,
@@ -644,6 +644,8 @@ def wait_for_camera_visual_preflight(
                     )
                 )
                 clipped_white = float(np.mean(np.all(image >= 250, axis=-1)))
+                # White tabletops legitimately fill most of the workspace view.
+                # Report clipping, but only enforce a fraction limit if configured.
                 usable = (
                     min_mean_luma <= luma <= max_mean_luma
                     and clipped_white <= max_clipped_white_fraction
@@ -897,7 +899,7 @@ def _build_env(
                     expected_shape=tuple(preflight_cfg.get("expected_shape", (360, 640, 3))),
                     expected_shapes=capture_shapes or None,
                     max_clipped_white_fraction=float(
-                        preflight_cfg.get("max_clipped_white_fraction", 0.15)
+                        preflight_cfg.get("max_clipped_white_fraction", 1.0)
                     ),
                     min_warmup_sec=float(preflight_cfg.get("min_warmup_sec", 2.0)),
                 )

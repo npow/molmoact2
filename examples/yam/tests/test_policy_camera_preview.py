@@ -61,6 +61,13 @@ class PolicyCameraPreviewTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "left_camera is disabled"):
                 preview.load_policy_camera_specs(config_path)
 
+    def test_white_table_coverage_is_diagnostic_only(self):
+        image = np.full(preview.EXPECTED_SHAPE, 170, dtype=np.uint8)
+        image[:288] = 255
+        quality = preview.frame_quality(image)
+        self.assertTrue(quality["technical_ready"])
+        self.assertAlmostEqual(quality["clipped_white_fraction"], 0.8)
+
     def test_quality_uses_the_motor_enable_technical_contract(self):
         ready = np.full(preview.EXPECTED_SHAPE, 100, dtype=np.uint8)
         quality = preview.frame_quality(ready)
