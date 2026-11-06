@@ -60,8 +60,9 @@ eval:
   return_to_rest_on_exit: true
   return_to_rest_max_joint_step: 0.01
   reproducibility:
-    # Stable per-query policy noise for reproducible Orchestral rollouts.
-    seed: 20260727
+    # Model-agnostic rollouts do not request optional per-query seed support.
+    # Use model-specific configs when qualifying deterministic policy noise.
+    seed: null
     deterministic_algorithms: false
   camera_preflight:
     enabled: true

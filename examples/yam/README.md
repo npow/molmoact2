@@ -94,6 +94,9 @@ unknown or ambiguous views, extra modalities and camera-history requirements
 fail before motor enable. Never assign views by their position in a dictionary.
 Keep `--control-hz` matched to the checkpoint; the current deployment contract
 does not declare control rate or joint/gripper semantics.
+Shared configs leave `eval.reproducibility.seed` unset because per-query policy
+seeding is an optional model capability (ABC-VLA does not support it). The
+model-specific pi0.5 configs retain their deterministic seed settings.
 
 The `pi05_*` configs deliberately select `pi05_yam_red_cap`: that checkpoint
 requires joint-delta and gripper conversion. Those configs are not shared
