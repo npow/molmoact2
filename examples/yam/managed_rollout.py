@@ -16,7 +16,6 @@ import numpy as np
 
 from orchestral import Orchestral
 from orchestral.core.tailnet import ManagedTailnetNode, TailscaleCli
-import rerun as rr
 
 DEFAULT_DEPLOYMENT = "steady-ape-3roj"
 LEFT_CONFIG = "examples/yam/configs/pi05_holesaw_conveyor_left.yaml"
@@ -51,14 +50,16 @@ def probe(host, family, instruction):
     camera_mapping = host.identity["camera_mapping"]
     prediction = host.act(dict.fromkeys(camera_mapping, image), state, instruction)
     actions = np.asarray(prediction["actions"])
-    if actions.shape != (16, 7) or not np.isfinite(actions).all():
-        raise SystemExit("GR00T did not return a finite 16 × 7 action chunk.")
+    expected = (host.identity["action_horizon"], host.identity["action_dim"])
+    if actions.shape != expected or not np.isfinite(actions).all():
+        raise SystemExit(f"{family} did not return a finite action chunk of shape {expected}.")
     host.begin_episode()
-    print(f"Staging GR00T returned a finite 16 × 7 action chunk using {', '.join(camera_mapping.values())}.",
-          flush=True)
+    print(f"Staging {family} returned a finite {expected[0]} × {expected[1]} action chunk using "
+          f"{', '.join(camera_mapping.values())}.", flush=True)
 
 
-def rollout_gr00t(host, identity, args):
+def rollout_joint_policy(host, identity, args):
+    import rerun as rr
     from omegaconf import OmegaConf
     from launch_yaml_eval_molmoact import (
         _build_env,
@@ -67,9 +68,10 @@ def rollout_gr00t(host, identity, args):
     )
 
     rollout = runpy.run_path(str(Path(__file__).with_name("groot_rollout.py")))
+    family = args.policy_family
     checked_shape = (identity["action_horizon"], identity["action_dim"])
     if identity["state_dim"] != 7 or checked_shape != rollout["ACTION_SHAPE"]:
-        raise SystemExit(f"Unexpected GR00T contract for YAM: {checked_shape}")
+        raise SystemExit(f"Unexpected {family} contract for YAM: {checked_shape}")
     left = OmegaConf.to_container(OmegaConf.load(LEFT_CONFIG), resolve=True)
     right = OmegaConf.to_container(OmegaConf.load(RIGHT_CONFIG), resolve=True)
     validate_bimanual_model_arm_order(left, right)
@@ -83,11 +85,11 @@ def rollout_gr00t(host, identity, args):
     bindings = {name: f"{rig_cameras[role]}_rgb" for role, name in camera_mapping.items()}
     for role in rig_cameras.keys() - camera_mapping.keys():
         left["sensors"]["cameras"][rig_cameras[role]]["enabled"] = False
-    input(f"GR00T left-arm rollout at {args.control_hz:g} Hz. Instruction: {args.instruction!r}. "
+    input(f"{family} left-arm rollout at {args.control_hz:g} Hz. Instruction: {args.instruction!r}. "
           "Clear the workspace, then press Enter to start (Ctrl+C stops)... ")
     output_path = (
         args.rrd.expanduser().resolve() if args.rrd else
-        Path("yam_eval_runs/rerun") / f"gr00t_{datetime.now().astimezone():%Y%m%d_%H%M%S}.rrd"
+        Path("yam_eval_runs/rerun") / f"{family}_{datetime.now().astimezone():%Y%m%d_%H%M%S}.rrd"
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sensor_roles = {
@@ -104,7 +106,7 @@ def rollout_gr00t(host, identity, args):
     frame_counts = {name: 0 for name in bindings}
     count_lock = threading.Lock()
     recording_start = time.monotonic()
-    recording = rr.RecordingStream("yam_gr00t_rollout")
+    recording = rr.RecordingStream(f"yam_{family}_rollout")
     print(f"[rerun] Recording every captured camera frame to {output_path}", flush=True)
     try:
         with recording:
@@ -143,6 +145,7 @@ def rollout_gr00t(host, identity, args):
 
 def soak_endpoint(host, identity, args):
     """Continuously query a YAM endpoint from live cameras without a robot."""
+    import rerun as rr
     from omegaconf import OmegaConf
     from gello_min.v4l2_camera import V4L2Camera
 
@@ -399,6 +402,7 @@ def main():
     try:
         deployment = client.deployments.get(target.deployment)
         checkpoint = deployment.checkpoint_uri or ""
+        registered_name = deployment.model_id.lower()
     finally:
         client._http.close()
     model_name = checkpoint.split("@", 1)[0].rsplit("/", 1)[-1].lower()
@@ -406,6 +410,8 @@ def main():
         family = "pi05"
     elif model_name.startswith("gr00t"):
         family = "gr00t"
+    elif registered_name.startswith("molmoact2-") or model_name.startswith("molmoact2-"):
+        family = "molmoact2"
     elif target.soak_hours > 0:
         family = "generic"
     else:
@@ -453,7 +459,7 @@ def main():
     )
     host = OrchestralSessionHost(
         deployment_id=target.deployment, instruction=args.instruction, policy_adapter=adapter,
-        allow_camera_subset=family in {"gr00t", "generic"} or target.soak_hours > 0,
+        allow_camera_subset=family in {"gr00t", "molmoact2", "generic"} or target.soak_hours > 0,
     )
     try:
         identity = host.open()
@@ -463,7 +469,7 @@ def main():
             if args.soak_hours > 0:
                 soak_endpoint(host, identity, args)
             else:
-                rollout_gr00t(host, identity, args)
+                rollout_joint_policy(host, identity, args)
     finally:
         host.close()
 
