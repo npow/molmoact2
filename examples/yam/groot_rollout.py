@@ -81,6 +81,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     future = None
     submitted_with = 0
     request_hold_ticks = 0
+    rejected_chunks = 0
     rows = predictions = handoffs = misses = holds = 0
     next_tick = time.monotonic()
     deadline = next_tick + seconds
@@ -93,6 +94,12 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             if not pending and future is not None and future.done():
                 chunk, elapsed = future.result()
                 future = None
+                if len(chunk):
+                    rejected_chunks = 0
+                else:
+                    rejected_chunks += 1
+                    if rejected_chunks == 3:
+                        raise SystemExit(f"{model_label} returned three consecutive unreachable plans; rollout stopped")
                 # Each elapsed command in the active plan corresponds to one row in the
                 # new plan, which starts at the observation taken for this prediction.
                 # A missed deadline invalidates a prefetched plan. Wait for a fresh

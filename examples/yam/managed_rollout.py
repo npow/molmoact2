@@ -43,7 +43,7 @@ def policy_family(model_id):
     name = model_id.lower()
     for prefix, family in (("pi05", "pi05"), ("gr00t", "gr00t"),
                            ("molmoact2", "molmoact2"), ("dm05", "dexmal"),
-                           ("praxis1", "praxis1"), ("verne", "verne")):
+                           ("praxis1", "praxis1"), ("verne", "verne"), ("isaac05", "isaac05")):
         if name == prefix or name.startswith(prefix + "-"):
             return family
     return None
@@ -464,7 +464,7 @@ def main():
 
     settings = argparse.ArgumentParser(prog=parser.prog)
     settings.add_argument("--seconds", type=float, default=300)
-    settings.add_argument("--control-hz", type=float, default=15 if family == "praxis1" else 30)
+    settings.add_argument("--control-hz", type=float, default=15 if family in {"praxis1", "isaac05"} else 30)
     settings.add_argument("--instruction", default=OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
     settings.add_argument("--prefetch-lead-steps", type=int, default=8)
     settings.add_argument("--shadow", action="store_true")
@@ -482,6 +482,8 @@ def main():
         settings.error("--soak-hours must be finite and nonnegative")
     if not 0 <= args.prefetch_lead_steps < 16:
         settings.error("--prefetch-lead-steps must be between 0 and 15")
+    if family == "verne" and not (target.probe or target.soak_hours > 0 or args.shadow):
+        settings.error("Verne hardware rollout is disabled after unexpected motion; use --shadow to test its policy without sending joint commands")
     adapter = {
         "praxis1": TOOL_POSE_MATRIX_ADAPTER,
         "verne": TOOL_POSE_ADAPTER,
