@@ -50,7 +50,7 @@ pip install -r examples/yam/requirements.txt
 #   lerobot — only for the optional dataset conversion
 ```
 
-`server` mode additionally needs the official `orchestral-client` SDK, which
+`server` mode additionally needs the `orchestral-labs` SDK, which
 requires Python >= 3.12 — see [Orchestral action sessions](#orchestral-action-sessions)
 below.
 
@@ -89,21 +89,41 @@ With the loopback Orchestral Worker running, start a timed RTC rollout with
 red-lid instruction. The script uses H.264 at 15 Hz and defaults to 60 seconds.
 Pass `--seconds 120` to extend it, or press Ctrl-C to end it early.
 
+For the local `npow/pi05-yam-holesaw-conveyor` Worker, run
+`examples/yam/run-rollout.sh --holesaw`. This selects the overhead color
+camera, the checkpoint's training prompt, and the left arm at 15 Hz. The
+default Grant for this checkpoint is `../orchestral/.thor-pi05/grant-holesaw`.
+When starting this Worker manually, pass `--model-action-dim 32` for the
+sharded checkpoint.
+
+Managed staging deployments use the same launcher with an endpoint ID:
+`examples/yam/run-rollout.sh --deployment steady-wombat-nvqs`. This starts a
+physical rollout. To measure an endpoint with live cameras without opening the
+robot or CAN, run
+`examples/yam/run-rollout.sh --deployment steady-wombat-nvqs --soak-hours 1`.
+Soak runs write CSV metrics and a JSON summary under `yam_eval_runs/soak/`; RRD
+recording is opt in with `--rrd PATH`. The launcher uses
+`~/.orchestral/stage.json` for staging credentials by default; override it with
+`ORC_CREDENTIALS_FILE`.
+
 RTC runs a single timed rollout. Use `launch_yaml_eval_molmoact.py` for
 per-object labeling, saved evaluations, and LeRobot export.
 
-The launcher imports the SDK in the robot interpreter. Install the runtime
-dependencies from `examples/yam/requirements-rtc.txt` and use an SDK build
-that exports `orchestral.RealTimeChunking`. The PyPI version pinned in that
-file provides the SDK dependencies and native client, but predates RTC.
-For a source build, Thor was verified with Orchestral commit
-`b816cdbe18b0eed247f9fd49c90222e300b7ddb1`. Prepare that checkout with
-`just install apis native`, then set `ORCHESTRAL_RTC_SDK_ROOT` to its path.
-On Thor, the wrapper defaults to the prepared
-`../orchestral/.thor-pi05/rtc-sdk` directory.
+The project venv installs the sibling `../orchestral` checkout as editable.
+Run `just apis native` in that checkout to prepare its generated contracts
+and Rust binaries, then run `uv sync --extra robot` from this repository.
+On Thor, run `python3 src/orchestral/client/tailnet_binaries.py --install src/orchestral/client/_native/linux_arm64`
+in the Orchestral checkout to install its pinned Tailscale pair.
+Set `ORCHESTRAL_RTC_SDK_ROOT` to explicitly select another SDK checkout.
 
 Set `YAM_PYTHON`, `I2RT_ROOT`, or `ORCHESTRAL_GRANT` to use a different
 robot interpreter, i2rt checkout, or Grant file.
+
+The Session is opened from the Worker's Grant, so it has no control-plane login. To send its
+live spans (observation-to-action, reaction, held ticks and tick jitter) to Grafana, set
+`ORC_TELEMETRY_BASE_URL` (the control plane, for example `https://api.orchestrallabs.ai`) and
+`ORC_TELEMETRY_API_KEY` (an API key of the org that should own them). This needs an Orchestral
+SDK that relays grant-only Sessions; without the two variables the spans are not sent.
 
 To start a Worker separately, use an Orchestral Worker Python environment with
 OpenPI, JAX CUDA 13, cuBLAS 13.2 or newer, and the native QUIC binary. Download

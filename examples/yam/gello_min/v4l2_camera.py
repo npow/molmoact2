@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional, Tuple
+import logging
+from typing import Callable, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -28,6 +29,7 @@ class V4L2Camera:
         fps: int = 5,
         read_wait_timeout_sec: float = 2.0,
         max_frame_age_sec: float = 1.5,
+        frame_callback: Optional[Callable[[np.ndarray, float], None]] = None,
     ):
         self.device = device
         self._cap = cv2.VideoCapture()
@@ -64,6 +66,8 @@ class V4L2Camera:
         self._capture_period_sec = 1.0 / max(1, int(fps))
         self._read_wait_timeout_sec = float(read_wait_timeout_sec)
         self._max_frame_age_sec = float(max_frame_age_sec)
+        self._frame_callback = frame_callback
+        self._frame_callback_error_reported = False
         self._latest_rgb: Optional[np.ndarray] = None
         self._latest_depth: Optional[np.ndarray] = None
         self._latest_frame_timestamp: Optional[float] = None
@@ -87,6 +91,7 @@ class V4L2Camera:
                     raise RuntimeError(f"No frame from V4L2 camera {self.device}")
 
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                captured_at = time.monotonic()
                 with self._frame_lock:
                     # ``cvtColor`` returns a fresh array, so consumers can
                     # safely retain the previous frame while this reference is
@@ -96,6 +101,21 @@ class V4L2Camera:
                     self._latest_frame_timestamp = time.time()
                     self._last_capture_error = None
                     self._frame_ready.set()
+                if self._frame_callback is not None:
+                    try:
+                        self._frame_callback(rgb, captured_at)
+                    except Exception as exc:  # noqa: BLE001 -- recording must not break capture
+                        report_error = False
+                        with self._frame_lock:
+                            self._last_capture_error = exc
+                            if not self._frame_callback_error_reported:
+                                self._frame_callback_error_reported = True
+                                report_error = True
+                        if report_error:
+                            logging.getLogger(__name__).exception(
+                                "Camera frame callback failed for %s; capture will continue",
+                                self.device,
+                            )
             except Exception as exc:  # noqa: BLE001 — surface through read()
                 with self._frame_lock:
                     self._last_capture_error = exc

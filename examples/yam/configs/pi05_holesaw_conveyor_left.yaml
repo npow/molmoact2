@@ -1,0 +1,34 @@
+# Left-arm conveyor rig for npow/pi05-yam-holesaw-conveyor.
+# The training demonstrations used the D435 overhead color stream.
+model_arm_side: left
+
+sensors:
+  cameras:
+    left_camera:
+      device_id: "/dev/yam-cameras/left"
+      width: 640
+      height: 480
+      fps: 30
+    front_camera:
+      device_id: "/dev/yam-cameras/middle"
+      width: 640
+      height: 480
+      fps: 30
+    right_camera:
+      device_id: "/dev/yam-cameras/right"
+      width: 640
+      height: 480
+      fps: 30
+
+robot:
+  _target_: gello_min.yam.YAMRobot
+  channel: can_left
+
+hz: 15
+
+storage:
+  language_instruction: "Pick three hole saws from the moving conveyor belt and place them in the red case."
+
+eval:
+  server:
+    policy_adapter: pi05_yam_red_cap

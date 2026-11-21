@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import struct
 import sys
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -32,6 +34,19 @@ NOISE_SCHEME = "numpy-pcg64-15x32-fp32-v1"
 #: Environment variable naming a Python >= 3.12 interpreter that can import the
 #: official ``orchestral`` package, used when the robot runtime cannot.
 ORCHESTRAL_PYTHON_ENV = "ORCHESTRAL_PYTHON"
+_QUIC_SNAPSHOT_ENV = "ORC_QUIC_STATS_SNAPSHOT"
+
+
+@contextmanager
+def _quic_snapshots():
+    """Enable the SDK's native connection diagnostics for this session."""
+    original = os.environ.get(_QUIC_SNAPSHOT_ENV)
+    os.environ.setdefault(_QUIC_SNAPSHOT_ENV, "1")
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop(_QUIC_SNAPSHOT_ENV, None)
 
 #: SDK image encoders supported for both managed and direct sessions.
 OBSERVATION_ENCODINGS: Tuple[str, ...] = ("jpeg", "h264")
@@ -151,14 +166,14 @@ def _frame_is_empty(value: Any) -> bool:
     return not value
 
 
-def missing_cameras(images: Mapping[str, Any], keys: Sequence[str] = CAMERA_KEYS) -> List[str]:
+def missing_cameras(images: Mapping[str, Any], camera_keys=CAMERA_KEYS) -> List[str]:
     """Camera keys with no usable frame, for either payload shape.
 
     A plain ``not images.get(key)`` cannot do this job any more: a numpy array
     has no truth value, so the check that exists to *report* a stalled camera
     would itself raise instead.
     """
-    return [key for key in keys if _frame_is_empty(images.get(key))]
+    return [key for key in camera_keys if _frame_is_empty(images.get(key))]
 
 
 def _observation_frame(value: Any) -> Any:
@@ -207,7 +222,9 @@ def _camera_role(name: str) -> Optional[str]:
     return roles.pop()
 
 
-def _checkpoint_input_names(contract: Any, policy_adapter="identity") -> Tuple[Dict[str, str], str]:
+def _checkpoint_input_names(
+    contract: Any, policy_adapter="identity", *, allow_camera_subset=False,
+) -> Tuple[Dict[str, str], str]:
     """Map ``CAMERA_KEYS`` and the state vector onto the contract's input names.
 
     Cameras match an image input whose name ends in ``.<key>`` (or is ``<key>``).
@@ -227,14 +244,31 @@ def _checkpoint_input_names(contract: Any, policy_adapter="identity") -> Tuple[D
     states = [f.name for f in state_features]
     single_arm = len(state_features) == 1 and tuple(getattr(state_features[0], "shape", ()) or ()) == (7,)
     if policy_adapter == "pi05_yam_red_cap":
-        cameras = {"top": "base_0_rgb", "left": "left_wrist_0_rgb", "right": "right_wrist_0_rgb"}
-        if set(images) != set(cameras.values()) or states != ["state"]:
-            raise OrchestralBridgeError("pi05_yam_red_cap requires OpenPI model slots and state; import with policy_config=none")
+        available_cameras = {
+            "top": "base_0_rgb",
+            "left": "left_wrist_0_rgb",
+            "right": "right_wrist_0_rgb",
+        }
+        cameras = {
+            role: name for role, name in available_cameras.items()
+            if name in images
+        }
+        if (
+            not cameras
+            or set(images) != set(cameras.values())
+            or states != ["state"]
+        ):
+            raise OrchestralBridgeError(
+                "pi05_yam_red_cap requires one or more recognized OpenPI camera slots "
+                "(base_0_rgb, left_wrist_0_rgb, right_wrist_0_rgb) plus state; "
+                f"got image inputs {images} and state inputs {states}. "
+                "Import with policy_config=none to preserve checkpoint input names."
+            )
         return cameras, "state"
     cameras: Dict[str, str] = {}
     for key in CAMERA_KEYS:
         matches = [name for name in images if _camera_role(name) == key]
-        if not matches and single_arm and key in ("left", "right"):
+        if not matches and (allow_camera_subset or single_arm and key in ("left", "right")):
             continue
         if len(matches) != 1:
             raise OrchestralBridgeError(
@@ -244,7 +278,7 @@ def _checkpoint_input_names(contract: Any, policy_adapter="identity") -> Tuple[D
             )
         cameras[key] = matches[0]
     unused = sorted(set(images) - set(cameras.values()))
-    if unused or len(states) != 1 or not ({"left", "right"} & cameras.keys()):
+    if not cameras or unused or len(states) != 1:
         raise OrchestralBridgeError(
             f"checkpoint input contract does not match cameras {list(CAMERA_KEYS)} plus "
             f"one state vector: unmatched image inputs {unused}, state inputs {states}"
@@ -252,9 +286,11 @@ def _checkpoint_input_names(contract: Any, policy_adapter="identity") -> Tuple[D
     return cameras, states[0]
 
 
-def _checkpoint_geometry(contract: Any, policy_adapter="identity") -> Dict[str, Any]:
+def _checkpoint_geometry(contract: Any, policy_adapter="identity", *, allow_camera_subset=False) -> Dict[str, Any]:
     """Read physical dimensions and camera geometry from the deployed contract."""
-    camera_names, state_name = _checkpoint_input_names(contract, policy_adapter)
+    camera_names, state_name = _checkpoint_input_names(
+        contract, policy_adapter, allow_camera_subset=allow_camera_subset,
+    )
     features = {feature.name: feature for feature in contract.inputs}
     result: Dict[str, Any] = {"camera_inputs": {}, "camera_mapping": camera_names}
     state_shape = getattr(features[state_name], "shape", None)
@@ -390,7 +426,8 @@ def _startup_step(description: str):
 class OrchestralSessionHost:
     """One Orchestral prediction session for the entire evaluation."""
 
-    def __init__(self, *, deployment_id: str, instruction=None, observation_encoding="h264", policy_adapter="identity"):
+    def __init__(self, *, deployment_id: str, instruction=None, observation_encoding="h264",
+                 policy_adapter="identity", allow_camera_subset=False):
         if not deployment_id:
             raise OrchestralBridgeError("a managed Orchestral deployment id is required")
         if observation_encoding not in OBSERVATION_ENCODINGS:
@@ -398,12 +435,68 @@ class OrchestralSessionHost:
         if policy_adapter not in {"identity", "pi05_yam_red_cap", TOOL_POSE_ADAPTER}:
             raise OrchestralBridgeError(f"unsupported policy_adapter: {policy_adapter!r}")
         self.policy_adapter = policy_adapter
+        self.allow_camera_subset = allow_camera_subset
         self.deployment_id = deployment_id
         self.instruction = instruction
         self.observation_encoding = observation_encoding
         self._client = self._session = None
         self._episode_start = True
         self.identity = {}
+        self._route_samples = deque(maxlen=256)
+        self._route_stop = threading.Event()
+        self._route_thread = None
+
+    def _start_route_sampling(self, session):
+        status = getattr(getattr(session, "_tailnet_node", None), "status", None)
+        if not callable(status):
+            return
+        try:
+            from orchestral.core.tailnet import summarize_tailscale_peer_state
+        except ImportError:
+            return
+
+        def sample():
+            while not self._route_stop.is_set():
+                started = time.time_ns()
+                try:
+                    peer = summarize_tailscale_peer_state(status(), session.grant.endpoint_host)
+                except Exception:
+                    peer = {"found": False}
+                self._route_samples.append({**peer, "sample_started_unix_ns": started,
+                                            "recorded_unix_ns": time.time_ns()})
+                self._route_stop.wait(0.25)
+
+        self._route_samples.clear()
+        self._route_stop.clear()
+        self._route_thread = threading.Thread(target=sample, name="yam-tailnet-path", daemon=True)
+        self._route_thread.start()
+
+    def _prediction_transport(self, started_ns, completed_ns, elapsed_us):
+        session = self._session
+        transport = getattr(session, "_transport", None)
+        diagnostics = {
+            "started_unix_ns": started_ns,
+            "completed_unix_ns": completed_ns,
+            "sdk_predict_us": elapsed_us,
+            "client_ipc_us": dict(getattr(transport, "last_request_stage_timings_us", {})),
+            "client_quic": dict(getattr(session, "last_transport_stats", {})),
+        }
+        samples = self._route_samples.copy()
+        before = [sample for sample in samples if sample["recorded_unix_ns"] < started_ns]
+        during = [sample for sample in samples if started_ns <= sample["recorded_unix_ns"] <= completed_ns]
+        diagnostics["tailscale_samples"] = before[-1:] + during
+        if elapsed_us >= 300_000:
+            reader = getattr(transport, "read_last_native_quic_transaction", None)
+            native = reader() if callable(reader) else {}
+            timestamp = native.get("recorded_unix_ns")
+            if isinstance(timestamp, int) and started_ns <= timestamp <= time.time_ns():
+                diagnostics["client_transaction"] = {
+                    key: native[key] for key in (
+                        "recorded_unix_ns", "stream_id", "request_bytes", "response_bytes",
+                        "timings_us", "stats_delta",
+                    ) if key in native
+                }
+        return diagnostics
 
     def _configure(self, spec):
         from types import SimpleNamespace
@@ -422,8 +515,10 @@ class OrchestralSessionHost:
         )
         if getattr(spec, "modalities", {}):
             raise OrchestralBridgeError("YAM cannot supply additional deployment modalities")
-        geometry = _checkpoint_geometry(contract, self.policy_adapter)
-        self._camera_names, _ = _checkpoint_input_names(contract, self.policy_adapter)
+        geometry = _checkpoint_geometry(
+            contract, self.policy_adapter, allow_camera_subset=self.allow_camera_subset,
+        )
+        self._camera_names = geometry["camera_mapping"]
         if self.policy_adapter == "pi05_yam_red_cap" and (
             geometry["state_dim"] != 7 or geometry["action_dim"] != 7
             or geometry["action_horizon"] != 15
@@ -434,18 +529,45 @@ class OrchestralSessionHost:
     def open(self):
         if self._session is not None:
             return dict(self.identity)
-        from orchestral import Orchestral
-        client = Orchestral()
+        with _startup_step("loading the SDK and credentials"):
+            from orchestral import Deployment, Orchestral
+
+            client = Orchestral()
+            if os.environ.get("ORCHESTRAL_BRIDGE_IPV4") == "1":
+                import httpx
+                from orchestral.core.lean_httpx import tls_verify_for
+
+                # Scope this to the SDK's control-plane HTTP client. Tailscale
+                # and QUIC use their own transports.
+                original = client._http
+                client._http = httpx.Client(
+                    base_url=original.base_url,
+                    headers=original.headers,
+                    timeout=original.timeout,
+                    transport=httpx.HTTPTransport(
+                        local_address="0.0.0.0", verify=tls_verify_for(client.base_url),
+                    ),
+                )
+                original.close()
         try:
-            deployment = client.deployments.get(self.deployment_id)
-            self._configure(deployment.io_spec)
-            session = deployment.session(instruction=self.instruction or "", encoder="mjpeg" if self.observation_encoding == "jpeg" else "h264")
+            # A managed Session needs the signed Grant, which already carries
+            # the model contract. Construct a reference so the SDK can request
+            # that Grant directly and refresh it when the Session reconnects.
+            deployment = Deployment({"name": f"deployments/{self.deployment_id}"}, client)
+            with _startup_step(f"requesting the Grant and validating the model contract for {self.deployment_id}"):
+                self._configure(deployment.io_spec)
+            with _startup_step(f"opening the {self.observation_encoding} Session"), _quic_snapshots():
+                session = deployment.session(
+                    instruction=self.instruction or "",
+                    encoder="mjpeg" if self.observation_encoding == "jpeg" else "h264",
+                )
         except BaseException:
             client._http.close()
             raise
         self._client, self._session = client, session
+        self._start_route_sampling(session)
         self.identity.update(deployment_id=self.deployment_id, session_id=session.session_id,
-                             model_ref=deployment.model_id, base_url=client.base_url,
+                             model_ref=session.grant.model_id, base_url=client.base_url,
                              observation_encoding=self.observation_encoding)
         return dict(self.identity)
 
@@ -494,13 +616,13 @@ class OrchestralSessionHost:
     def predict_inputs(self, images, state):
         """Map rig cameras and state into a prediction and keep its reference pose."""
         import numpy as np
-        missing = missing_cameras(images, tuple(self._camera_names))
+        missing = missing_cameras(images, self._camera_names)
         if missing:
             raise OrchestralBridgeError(f"Orchestral observation is missing camera bytes: {missing}")
         if len(state) != self.identity["state_dim"]:
             raise OrchestralBridgeError(f"Orchestral endpoint state must be {self.identity['state_dim']} floats, got {len(state)}")
-        inputs = {self._camera_names[key]: _checkpoint_pixels(images[key], self.identity["camera_inputs"][key])
-                  for key in self._camera_names}
+        inputs = {name: _checkpoint_pixels(images[key], self.identity["camera_inputs"][key])
+                  for key, name in self._camera_names.items()}
         query_state = np.asarray(state, dtype=np.float32).copy()
         if query_state.shape != (self.identity["state_dim"],) or not np.isfinite(query_state).all():
             raise OrchestralBridgeError("state must be a finite vector matching the endpoint")
@@ -541,11 +663,17 @@ class OrchestralSessionHost:
                 # this request's observation as the origin for joint deltas.
                 prefix[:, :6] -= query_state[:6]
                 prefix[:, 6] = 1.0 - prefix[:, 6]
-        result = self._session.predict(
-            inputs=inputs, instruction=instruction or self.instruction,
-            episode_start=self._episode_start, noise_seed=noise_seed,
-            **({"committed_actions": prefix} if prefix is not None else {}),
-        )
+        started_ns = time.time_ns()
+        started_at = time.monotonic_ns()
+        with _quic_snapshots():
+            result = self._session.predict(
+                inputs=inputs, instruction=instruction or self.instruction,
+                episode_start=self._episode_start, noise_seed=noise_seed,
+                **({"committed_actions": prefix} if prefix is not None else {}),
+            )
+        completed_ns = time.time_ns()
+        elapsed_us = (time.monotonic_ns() - started_at) // 1000
+        transport = self._prediction_transport(started_ns, completed_ns, elapsed_us)
         self._episode_start = False
         actions = np.asarray(result.actions, dtype=np.float32).copy()
         if actions.shape != (self.identity["action_horizon"], self.identity["action_dim"]) or not np.isfinite(actions).all():
@@ -555,7 +683,9 @@ class OrchestralSessionHost:
         return {"actions": actions.tolist(), "horizon": len(actions),
                 "action_space": TOOL_POSE_ADAPTER if self.policy_adapter == TOOL_POSE_ADAPTER else ACTION_SPACE,
                 "telemetry": {**timings, "server_infer_ms": result.timings.accel_exec_us / 1000,
-                              "trace_id": result.trace_id,
+                              "trace_id": result.trace_id or getattr(self._session, "last_predict_trace_id", ""),
+                              "request_bytes": transport.get("client_transaction", {}).get("request_bytes"),
+                              "transport_diagnostics": transport,
                               "noise_scheme": NOISE_SCHEME if noise_seed is not None else None,
                               "noise_seed_acknowledged": noise_seed is not None},
                 "binding": None, "safety_signal": None}
@@ -567,6 +697,10 @@ class OrchestralSessionHost:
         return True
 
     def close(self, success=True):
+        self._route_stop.set()
+        route_thread, self._route_thread = self._route_thread, None
+        if route_thread is not None:
+            route_thread.join(timeout=0.3)
         session, self._session = self._session, None
         client, self._client = self._client, None
         try:
@@ -597,8 +731,10 @@ class OrchestralDirectHost(OrchestralSessionHost):
             raise OrchestralBridgeError(f"Orchestral grant {path} is group/world readable; chmod 600 it")
         grant = ConnectGrant.from_token(path.read_text().strip())
         self._configure(grant.io_spec)
-        session = Session(grant, instruction=self.instruction or "", encoder="mjpeg" if self.observation_encoding == "jpeg" else "h264")
+        with _quic_snapshots():
+            session = Session(grant, instruction=self.instruction or "", encoder="mjpeg" if self.observation_encoding == "jpeg" else "h264")
         self._session = session
+        self._start_route_sampling(session)
         self.identity.update(deployment_id=grant.deployment_id, session_id=session.session_id,
                              observation_encoding=self.observation_encoding)
         return dict(self.identity)
@@ -707,9 +843,38 @@ def _handle(host_ref: Dict[str, Any], header: Dict[str, Any], buffers: List[byte
     raise OrchestralBridgeError(f"unknown Orchestral bridge op {op!r}")
 
 
+def _preflight(argv: Sequence[str]) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Open an Orchestral Session without opening cameras or CAN.")
+    parser.add_argument("--check-deployment", required=True, metavar="ID")
+    parser.add_argument("--policy-adapter", choices=("identity", "pi05_yam_red_cap"), default="identity")
+    parser.add_argument("--observation-encoding", choices=OBSERVATION_ENCODINGS, default="h264")
+    args = parser.parse_args(argv)
+    host = OrchestralSessionHost(
+        deployment_id=args.check_deployment,
+        policy_adapter=args.policy_adapter,
+        observation_encoding=args.observation_encoding,
+    )
+    try:
+        identity = host.open()
+        host.close(success=False)
+    except Exception as exc:
+        print(f"Preflight failed: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"Session ready for {args.check_deployment}: "
+        f"{identity['state_dim']} state values, "
+        f"{identity['action_horizon']}x{identity['action_dim']} actions"
+    )
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Serve bridge requests on stdin/stdout until the parent closes the pipe."""
-    del argv
+    """Serve bridge requests on stdin/stdout or run a standalone preflight."""
+    args = sys.argv[1:] if argv is None else argv
+    if args:
+        return _preflight(args)
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
     host_ref: Dict[str, Any] = {"host": None}

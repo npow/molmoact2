@@ -34,6 +34,7 @@ import argparse
 import logging
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -55,6 +56,66 @@ logger = logging.getLogger("rtc_rollout")
 ARM_DIM = 7
 
 
+class RolloutTelemetry:
+    """Collect timing on the predictor thread and report after the motors close."""
+
+    def __init__(self, control_hz: float):
+        self.period_ms = 1000 / control_hz
+        self.predictions = []
+        self.hold_ticks = 0
+
+    def report(self):
+        completed = 0
+        failed = 0
+        late_count = 0
+        prefixes = Counter()
+        metrics = {}
+        for chunk, late in list(self.predictions):
+            late_count += late
+            if chunk.error is not None:
+                failed += 1
+                continue
+            completed += 1
+            prefix_rows = len(chunk.request.get("committed_actions", ()))
+            prefixes[prefix_rows] += 1
+            prediction_ms = 1000 * (chunk.t_completed - chunk.t_sent)
+            times = {"prediction_ms": prediction_ms}
+            if "observation_prep_ms" in chunk.meta:
+                times["observation_prep_ms"] = chunk.meta["observation_prep_ms"]
+                times["client_queue_ms"] = 1000 * (chunk.t_sent - chunk.meta["queued_at"])
+            if (timing := chunk.timings) is not None:
+                times.update(
+                    client_encode_ms=timing.encode_us / 1000,
+                    transport_estimate_ms=timing.net_wire_us / 1000,
+                    worker_decode_ms=timing.decode_us / 1000,
+                    worker_queue_ms=timing.queue_us / 1000,
+                    inference_ms=timing.accel_exec_us / 1000,
+                )
+                accounted_us = (timing.encode_us + timing.net_wire_us + timing.decode_us
+                                + timing.queue_us + timing.accel_exec_us)
+                times["unattributed_ms"] = max(0.0, prediction_ms - accounted_us / 1000)
+            for name, value in times.items():
+                metrics.setdefault(name, []).append(value)
+            if late or prediction_ms >= 2 * self.period_ms or any(
+                times.get(name, 0) >= self.period_ms
+                for name in ("observation_prep_ms", "client_queue_ms")
+            ):
+                logger.info(
+                    "RTC timing observation=%d prefix_rows=%d late=%s %s",
+                    chunk.seq, prefix_rows, late,
+                    " ".join(f"{name}={value:.1f}" for name, value in times.items()),
+                )
+
+        logger.info(
+            "RTC timing summary predictions=%d failed=%d prefix_rows_histogram=%s "
+            "late_handoffs=%d hold_ticks=%d tick_ms=%.1f",
+            completed, failed, dict(sorted(prefixes.items())), late_count, self.hold_ticks, self.period_ms,
+        )
+        for name, values in metrics.items():
+            median, p95 = np.percentile(values, (50, 95))
+            logger.info("RTC timing %s p50=%.1f p95=%.1f max=%.1f", name, median, p95, max(values))
+
+
 class VerifiedCommittedSession:
     """Expose capability to RTC after a successful probe on a legacy Worker."""
 
@@ -67,7 +128,8 @@ class VerifiedCommittedSession:
         return getattr(self._session, name)
 
 
-def make_chunking(session: Any, control_hz: float, *, s_min: int, d_init: int, rebase_joints: int):
+def make_chunking(session: Any, control_hz: float, *, s_min: int, d_init: int, rebase_joints: int,
+                  telemetry: RolloutTelemetry | None = None):
     """``RealTimeChunking`` for this rig.
 
     The red-cap endpoint predicts joint *deltas* from the state it was queried with. Committed
@@ -77,6 +139,11 @@ def make_chunking(session: Any, control_hz: float, *, s_min: int, d_init: int, r
     from orchestral import RealTimeChunking
 
     class YamRealTimeChunking(RealTimeChunking):
+        def _frozen_rows(self, s):
+            # A prediction can arrive before the next tick. Once only zero-tick
+            # samples remain, the SDK would otherwise submit an empty prefix.
+            return max(1, super()._frozen_rows(s))
+
         def _prepare(self, observation):
             extra = super()._prepare(observation)
             if extra and rebase_joints:
@@ -87,11 +154,18 @@ def make_chunking(session: Any, control_hz: float, *, s_min: int, d_init: int, r
                 extra = {**extra, "committed_actions": committed}
             return extra
 
+        def _deliver(self, chunk):
+            late_before = self.late
+            delivered = super()._deliver(chunk)
+            if telemetry is not None:
+                telemetry.predictions.append((chunk, self.late > late_before))
+            return delivered
+
     return YamRealTimeChunking(session, control_hz, s_min=s_min, d_init=d_init)
 
 
 def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_init: int,
-        seconds: float) -> dict:
+        seconds: float, telemetry: RolloutTelemetry) -> dict:
     """The control loop: one row per tick, one prediction in flight, until ``seconds`` or Ctrl-C."""
     endpoint_dim = host.identity["state_dim"]
     if endpoint_dim == ARM_DIM:
@@ -101,8 +175,8 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
     red_cap = host.policy_adapter == "pi05_yam_red_cap"
     session = host.session
     chunking = make_chunking(VerifiedCommittedSession(session), control_hz, s_min=s_min, d_init=d_init,
-                             rebase_joints=6 if red_cap else 0)
-    sent = holds = 0
+                             rebase_joints=6 if red_cap else 0, telemetry=telemetry)
+    sent = 0
     deadline = session.clock.now() + seconds
     while session.clock.now() < deadline:
         with chunking.actions.lock:
@@ -111,21 +185,27 @@ def run(env, host, mask, *, control_hz: float, instruction: str, s_min: int, d_i
                 query_state = chunking.rows.chunk.meta["query_state"]
         measured = mask.validate_state(env.get_robot_state()["joint_positions"], name="measured_state")
         if row is None:
-            holds += 1  # nothing due yet (first chunk) or a late chunk: the motors keep the last target
+            telemetry.hold_ticks += 1  # first chunk or late prediction: keep the last target
         else:
             target = measured.copy()
             target[endpoint] = host.robot_actions(row, query_state)
             env.step_command_only(mask.command_target(target, measured), wait=False)
             sent += 1
         if chunking.should_replan():
+            capture_started = session.clock.now()
             obs = env.get_obs()
             state = mask.validate_state(obs["joint_positions"], name="policy input state")[endpoint]
             images = {"top": obs["front_camera_rgb"], "left": obs["left_camera_rgb"],
                       "right": obs["right_camera_rgb"]}
             inputs, query_state = host.predict_inputs(images, state)
-            chunking.observe(inputs=inputs, instruction=instruction, meta={"query_state": query_state})
+            queued_at = session.clock.now()
+            chunking.observe(inputs=inputs, instruction=instruction, meta={
+                "query_state": query_state,
+                "observation_prep_ms": 1000 * (queued_at - capture_started),
+                "queued_at": queued_at,
+            })
         time.sleep(max(0.0, chunking.t_next - session.clock.now()))
-    return {"rows_sent": sent, "hold_ticks": holds, "late_chunks": chunking.late,
+    return {"rows_sent": sent, "hold_ticks": telemetry.hold_ticks, "late_chunks": chunking.late,
             "delays_ticks": list(chunking.delays), "rows_run_before_takeover": list(chunking.k)}
 
 
@@ -180,6 +260,7 @@ def main(argv: Optional[list] = None) -> int:
         host = OrchestralSessionHost(deployment_id=args.orchestral_deployment, instruction=instruction,
                                      policy_adapter=adapter)
     identity = host.open()
+    telemetry = None
     try:
         if not host.supports_committed_actions():
             raise SystemExit("this deployment does not support committed actions; real-time chunking needs them")
@@ -200,10 +281,11 @@ def main(argv: Optional[list] = None) -> int:
             rest = np.asarray(env.get_robot_state()["joint_positions"], dtype=np.float32).copy()
             input(f"Instruction: {instruction!r}. Clear the workspace, then press Enter to start "
                   "(Ctrl-C ends the rollout)... ")
+            telemetry = RolloutTelemetry(control_hz)
             completed = True
             try:
                 summary = run(env, host, mask, control_hz=control_hz, instruction=instruction,
-                              s_min=args.s_min, d_init=args.d_init, seconds=args.seconds)
+                              s_min=args.s_min, d_init=args.d_init, seconds=args.seconds, telemetry=telemetry)
                 logger.info("Rollout summary: %s", summary)
             except KeyboardInterrupt:
                 logger.info("Interrupted")
@@ -217,7 +299,11 @@ def main(argv: Optional[list] = None) -> int:
         finally:
             env.close()
     finally:
-        host.close()
+        try:
+            host.close()
+        finally:
+            if telemetry is not None:
+                telemetry.report()
     return 0
 
 

@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from itertools import count
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Tuple
+from typing import Annotated, Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -778,6 +778,7 @@ def _build_env(
     args: Args,
     *,
     camera_sources: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    camera_frame_callback: Optional[Callable[[str, np.ndarray, float], None]] = None,
 ) -> Tuple[RobotEnv, Dict[str, Any], Optional[Dict[str, Any]], bool]:
     """Build cameras + robot(s) + RobotEnv from the launch configs.
 
@@ -872,6 +873,11 @@ def _build_env(
                     width=width,
                     height=height,
                     fps=fps,
+                    frame_callback=(
+                        (lambda frame, timestamp, camera=sensor_ids[name]:
+                         camera_frame_callback(camera, frame, timestamp))
+                        if camera_frame_callback is not None else None
+                    ),
                 )
                 capture_shapes[name] = (height, width, channels)
                 capture_descriptions.append(
@@ -894,7 +900,8 @@ def _build_env(
         if bool(preflight_cfg.get("enabled", True)):
             try:
                 wait_for_camera_visual_preflight(
-                    camera_dict,
+                    {name: camera for name, camera in camera_dict.items()
+                     if not isinstance(camera, _DisabledCamera)},
                     timeout_sec=float(preflight_cfg.get("timeout_sec", 10.0)),
                     required_consecutive_frames=int(
                         preflight_cfg.get("required_consecutive_frames", 2)
