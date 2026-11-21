@@ -36,6 +36,16 @@ def run_tailscale(self, *args, timeout=10.0):
 ManagedTailnetNode.__init__ = initialize_node
 TailscaleCli.run = run_tailscale
 
+def policy_family(model_id):
+    """Select a YAM action adapter using the registered model ID."""
+    name = model_id.lower()
+    for prefix, family in (("pi05", "pi05"), ("gr00t", "gr00t"),
+                           ("molmoact2", "molmoact2"), ("dm05", "dexmal")):
+        if name == prefix or name.startswith(prefix + "-"):
+            return family
+    return None
+
+
 def probe(host, family, instruction):
     import numpy as np
 
@@ -70,8 +80,10 @@ def rollout_joint_policy(host, identity, args):
     rollout = runpy.run_path(str(Path(__file__).with_name("groot_rollout.py")))
     family = args.policy_family
     checked_shape = (identity["action_horizon"], identity["action_dim"])
-    if identity["state_dim"] != 7 or checked_shape != rollout["ACTION_SHAPE"]:
+    if identity["state_dim"] != 7 or checked_shape[1] != 7 or checked_shape[0] <= 0:
         raise SystemExit(f"Unexpected {family} contract for YAM: {checked_shape}")
+    if args.prefetch_lead_steps >= checked_shape[0]:
+        raise SystemExit(f"--prefetch-lead-steps must be below the endpoint horizon ({checked_shape[0]})")
     left = OmegaConf.to_container(OmegaConf.load(LEFT_CONFIG), resolve=True)
     right = OmegaConf.to_container(OmegaConf.load(RIGHT_CONFIG), resolve=True)
     validate_bimanual_model_arm_order(left, right)
@@ -134,6 +146,7 @@ def rollout_joint_policy(host, identity, args):
                         env, host.session, mask, seconds=args.seconds, instruction=args.instruction,
                         shadow=args.shadow, lead_steps=args.prefetch_lead_steps,
                         camera_bindings=bindings, history_offsets=(), control_hz=args.control_hz,
+                        action_shape=checked_shape,
                     )
                 finally:
                     env.close()
@@ -401,21 +414,15 @@ def main():
     client = Orchestral()
     try:
         deployment = client.deployments.get(target.deployment)
-        checkpoint = deployment.checkpoint_uri or ""
-        registered_name = deployment.model_id.lower()
+        model_id = deployment.model_id
     finally:
         client._http.close()
-    model_name = checkpoint.split("@", 1)[0].rsplit("/", 1)[-1].lower()
-    if model_name.startswith("pi05"):
-        family = "pi05"
-    elif model_name.startswith("gr00t"):
-        family = "gr00t"
-    elif registered_name.startswith("molmoact2-") or model_name.startswith("molmoact2-"):
-        family = "molmoact2"
-    elif target.soak_hours > 0:
-        family = "generic"
-    else:
-        parser.error(f"{target.deployment} has an unsupported checkpoint: {checkpoint!r}")
+    family = policy_family(model_id)
+    if family is None:
+        if target.soak_hours > 0 or target.probe:
+            family = "generic"
+        else:
+            parser.error(f"{target.deployment} has no YAM joint-rollout adapter for model {model_id!r}")
 
     if family == "pi05" and not target.probe and target.soak_hours <= 0:
         sys.argv = [
@@ -459,7 +466,7 @@ def main():
     )
     host = OrchestralSessionHost(
         deployment_id=target.deployment, instruction=args.instruction, policy_adapter=adapter,
-        allow_camera_subset=family in {"gr00t", "molmoact2", "generic"} or target.soak_hours > 0,
+        allow_camera_subset=family != "pi05" or target.soak_hours > 0,
     )
     try:
         identity = host.open()

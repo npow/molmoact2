@@ -34,14 +34,14 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
     return frames
 
 
-def checked_chunk(session, cameras, state, instruction, *, episode_start):
+def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE):
     start = time.monotonic()
     response = session.predict(cameras=cameras, state=state, instruction=instruction, episode_start=episode_start)
     chunk = np.asarray(response.actions, dtype=np.float32)
-    if chunk.shape != ACTION_SHAPE or not np.isfinite(chunk).all():
-        raise ValueError("GR00T returned an invalid action chunk")
+    if chunk.shape != action_shape or not np.isfinite(chunk).all():
+        raise ValueError("The policy returned an invalid action chunk")
     if np.any((chunk[:, 6] < -0.05) | (chunk[:, 6] > 1.05)):
-        raise ValueError("GR00T returned a gripper target outside the normalized aperture range")
+        raise ValueError("The policy returned a gripper target outside the normalized aperture range")
     chunk = chunk.copy()
     chunk[:, 6] = np.clip(chunk[:, 6], 0, 1)
     return chunk, time.monotonic() - start
@@ -57,7 +57,8 @@ def warm_session(session, instruction):
 
 
 def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
-        camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ):
+        camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
+        action_shape=ACTION_SHAPE):
     period = 1 / control_hz
     history_size = 1 - min(history_offsets, default=0)
     history = deque(maxlen=history_size)
@@ -96,7 +97,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 submitted_with = len(pending)
                 request_hold_ticks = 0
                 future = predictor.submit(checked_chunk, session, cameras, measured[:7].copy(),
-                                          instruction, episode_start=(predictions == 0))
+                                          instruction, episode_start=(predictions == 0),
+                                          action_shape=action_shape)
                 predictions += 1
 
             next_tick += period
@@ -115,7 +117,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             time.sleep(max(0, next_tick - time.monotonic()))
     finally:
         predictor.shutdown(wait=False, cancel_futures=True)
-    print(f"GR00T rollout finished. {predictions} predictions, {rows} {'shadow rows' if shadow else 'commands'}, "
+    print(f"Joint-policy rollout finished. {predictions} predictions, {rows} {'shadow rows' if shadow else 'commands'}, "
           f"{handoffs} prefetched handoffs, {misses} missed boundaries, {holds} hold ticks.")
 
 
