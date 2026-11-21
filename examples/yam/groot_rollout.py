@@ -35,12 +35,21 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
 
 
 def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
-                  model_label="GR00T", gripper_tolerance=0.05):
+                  model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False):
     start = time.monotonic()
-    response = session.predict(cameras=cameras, state=state, instruction=instruction, episode_start=episode_start)
+    query_state = pose_actions.state(state, matrix_policy=matrix_policy) if pose_actions else state
+    response = session.predict(cameras=cameras, state=query_state, instruction=instruction, episode_start=episode_start)
     chunk = np.asarray(response.actions, dtype=np.float32)
     if chunk.shape != action_shape or not np.isfinite(chunk).all():
         raise ValueError(f"{model_label} returned an invalid action chunk")
+    if pose_actions:
+        from tool_pose_actions import UnreachableToolPose
+
+        try:
+            chunk = pose_actions.actions(chunk, state, matrix_policy=matrix_policy)
+        except UnreachableToolPose as error:
+            print(f"[{model_label.lower()}] {error}. Holding and replanning.", flush=True)
+            return np.empty((0, 7), dtype=np.float32), time.monotonic() - start
     gripper = chunk[:, 6]
     lower, upper = -gripper_tolerance, 1.0 + gripper_tolerance
     if np.any((gripper < lower) | (gripper > upper)):
@@ -64,7 +73,7 @@ def warm_session(session, instruction):
 
 def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
-        action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05):
+        action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False):
     period = 1 / control_hz
     history_size = 1 - min(history_offsets, default=0)
     history = deque(maxlen=history_size)
@@ -106,7 +115,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 future = predictor.submit(checked_chunk, session, cameras, measured[:7].copy(),
                                           instruction, episode_start=(predictions == 0),
                                           action_shape=action_shape, model_label=model_label,
-                                          gripper_tolerance=gripper_tolerance)
+                                          gripper_tolerance=gripper_tolerance, pose_actions=pose_actions,
+                                          matrix_policy=matrix_policy)
                 predictions += 1
 
             next_tick += period

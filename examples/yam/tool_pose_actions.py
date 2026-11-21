@@ -1,4 +1,4 @@
-"""Robot-side conversion for policies using xyz, row-wise rotation-6D, and gripper."""
+"""Robot-side conversion between tool poses and joint targets."""
 from pathlib import Path
 
 import numpy as np
@@ -51,9 +51,13 @@ class ToolPoseActions:
             raise ValueError("Robot state must have six finite joint angles and a normalized gripper")
         return state
 
-    def state(self, joint_state):
+    def state(self, joint_state, *, matrix_policy=False):
         state = self._checked_state(joint_state)
         position, rotation = self._pose(self._mj.MjData(self.model), state[:6])
+        if matrix_policy:
+            quaternion = np.empty(4)
+            self._mj.mju_mat2Quat(quaternion, rotation.ravel())
+            return np.r_[position, quaternion, 1.0 - state[6]].astype(np.float32)
         return np.concatenate((position, self._rotvec(rotation), state[6:])).astype(np.float32)
 
     def _solve(self, data, target_position, target_rotation, previous):
@@ -82,17 +86,23 @@ class ToolPoseActions:
             return result.x
         raise UnreachableToolPose("Tool target is unreachable within the configured joint limits and step bound")
 
-    def actions(self, rows, joint_state):
+    def actions(self, rows, joint_state, *, matrix_policy=False):
         rows = np.asarray(rows, dtype=np.float64)
-        if rows.ndim != 2 or not len(rows) or rows.shape[1] != 10 or not np.isfinite(rows).all():
-            raise ValueError("Tool actions must be finite xyz, rotation-6D, gripper rows")
+        width = 13 if matrix_policy else 10
+        if rows.ndim != 2 or not len(rows) or rows.shape[1] != width or not np.isfinite(rows).all():
+            raise ValueError(f"Tool actions must be finite rows of width {width}")
         joints = self._checked_state(joint_state)[:6]
         data = self._mj.MjData(self.model)
         output = np.empty((len(rows), 7), dtype=np.float32)
         for i, row in enumerate(rows):
+            gripper = 1.0 - row[-1] if matrix_policy else row[-1]
+            if matrix_policy:
+                matrix = row[3:12].reshape(3, 3)
+                if np.linalg.det(matrix) <= 0 or not np.allclose(matrix @ matrix.T, np.eye(3), atol=0.05):
+                    raise ValueError(f"Invalid rotation matrix in tool action row {i}")
             first, second = row[3:6].copy(), row[6:9].copy()
             norm = np.linalg.norm(first)
-            if norm < 1e-6 or not 0 <= row[9] <= 1:
+            if norm < 1e-6 or not 0 <= gripper <= 1:
                 raise ValueError(f"Invalid rotation or gripper in tool action row {i}")
             first /= norm
             second -= first * np.dot(first, second)
@@ -106,5 +116,5 @@ class ToolPoseActions:
                 if i:
                     return output[:i].copy()
                 raise UnreachableToolPose(f"Tool action row {i}: {error}") from error
-            output[i, :6], output[i, 6] = joints, row[9]
+            output[i, :6], output[i, 6] = joints, gripper
         return output

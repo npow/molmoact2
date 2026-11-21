@@ -42,10 +42,23 @@ def policy_family(model_id):
     """Select a YAM action adapter using the registered model ID."""
     name = model_id.lower()
     for prefix, family in (("pi05", "pi05"), ("gr00t", "gr00t"),
-                           ("molmoact2", "molmoact2"), ("dm05", "dexmal")):
+                           ("molmoact2", "molmoact2"), ("dm05", "dexmal"),
+                           ("praxis1", "praxis1"), ("verne", "verne")):
         if name == prefix or name.startswith(prefix + "-"):
             return family
     return None
+
+
+def placeholder_state(family, dimension):
+    if family == "praxis1":
+        return np.array([0.3, 0, 0.3, 1, 0, 0, 0, 0.5], dtype=np.float32)
+    if family == "verne":
+        return np.array([0.3, 0, 0.3, 0, 0, 0, 0.5], dtype=np.float32)
+    state = np.zeros(dimension, dtype=np.float32)
+    state[0], state[6] = np.pi, 0.5
+    if dimension == 14:
+        state[13] = 0.5
+    return state
 
 
 def probe(host, family, instruction):
@@ -58,7 +71,7 @@ def probe(host, family, instruction):
         return
 
     image = np.zeros((256, 256, 3), dtype=np.uint8)
-    state = np.array([np.pi, 0, 0, 0, 0, 0, 0.5], dtype=np.float32)
+    state = placeholder_state(family, host.identity["state_dim"])
     camera_mapping = host.identity["camera_mapping"]
     prediction = host.act(dict.fromkeys(camera_mapping, image), state, instruction)
     actions = np.asarray(prediction["actions"])
@@ -82,10 +95,20 @@ def rollout_joint_policy(host, identity, args):
     rollout = runpy.run_path(str(Path(__file__).with_name("groot_rollout.py")))
     family = args.policy_family
     checked_shape = (identity["action_horizon"], identity["action_dim"])
-    if identity["state_dim"] != 7 or checked_shape[1] != 7 or checked_shape[0] <= 0:
+    state_width, action_width = {"praxis1": (8, 13), "verne": (7, 10)}.get(family, (7, 7))
+    if identity["state_dim"] != state_width or checked_shape[1] != action_width or checked_shape[0] <= 0:
         raise SystemExit(f"Unexpected {family} contract for YAM: {checked_shape}")
     if args.prefetch_lead_steps >= checked_shape[0]:
         raise SystemExit(f"--prefetch-lead-steps must be below the endpoint horizon ({checked_shape[0]})")
+    pose_actions = None
+    if family in {"praxis1", "verne"}:
+        from tool_pose_actions import ToolPoseActions
+
+        pose_actions = ToolPoseActions(
+            model_path=Path(__file__).with_name("configs") / "yam_holesaw_kinematics.urdf",
+            base_body="base", tool_body="gripper",
+            joint_names=[f"joint{i}" for i in range(1, 7)], max_joint_step_rad=0.12,
+        )
     left = OmegaConf.to_container(OmegaConf.load(LEFT_CONFIG), resolve=True)
     right = OmegaConf.to_container(OmegaConf.load(RIGHT_CONFIG), resolve=True)
     validate_bimanual_model_arm_order(left, right)
@@ -149,7 +172,7 @@ def rollout_joint_policy(host, identity, args):
                         shadow=args.shadow, lead_steps=args.prefetch_lead_steps,
                         camera_bindings=bindings, history_offsets=(), control_hz=args.control_hz,
                         action_shape=checked_shape,
-                        model_label="MolmoAct2" if family == "molmoact2" else "GR00T",
+                        model_label=family, pose_actions=pose_actions, matrix_policy=family == "praxis1",
                         gripper_tolerance=MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2" else 0.05,
                     )
                 finally:
@@ -202,12 +225,7 @@ def soak_endpoint(host, identity, args):
     }
     calls = errors = camera_errors = 0
     interrupted = False
-    state = np.zeros(identity["state_dim"], dtype=np.float32)
-    state[0] = np.pi
-    if state.size >= 7:
-        state[6] = 0.5
-    if state.size >= 14:
-        state[13] = 0.5
+    state = placeholder_state(args.policy_family, identity["state_dim"])
     recording_start = time.monotonic()
     soak_started_at = None
     recording = rr.RecordingStream(f"yam_{model_label}_live_camera_soak") if output_path is not None else None
@@ -404,7 +422,9 @@ def soak_endpoint(host, identity, args):
 
 def main():
     from omegaconf import OmegaConf
-    from orchestral_session_bridge import OrchestralSessionHost
+    from orchestral_session_bridge import (
+        TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER, OrchestralSessionHost,
+    )
 
     parser = argparse.ArgumentParser(description="Run or probe a staging holesaw policy.")
     parser.add_argument("--deployment", "--orchestral-deployment", default=DEFAULT_DEPLOYMENT,
@@ -444,7 +464,7 @@ def main():
 
     settings = argparse.ArgumentParser(prog=parser.prog)
     settings.add_argument("--seconds", type=float, default=300)
-    settings.add_argument("--control-hz", type=float, default=30)
+    settings.add_argument("--control-hz", type=float, default=15 if family == "praxis1" else 30)
     settings.add_argument("--instruction", default=OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
     settings.add_argument("--prefetch-lead-steps", type=int, default=8)
     settings.add_argument("--shadow", action="store_true")
@@ -462,12 +482,11 @@ def main():
         settings.error("--soak-hours must be finite and nonnegative")
     if not 0 <= args.prefetch_lead_steps < 16:
         settings.error("--prefetch-lead-steps must be between 0 and 15")
-    # Soaks only measure endpoint inference. Use the endpoint-declared image
-    # slots directly and discard actions, independent of model-family action
-    # adapters used by physical rollouts.
-    adapter = "identity" if target.soak_hours > 0 else (
-        "pi05_yam_red_cap" if family == "pi05" else "identity"
-    )
+    adapter = {
+        "praxis1": TOOL_POSE_MATRIX_ADAPTER,
+        "verne": TOOL_POSE_ADAPTER,
+        "pi05": "pi05_yam_red_cap" if target.soak_hours <= 0 else "identity",
+    }.get(family, "identity")
     host = OrchestralSessionHost(
         deployment_id=target.deployment, instruction=args.instruction, policy_adapter=adapter,
         allow_camera_subset=family != "pi05" or target.soak_hours > 0,

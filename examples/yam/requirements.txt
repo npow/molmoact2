@@ -31,6 +31,9 @@ omegaconf
 tyro
 pyzmq
 tqdm
+# Tool-pose rollouts use MuJoCo kinematics and bounded SciPy IK.
+mujoco
+scipy
 # Post-rollout playback writer. This is deliberately not imported by the arm
 # control loop; it is used only after a rollout's raw data has been saved.
 rerun-sdk==0.35.0

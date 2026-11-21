@@ -29,6 +29,7 @@ STATE_DIM = 14
 ACTION_HORIZON = 30
 ACTION_SPACE = "joint_position"
 TOOL_POSE_ADAPTER = "tool_pose_rot6d"
+TOOL_POSE_MATRIX_ADAPTER = "tool_pose_matrix"
 NOISE_SCHEME = "numpy-pcg64-15x32-fp32-v1"
 
 #: Environment variable naming a Python >= 3.12 interpreter that can import the
@@ -265,6 +266,8 @@ def _checkpoint_input_names(
                 "Import with policy_config=none to preserve checkpoint input names."
             )
         return cameras, "state"
+    if policy_adapter == TOOL_POSE_MATRIX_ADAPTER and set(images) == {"exterior", "wrist"} and len(states) == 1:
+        return {"top": "exterior", "left": "wrist"}, states[0]
     cameras: Dict[str, str] = {}
     for key in CAMERA_KEYS:
         matches = [name for name in images if _camera_role(name) == key]
@@ -297,11 +300,13 @@ def _checkpoint_geometry(contract: Any, policy_adapter="identity", *, allow_came
     outputs = _jsonable(getattr(contract, "outputs", None) or {})
     action_shape = (outputs.get("actions") or {}).get("shape")
     if state_shape is not None or action_shape is not None:
-        if (not state_shape or len(state_shape) != 1 or state_shape[0] not in (7, 14)
+        pairs = {
+            TOOL_POSE_ADAPTER: {(7, 10)},
+            TOOL_POSE_MATRIX_ADAPTER: {(8, 13)},
+        }.get(policy_adapter, {(7, 7), (14, 14)})
+        if (not state_shape or len(state_shape) != 1
                 or not action_shape or len(action_shape) != 2
-                or (state_shape[0], action_shape[1]) not in (
-                    {(7, 10)} if policy_adapter == TOOL_POSE_ADAPTER else {(7, 7), (14, 14)}
-                )
+                or (state_shape[0], action_shape[1]) not in pairs
                 or not isinstance(action_shape[0], int) or action_shape[0] <= 0):
             raise OrchestralBridgeError(
                 f"unsupported checkpoint state/action shapes: {state_shape}, {action_shape}"
@@ -432,7 +437,7 @@ class OrchestralSessionHost:
             raise OrchestralBridgeError("a managed Orchestral deployment id is required")
         if observation_encoding not in OBSERVATION_ENCODINGS:
             raise OrchestralBridgeError(f"unsupported observation encoding: {observation_encoding!r}")
-        if policy_adapter not in {"identity", "pi05_yam_red_cap", TOOL_POSE_ADAPTER}:
+        if policy_adapter not in {"identity", "pi05_yam_red_cap", TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER}:
             raise OrchestralBridgeError(f"unsupported policy_adapter: {policy_adapter!r}")
         self.policy_adapter = policy_adapter
         self.allow_camera_subset = allow_camera_subset
@@ -574,7 +579,7 @@ class OrchestralSessionHost:
     def supports_committed_actions(self):
         if self._session is None:
             raise OrchestralBridgeError("Orchestral session is not open")
-        if self.policy_adapter == TOOL_POSE_ADAPTER:
+        if self.policy_adapter in {TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER}:
             return False
         session = self._session
         query = getattr(type(session), "supports_committed_actions", None)
@@ -651,7 +656,7 @@ class OrchestralSessionHost:
         inputs, query_state = self.predict_inputs(images, state)
         prefix = None
         if committed_actions is not None:
-            if self.policy_adapter == TOOL_POSE_ADAPTER:
+            if self.policy_adapter in {TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER}:
                 raise OrchestralBridgeError("The tool pose adapter cannot transform committed commands")
             prefix = np.array(committed_actions, dtype=np.float32, copy=True)
             if (prefix.ndim != 2 or prefix.shape[1] != self.identity["action_dim"]
@@ -681,7 +686,7 @@ class OrchestralSessionHost:
         actions = self.robot_actions(actions, query_state)
         timings = asdict(result.timings)
         return {"actions": actions.tolist(), "horizon": len(actions),
-                "action_space": TOOL_POSE_ADAPTER if self.policy_adapter == TOOL_POSE_ADAPTER else ACTION_SPACE,
+                "action_space": self.policy_adapter if self.policy_adapter in {TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER} else ACTION_SPACE,
                 "telemetry": {**timings, "server_infer_ms": result.timings.accel_exec_us / 1000,
                               "trace_id": result.trace_id or getattr(self._session, "last_predict_trace_id", ""),
                               "request_bytes": transport.get("client_transaction", {}).get("request_bytes"),

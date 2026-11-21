@@ -43,6 +43,12 @@ class ToolPoseActionsTests(unittest.TestCase):
         skew = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
         rotation = np.eye(3) + np.sin(angle) * skew + (1 - np.cos(angle)) * (skew @ skew)
         pose_row = np.concatenate((state[:3], rotation[:2].ravel(), state[6:]))
+        matrix_state = adapter.state(goal, matrix_policy=True)
+        self.assertAlmostEqual(float(np.linalg.norm(matrix_state[3:7])), 1.0)
+        self.assertAlmostEqual(float(matrix_state[-1]), 1.0 - goal[-1])
+        matrix_row = np.r_[matrix_state[:3], rotation.ravel(), matrix_state[-1]]
+        matrix_command, = adapter.actions([matrix_row], start, matrix_policy=True)
+        np.testing.assert_allclose(matrix_command, goal, atol=0.01)
         command, = adapter.actions([pose_row], start)
         np.testing.assert_allclose(adapter.state(command)[:3], state[:3], atol=0.002)
         np.testing.assert_allclose(adapter.state(command)[3:6], state[3:6], atol=0.02)
