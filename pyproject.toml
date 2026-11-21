@@ -23,7 +23,7 @@ dependencies = [
     "prometheus-client>=0.21",
     "tyro>=1.0.13",
     "imageio>=2.37.3",
-    "orchestral-client>=0.1.9,<0.2",
+    "orchestral-labs",
 ]
 
 [project.optional-dependencies]
@@ -59,6 +59,7 @@ dev = ["pytest>=8"]
 torch = [{ index = "pytorch-cu121", marker = "platform_machine == 'x86_64'" }]
 torchvision = [{ index = "pytorch-cu121", marker = "platform_machine == 'x86_64'" }]
 i2rt = { git = "https://github.com/npow/i2rt.git", rev = "codex/yam-reliability-checkpoint" }
+orchestral-labs = { path = "../orchestral", editable = true }
 
 [[tool.uv.index]]
 name = "pytorch-cu121"

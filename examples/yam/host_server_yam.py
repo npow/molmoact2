@@ -258,6 +258,19 @@ def build_app(policy: Policy) -> FastAPI:
             return _error_response(400, f"failed to decode json_numpy body: {e}")
 
         try:
+            # The rollout client can send native-resolution q85 JPEGs to keep
+            # the LAN request compact. Decode them here into the same RGB arrays
+            # consumed by the policy.
+            jpeg_images = payload.get("images_jpeg")
+            if jpeg_images is not None:
+                import base64
+                import io
+
+                jpeg_keys = {"top_cam": "top", "left_cam": "left", "right_cam": "right"}
+                for field, view in jpeg_keys.items():
+                    encoded = jpeg_images[view]
+                    image = Image.open(io.BytesIO(base64.b64decode(encoded)))
+                    payload[field] = np.asarray(image.convert("RGB"), dtype=np.uint8)
             top_cam = payload["top_cam"]
             left_cam = payload["left_cam"]
             right_cam = payload["right_cam"]

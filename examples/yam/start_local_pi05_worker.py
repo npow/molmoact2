@@ -1,4 +1,4 @@
-"""Start a loopback Orchestral Worker for the left-arm red-lid checkpoint."""
+"""Start a loopback Orchestral Worker for a local OpenPI checkpoint."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=Path, help="Local OpenPI checkpoint directory")
     parser.add_argument("--grant", required=True, type=Path, help="New file to receive the local Grant")
+    parser.add_argument("--deployment-id", default="dep_thor_pi05_speedaug", help="Local Worker identity")
+    parser.add_argument("--model-action-dim", type=int, help="Full action width for sharded checkpoint metadata")
     args = parser.parse_args()
 
     checkpoint = args.checkpoint.resolve()
@@ -31,13 +33,16 @@ def main() -> None:
         signal.signal(signum, lambda *_: stop.set())
 
     os.environ["ORC_REAL_WEIGHTS"] = "1"
+    config = {"policy_config": "none", "inference_batch_size": 1}
+    if args.model_action_dim is not None:
+        config["model_action_dim"] = args.model_action_dim
     worker = start_worker(
-        deployment_id="dep_thor_pi05_speedaug",
+        deployment_id=args.deployment_id,
         model_name="openpi",
         checkpoint=str(checkpoint),
         profile_name="xla",
         accel_name="cuda",
-        config={"policy_config": "none", "inference_batch_size": 1},
+        config=config,
         provider="local",
         host="127.0.0.1",
     )
