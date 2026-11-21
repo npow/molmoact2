@@ -43,7 +43,8 @@ def policy_family(model_id):
     name = model_id.lower()
     for prefix, family in (("pi05", "pi05"), ("gr00t", "gr00t"),
                            ("molmoact2", "molmoact2"), ("dm05", "dexmal"),
-                           ("praxis1", "praxis1"), ("verne", "verne"), ("isaac05", "isaac05")):
+                           ("praxis1", "praxis1"), ("verne", "verne"), ("isaac05", "isaac05"),
+                           ("flux3-action", "flux3-action")):
         if name == prefix or name.startswith(prefix + "-"):
             return family
     return None
@@ -73,8 +74,18 @@ def probe(host, family, instruction):
     image = np.zeros((256, 256, 3), dtype=np.uint8)
     state = placeholder_state(family, host.identity["state_dim"])
     camera_mapping = host.identity["camera_mapping"]
-    prediction = host.act(dict.fromkeys(camera_mapping, image), state, instruction)
-    actions = np.asarray(prediction["actions"])
+    if "history_rows" in host.identity:
+        from temporal_joint_history import TemporalJointHistory
+
+        history = TemporalJointHistory(host.identity["history_rows"])
+        spec = host.session.grant.io_spec
+        history.observe({name: np.zeros((*shape, 3), np.uint8) for name, shape in spec.cameras.items()}, state)
+        cameras, inputs = history.inputs()
+        prediction = host.session.predict(cameras=cameras, instruction=instruction, episode_start=True, **inputs)
+        actions = np.asarray(prediction.actions)
+    else:
+        prediction = host.act(dict.fromkeys(camera_mapping, image), state, instruction)
+        actions = np.asarray(prediction["actions"])
     expected = (host.identity["action_horizon"], host.identity["action_dim"])
     if actions.shape != expected or not np.isfinite(actions).all():
         raise SystemExit(f"{family} did not return a finite action chunk of shape {expected}.")
@@ -101,6 +112,11 @@ def rollout_joint_policy(host, identity, args):
     plan_rows = 4 if family == "verne" else checked_shape[0]
     if args.prefetch_lead_steps >= plan_rows:
         raise SystemExit(f"--prefetch-lead-steps must be below the rollout plan length ({plan_rows})")
+    temporal_history = None
+    if "history_rows" in identity:
+        from temporal_joint_history import TemporalJointHistory
+
+        temporal_history = TemporalJointHistory(identity["history_rows"])
     pose_actions = None
     if family in {"praxis1", "verne"}:
         from tool_pose_actions import ToolPoseActions
@@ -175,6 +191,7 @@ def rollout_joint_policy(host, identity, args):
                         action_shape=checked_shape,
                         model_label=family, pose_actions=pose_actions, matrix_policy=family == "praxis1",
                         timestamp_observations=family == "verne", max_plan_rows=plan_rows,
+                        temporal_history=temporal_history,
                         gripper_tolerance=MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2" else 0.05,
                     )
                 finally:
@@ -425,7 +442,7 @@ def soak_endpoint(host, identity, args):
 def main():
     from omegaconf import OmegaConf
     from orchestral_session_bridge import (
-        TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER, OrchestralSessionHost,
+        TEMPORAL_JOINT_ADAPTER, TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER, OrchestralSessionHost,
     )
 
     parser = argparse.ArgumentParser(description="Run or probe a staging holesaw policy.")
@@ -466,9 +483,9 @@ def main():
 
     settings = argparse.ArgumentParser(prog=parser.prog)
     settings.add_argument("--seconds", type=float, default=300)
-    settings.add_argument("--control-hz", type=float, default=15 if family in {"praxis1", "isaac05"} else 30)
+    settings.add_argument("--control-hz", type=float, default=15 if family in {"praxis1", "isaac05", "flux3-action"} else 30)
     settings.add_argument("--instruction", default=OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
-    settings.add_argument("--prefetch-lead-steps", type=int, default=0 if family == "verne" else 8)
+    settings.add_argument("--prefetch-lead-steps", type=int, default=0 if family in {"verne", "flux3-action"} else 8)
     settings.add_argument("--shadow", action="store_true")
     settings.add_argument("--rrd", type=Path, help="Rerun output path; opt in for soak runs")
     settings.add_argument("--metrics", type=Path, help="Soak CSV path (default: yam_eval_runs/soak/gr00t_soak_<timestamp>.metrics.csv)")
@@ -486,7 +503,10 @@ def main():
         settings.error("--prefetch-lead-steps must be between 0 and 15")
     if family == "verne" and not (target.probe or target.soak_hours > 0 or args.shadow):
         settings.error("Verne hardware rollout is disabled after unexpected motion; use --shadow to test its policy without sending joint commands")
+    if family == "flux3-action" and target.soak_hours > 0 and not target.probe:
+        settings.error("FLUX 3 Action requires robot command history; use --probe or a supervised --shadow rollout")
     adapter = {
+        "flux3-action": TEMPORAL_JOINT_ADAPTER,
         "praxis1": TOOL_POSE_MATRIX_ADAPTER,
         "verne": TOOL_POSE_ADAPTER,
         "pi05": "pi05_yam_red_cap" if target.soak_hours <= 0 else "identity",

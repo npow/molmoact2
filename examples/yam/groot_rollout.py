@@ -36,10 +36,13 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
 
 def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
                   model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
-                  observation_time=None, max_plan_rows=None):
+                  observation_time=None, max_plan_rows=None, history_inputs=None):
     start = time.monotonic()
     query_state = pose_actions.state(state, matrix_policy=matrix_policy) if pose_actions else state
     sensors = {} if observation_time is None else {"timestamp": np.array([observation_time], dtype=np.float64)}
+    if history_inputs is not None:
+        sensors.update(history_inputs)
+        query_state = None
     response = session.predict(cameras=cameras, state=query_state, instruction=instruction,
                                episode_start=episode_start, **sensors)
     chunk = np.asarray(response.actions, dtype=np.float32)
@@ -78,7 +81,7 @@ def warm_session(session, instruction):
 def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
         action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
-        timestamp_observations=False, max_plan_rows=None):
+        timestamp_observations=False, max_plan_rows=None, temporal_history=None):
     period = 1 / control_hz
     history_size = 1 - min(history_offsets, default=0)
     history = deque(maxlen=history_size)
@@ -96,8 +99,11 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         while time.monotonic() < deadline:
             obs = env.get_obs()
             observation_time = time.monotonic() - started_at if timestamp_observations else None
-            history.append(frames_for_policy(obs, session.grant.io_spec.cameras, camera_bindings))
+            frames = frames_for_policy(obs, session.grant.io_spec.cameras, camera_bindings)
+            history.append(frames)
             measured = mask.validate_state(obs["joint_positions"], name="policy input state")
+            if temporal_history is not None:
+                temporal_history.observe(frames, measured[:7])
             if not pending and future is not None and future.done():
                 chunk, elapsed = future.result()
                 future = None
@@ -124,6 +130,9 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                      for name in camera_bindings}
                     if history_offsets else history[-1]
                 )
+                history_inputs = None
+                if temporal_history is not None:
+                    cameras, history_inputs = temporal_history.inputs()
                 submitted_with = len(pending)
                 request_hold_ticks = 0
                 future = predictor.submit(checked_chunk, session, cameras, measured[:7].copy(),
@@ -131,7 +140,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                                           action_shape=action_shape, model_label=model_label,
                                           gripper_tolerance=gripper_tolerance, pose_actions=pose_actions,
                                           matrix_policy=matrix_policy, observation_time=observation_time,
-                                          max_plan_rows=max_plan_rows)
+                                          max_plan_rows=max_plan_rows, history_inputs=history_inputs)
                 predictions += 1
 
             next_tick += period
@@ -141,7 +150,10 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     measured = mask.validate_state(env.get_robot_state()["joint_positions"], name="measured state")
                     target = measured.copy()
                     target[:7] = row
-                    env.step_command_only(mask.command_target(target, measured), wait=False)
+                    command = mask.command_target(target, measured)
+                    env.step_command_only(command, wait=False)
+                    if temporal_history is not None:
+                        temporal_history.commanded(command[:7])
                 rows += 1
                 next_tick = max(next_tick, time.monotonic() + period)
             elif future is not None:

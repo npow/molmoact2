@@ -30,6 +30,7 @@ ACTION_HORIZON = 30
 ACTION_SPACE = "joint_position"
 TOOL_POSE_ADAPTER = "tool_pose_rot6d"
 TOOL_POSE_MATRIX_ADAPTER = "tool_pose_matrix"
+TEMPORAL_JOINT_ADAPTER = "temporal_joint"
 NOISE_SCHEME = "numpy-pcg64-15x32-fp32-v1"
 
 #: Environment variable naming a Python >= 3.12 interpreter that can import the
@@ -437,7 +438,7 @@ class OrchestralSessionHost:
             raise OrchestralBridgeError("a managed Orchestral deployment id is required")
         if observation_encoding not in OBSERVATION_ENCODINGS:
             raise OrchestralBridgeError(f"unsupported observation encoding: {observation_encoding!r}")
-        if policy_adapter not in {"identity", "pi05_yam_red_cap", TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER}:
+        if policy_adapter not in {"identity", "pi05_yam_red_cap", TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER, TEMPORAL_JOINT_ADAPTER}:
             raise OrchestralBridgeError(f"unsupported policy_adapter: {policy_adapter!r}")
         self.policy_adapter = policy_adapter
         self.allow_camera_subset = allow_camera_subset
@@ -506,6 +507,23 @@ class OrchestralSessionHost:
     def _configure(self, spec):
         from types import SimpleNamespace
         history = getattr(spec, "camera_history", {}) or {}
+        if self.policy_adapter == TEMPORAL_JOINT_ADAPTER:
+            mapping = {"top": "images.scene", "left": "images.wrist"}
+            names = set(mapping.values())
+            rows = len(history.get("images.scene", ()))
+            offsets = tuple(range(1 - rows, 1))
+            modalities = getattr(spec, "modalities", {})
+            horizon, width = spec.action_shape
+            if (set(spec.cameras) != names or set(history) != names or rows <= 1
+                    or any(tuple(history[name]) != offsets for name in names)
+                    or set(modalities) != {"state_history", "command_history"}
+                    or any(sensor.shape != (rows, 7) or sensor.dtype != "float32" for sensor in modalities.values())
+                    or spec.state_dim != 0 or horizon <= 0 or width != 7):
+                raise OrchestralBridgeError("Unsupported two-camera temporal joint contract")
+            self._camera_names = mapping
+            self.identity.update(camera_mapping=mapping, state_dim=7, action_dim=width,
+                                 action_horizon=horizon, history_rows=rows, policy_adapter=self.policy_adapter)
+            return
         if any(tuple(offsets) != (0,) for offsets in history.values()):
             raise OrchestralBridgeError(
                 "YAM supplies current camera frames only; this deployment requires camera history"
