@@ -26,6 +26,7 @@ CAMERA_KEYS: Tuple[str, str, str] = ("top", "left", "right")
 STATE_DIM = 14
 ACTION_HORIZON = 30
 ACTION_SPACE = "joint_position"
+TOOL_POSE_ADAPTER = "tool_pose_rot6d"
 NOISE_SCHEME = "numpy-pcg64-15x32-fp32-v1"
 
 #: Environment variable naming a Python >= 3.12 interpreter that can import the
@@ -150,14 +151,14 @@ def _frame_is_empty(value: Any) -> bool:
     return not value
 
 
-def missing_cameras(images: Mapping[str, Any]) -> List[str]:
+def missing_cameras(images: Mapping[str, Any], keys: Sequence[str] = CAMERA_KEYS) -> List[str]:
     """Camera keys with no usable frame, for either payload shape.
 
     A plain ``not images.get(key)`` cannot do this job any more: a numpy array
     has no truth value, so the check that exists to *report* a stalled camera
     would itself raise instead.
     """
-    return [key for key in CAMERA_KEYS if _frame_is_empty(images.get(key))]
+    return [key for key in keys if _frame_is_empty(images.get(key))]
 
 
 def _observation_frame(value: Any) -> Any:
@@ -222,7 +223,9 @@ def _checkpoint_input_names(contract: Any, policy_adapter="identity") -> Tuple[D
             f"checkpoint input contract is not fully named (resolution={contract.resolution!r})"
         )
     images = [f.name for f in features if f.modality == "image"]
-    states = [f.name for f in features if f.modality == "state"]
+    state_features = [f for f in features if f.modality == "state"]
+    states = [f.name for f in state_features]
+    single_arm = len(state_features) == 1 and tuple(getattr(state_features[0], "shape", ()) or ()) == (7,)
     if policy_adapter == "pi05_yam_red_cap":
         cameras = {"top": "base_0_rgb", "left": "left_wrist_0_rgb", "right": "right_wrist_0_rgb"}
         if set(images) != set(cameras.values()) or states != ["state"]:
@@ -231,6 +234,8 @@ def _checkpoint_input_names(contract: Any, policy_adapter="identity") -> Tuple[D
     cameras: Dict[str, str] = {}
     for key in CAMERA_KEYS:
         matches = [name for name in images if _camera_role(name) == key]
+        if not matches and single_arm and key in ("left", "right"):
+            continue
         if len(matches) != 1:
             raise OrchestralBridgeError(
                 f"checkpoint input contract has {len(matches)} image inputs for camera "
@@ -239,7 +244,7 @@ def _checkpoint_input_names(contract: Any, policy_adapter="identity") -> Tuple[D
             )
         cameras[key] = matches[0]
     unused = sorted(set(images) - set(cameras.values()))
-    if unused or len(states) != 1:
+    if unused or len(states) != 1 or not ({"left", "right"} & cameras.keys()):
         raise OrchestralBridgeError(
             f"checkpoint input contract does not match cameras {list(CAMERA_KEYS)} plus "
             f"one state vector: unmatched image inputs {unused}, state inputs {states}"
@@ -258,7 +263,9 @@ def _checkpoint_geometry(contract: Any, policy_adapter="identity") -> Dict[str, 
     if state_shape is not None or action_shape is not None:
         if (not state_shape or len(state_shape) != 1 or state_shape[0] not in (7, 14)
                 or not action_shape or len(action_shape) != 2
-                or action_shape[1] != state_shape[0]
+                or (state_shape[0], action_shape[1]) not in (
+                    {(7, 10)} if policy_adapter == TOOL_POSE_ADAPTER else {(7, 7), (14, 14)}
+                )
                 or not isinstance(action_shape[0], int) or action_shape[0] <= 0):
             raise OrchestralBridgeError(
                 f"unsupported checkpoint state/action shapes: {state_shape}, {action_shape}"
@@ -388,7 +395,7 @@ class OrchestralSessionHost:
             raise OrchestralBridgeError("a managed Orchestral deployment id is required")
         if observation_encoding not in OBSERVATION_ENCODINGS:
             raise OrchestralBridgeError(f"unsupported observation encoding: {observation_encoding!r}")
-        if policy_adapter not in {"identity", "pi05_yam_red_cap"}:
+        if policy_adapter not in {"identity", "pi05_yam_red_cap", TOOL_POSE_ADAPTER}:
             raise OrchestralBridgeError(f"unsupported policy_adapter: {policy_adapter!r}")
         self.policy_adapter = policy_adapter
         self.deployment_id = deployment_id
@@ -445,6 +452,8 @@ class OrchestralSessionHost:
     def supports_committed_actions(self):
         if self._session is None:
             raise OrchestralBridgeError("Orchestral session is not open")
+        if self.policy_adapter == TOOL_POSE_ADAPTER:
+            return False
         session = self._session
         query = getattr(type(session), "supports_committed_actions", None)
         if query is not None and session.supports_committed_actions:
@@ -485,13 +494,13 @@ class OrchestralSessionHost:
     def predict_inputs(self, images, state):
         """Map rig cameras and state into a prediction and keep its reference pose."""
         import numpy as np
-        missing = missing_cameras(images)
+        missing = missing_cameras(images, tuple(self._camera_names))
         if missing:
             raise OrchestralBridgeError(f"Orchestral observation is missing camera bytes: {missing}")
         if len(state) != self.identity["state_dim"]:
             raise OrchestralBridgeError(f"Orchestral endpoint state must be {self.identity['state_dim']} floats, got {len(state)}")
         inputs = {self._camera_names[key]: _checkpoint_pixels(images[key], self.identity["camera_inputs"][key])
-                  for key in CAMERA_KEYS}
+                  for key in self._camera_names}
         query_state = np.asarray(state, dtype=np.float32).copy()
         if query_state.shape != (self.identity["state_dim"],) or not np.isfinite(query_state).all():
             raise OrchestralBridgeError("state must be a finite vector matching the endpoint")
@@ -520,6 +529,8 @@ class OrchestralSessionHost:
         inputs, query_state = self.predict_inputs(images, state)
         prefix = None
         if committed_actions is not None:
+            if self.policy_adapter == TOOL_POSE_ADAPTER:
+                raise OrchestralBridgeError("The tool pose adapter cannot transform committed commands")
             prefix = np.array(committed_actions, dtype=np.float32, copy=True)
             if (prefix.ndim != 2 or prefix.shape[1] != self.identity["action_dim"]
                     or not 0 < len(prefix) < self.identity["action_horizon"]
@@ -542,7 +553,7 @@ class OrchestralSessionHost:
         actions = self.robot_actions(actions, query_state)
         timings = asdict(result.timings)
         return {"actions": actions.tolist(), "horizon": len(actions),
-                "action_space": ACTION_SPACE,
+                "action_space": TOOL_POSE_ADAPTER if self.policy_adapter == TOOL_POSE_ADAPTER else ACTION_SPACE,
                 "telemetry": {**timings, "server_infer_ms": result.timings.accel_exec_us / 1000,
                               "trace_id": result.trace_id,
                               "noise_scheme": NOISE_SCHEME if noise_seed is not None else None,

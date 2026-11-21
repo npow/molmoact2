@@ -1183,7 +1183,7 @@ class PublishedSDKTests(unittest.TestCase):
         except ImportError:
             self.skipTest("orchestral-client is not installed")
         spec = IOSpec(cameras={"middle": (32, 32), "left": (32, 32), "right": (32, 32)},
-                      state_dim=7, action_shape=(15, 7), control_hz=15)
+                      state_dim=7, action_shape=(15, 7))
         grant = ConnectGrant(deployment_id="dep_test", org_id="org_test", model_id="mdl_test",
             endpoint_host="127.0.0.1", http_port=8000, quic_port=8001,
             io_spec=spec, expires_at=time.time()+3600)

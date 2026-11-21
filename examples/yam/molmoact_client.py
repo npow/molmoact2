@@ -43,6 +43,7 @@ from rollout_manifest import RolloutSeedPlan, SEED_STRATEGY
 from orchestral_session_bridge import (
     ACTION_HORIZON,
     ACTION_SPACE,
+    TOOL_POSE_ADAPTER,
     CAMERA_KEYS,
     OBSERVATION_ENCODINGS,
     ORCHESTRAL_PYTHON_ENV,
@@ -627,7 +628,8 @@ class OrchestralSessionTransport:
         # Both modes must fail identically: the caller only handles
         # OrchestralBridgeError, and a stalled camera must not surface as a KeyError
         # from one transport and a clean error from the other.
-        missing = missing_cameras(images)
+        camera_keys = tuple(self.identity.get("camera_mapping") or CAMERA_KEYS)
+        missing = missing_cameras(images, camera_keys)
         if missing:
             raise OrchestralBridgeError(f"Orchestral observation is missing camera bytes: {missing}")
         if self._host is not None:
@@ -644,12 +646,12 @@ class OrchestralSessionTransport:
         if committed_actions is not None:
             header["committed_actions"] = committed_actions.tolist()
         if self.observation_encoding == "jpeg":
-            header["images"] = {key: index for index, key in enumerate(CAMERA_KEYS)}
-            buffers: List[Any] = [images[key] for key in CAMERA_KEYS]
+            header["images"] = {key: index for index, key in enumerate(camera_keys)}
+            buffers: List[Any] = [images[key] for key in camera_keys]
         else:
             frames: Dict[str, Any] = {}
             buffers = []
-            for index, key in enumerate(CAMERA_KEYS):
+            for index, key in enumerate(camera_keys):
                 array = images[key]
                 shape = getattr(array, "shape", None)
                 if shape is None or len(shape) != 3 or shape[2] != 3:
@@ -881,6 +883,7 @@ class MolmoActOrchestral(PolicyBase):
         seed: Optional[int] = None,
         single_arm_side: Optional[str] = None,
         policy_adapter: str = "identity",
+        kinematics: Optional[Dict[str, Any]] = None,
     ):
         self.logger = get_molmoact_logger()
         if image_fit not in ("pad", "stretch"):
@@ -898,6 +901,15 @@ class MolmoActOrchestral(PolicyBase):
             raise ValueError("image_size must be positive or None")
         if single_arm_side not in (None, "left", "right"):
             raise ValueError("single_arm_side must be 'left', 'right', or None")
+        self._pose_actions = None
+        if policy_adapter == TOOL_POSE_ADAPTER:
+            if single_arm_side is None or not kinematics:
+                raise ValueError("Tool pose policies require an active arm side and robot kinematics")
+            from tool_pose_actions import ToolPoseActions
+
+            self._pose_actions = ToolPoseActions(**kinematics)
+        elif kinematics is not None:
+            raise ValueError("kinematics is only used with the tool_pose_rot6d adapter")
         self.single_arm_side = single_arm_side
         self._endpoint_single_arm_side: Optional[str] = None
         self.jpeg_quality = int(jpeg_quality)
@@ -962,7 +974,7 @@ class MolmoActOrchestral(PolicyBase):
         return int(exec_steps or advertised or self.action_horizon)
 
     def supports_committed_actions(self) -> bool:
-        return self._transport.supports_committed_actions()
+        return self._pose_actions is None and self._transport.supports_committed_actions()
 
     def get_action_horizon(self) -> int:
         if self.identity:
@@ -989,7 +1001,8 @@ class MolmoActOrchestral(PolicyBase):
         else:
             state_dim = int(advertised_state)
             action_dim = int(advertised_action)
-            if state_dim != action_dim or state_dim not in (ARM_DIM, STATE_DIM):
+            allowed = {(ARM_DIM, 10)} if self._pose_actions is not None else {(ARM_DIM, ARM_DIM), (STATE_DIM, STATE_DIM)}
+            if (state_dim, action_dim) not in allowed:
                 self._transport.close(success=False)
                 raise OrchestralBridgeError(
                     "Orchestral endpoint has unsupported state/action dimensions: "
@@ -1101,10 +1114,12 @@ class MolmoActOrchestral(PolicyBase):
             endpoint_state = bimanual_state[ARM_DIM:].copy()
         else:
             endpoint_state = bimanual_state
+        if self._pose_actions is not None:
+            endpoint_state = self._pose_actions.state(endpoint_state)
         return {
-            "left_camera_rgb": obs["left_camera_rgb"],
-            "front_camera_rgb": obs["front_camera_rgb"],
-            "right_camera_rgb": obs["right_camera_rgb"],
+            "left_camera_rgb": obs.get("left_camera_rgb"),
+            "front_camera_rgb": obs.get("front_camera_rgb"),
+            "right_camera_rgb": obs.get("right_camera_rgb"),
             "instruction": instruction,
             "state": endpoint_state,
             "bimanual_state": bimanual_state,
@@ -1125,6 +1140,8 @@ class MolmoActOrchestral(PolicyBase):
             "left": input_dict["left_camera_rgb"],
             "right": input_dict["right_camera_rgb"],
         }
+        camera_mapping = self.identity.get("camera_mapping") or CAMERA_KEYS
+        sources = {key: sources[key] for key in camera_mapping}
         if self.observation_encoding == "jpeg":
             images: Dict[str, Any] = {
                 key: self._jpeg_bytes(value) for key, value in sources.items()
@@ -1144,6 +1161,8 @@ class MolmoActOrchestral(PolicyBase):
 
         committed = input_dict.get("committed_actions")
         if committed is not None:
+            if self._pose_actions is not None:
+                raise ValueError("Committed joint actions are unavailable for tool pose policies")
             committed = np.asarray(committed, dtype=np.float32)
             if self._endpoint_single_arm_side is not None:
                 start = 0 if self._endpoint_single_arm_side == "left" else ARM_DIM
@@ -1165,25 +1184,30 @@ class MolmoActOrchestral(PolicyBase):
 
         endpoint_actions = np.asarray(prediction["actions"], dtype=np.float32)
         expected_horizon = self._expected_action_horizon()
-        if endpoint_actions.shape != (
-            expected_horizon,
-            endpoint_dim,
-        ) or not np.isfinite(endpoint_actions).all():
+        endpoint_width = self.identity.get("action_dim", endpoint_dim)
+        expected_shape = (expected_horizon, endpoint_width)
+        if endpoint_actions.shape != expected_shape or not np.isfinite(endpoint_actions).all():
             raise RuntimeError(
                 f"Orchestral returned a malformed action chunk: shape {endpoint_actions.shape}, "
-                f"expected ({expected_horizon}, {endpoint_dim})"
+                f"expected {expected_shape}"
             )
         if self._endpoint_single_arm_side:
             bimanual_state = require_bimanual_state(
                 input_dict["bimanual_state"], source="MolmoActOrchestral execution state"
             )
-            actions = np.repeat(bimanual_state[None, :], expected_horizon, axis=0)
             active = (
                 slice(0, ARM_DIM)
                 if self._endpoint_single_arm_side == "left"
                 else slice(ARM_DIM, STATE_DIM)
             )
-            actions[:, active] = endpoint_actions
+            commands = endpoint_actions
+            if self._pose_actions is not None:
+                commands = self._pose_actions.actions(endpoint_actions, bimanual_state[active])
+                if len(commands) < expected_horizon:
+                    self.logger.warning("Tool target at row %d is unreachable. Replanning after %d safe rows.",
+                                        len(commands), len(commands))
+            actions = np.repeat(bimanual_state[None, :], len(commands), axis=0)
+            actions[:, active] = commands
         else:
             actions = endpoint_actions
         telemetry = prediction.get("telemetry") or {}
@@ -1221,7 +1245,7 @@ class MolmoActOrchestral(PolicyBase):
             "reproducibility": {**self.reproducibility_metadata(), **seed_metadata},
             "transport": {
                 "protocol": "orchestral-action-session",
-                "action_space": prediction.get("action_space", ACTION_SPACE),
+                "action_space": ACTION_SPACE,
                 "session_id": identity.get("session_id"),
                 "observation_encoding": self.observation_encoding,
                 "image_bytes": image_bytes,

@@ -494,3 +494,32 @@ The client implements them directly; loading a sidecar file is unnecessary.
 Use `policy_adapter: identity` (the default) when the endpoint already returns
 robot commands through its complete upstream policy. Execution frequency comes
 from this client's `hz` setting.
+
+## Tool-pose checkpoints on a single arm
+
+Select `tool_pose_rot6d` for endpoints that take a seven-value tool state
+(position in meters, axis-angle in radians, and gripper) and return rows of ten
+values (position, the first two rotation-matrix rows, and gripper). The launcher
+uses the configured robot model for forward and inverse kinematics and holds
+the inactive arm at the observed joint positions. It executes the reachable
+prefix and replans from fresh feedback. If the first target is unreachable,
+it rejects the prediction. Leave prefetch disabled for this adapter.
+
+Set the kinematics on the same `eval.server` or `eval.direct` block as the
+endpoint. Use the base and tool frames from training, list the six joint names
+in controller order, and set a per-row joint motion bound for the physical rig.
+
+```yaml
+eval:
+  mode: server
+  server:
+    deployment: your-deployment-id
+    policy_adapter: tool_pose_rot6d
+    single_arm_side: left
+    kinematics:
+      model_path: /path/to/calibrated/robot.urdf
+      base_body: base
+      tool_body: tcp
+      joint_names: [joint1, joint2, joint3, joint4, joint5, joint6]
+      max_joint_step_rad: 0.08
+```

@@ -64,6 +64,22 @@ class DeploymentCameraMappingTests(unittest.TestCase):
         self.assertEqual(host.identity["state_dim"], 7)
         self.assertEqual(host.identity["action_horizon"], 15)
 
+    def test_single_arm_contract_uses_scene_and_declared_wrist(self):
+        for width, adapter in ((7, "identity"), (10, "tool_pose_rot6d")):
+            with self.subTest(adapter=adapter):
+                spec = IOSpec(cameras={"middle": (8, 8), "left": (8, 8)},
+                              state_dim=7, action_shape=(16, width))
+                host = OrchestralSessionHost(deployment_id="metadata-only", policy_adapter=adapter)
+                host._configure(spec)
+                frames = {key: np.full((8, 8, 3), 32, np.uint8) for key in ("top", "left")}
+                inputs, _ = host.predict_inputs(frames, [0] * 7)
+                self.assertEqual(set(inputs), {"middle", "left", "state"})
+                with self.assertRaisesRegex(OrchestralBridgeError, "missing camera"):
+                    host.predict_inputs({"top": frames["top"]}, [0] * 7)
+                if width == 10:
+                    with self.assertRaisesRegex(OrchestralBridgeError, "unsupported checkpoint"):
+                        OrchestralSessionHost(deployment_id="metadata-only")._configure(spec)
+
     def test_ambiguous_unknown_and_extra_views_are_rejected(self):
         layouts = [
             ("top", "base_view", "left", "right"),

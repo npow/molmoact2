@@ -2342,6 +2342,8 @@ def main() -> None:
     lead_steps = args.prefetch_lead_steps
     if lead_steps < 0:
         raise SystemExit("--prefetch-lead-steps must be nonnegative.")
+    if lead_steps and identity.get("policy_adapter") == "tool_pose_rot6d":
+        raise SystemExit("Tool-pose policies require fresh joint feedback at every replan. Set prefetch lead to zero.")
     if args.async_committed_actions:
         if (not isinstance(policy, MolmoActOrchestral)
                 or identity.get("policy_adapter") != "pi05_yam_red_cap"
