@@ -35,13 +35,17 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
 
 
 def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
-                  model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False):
+                  model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
+                  observation_time=None, max_plan_rows=None):
     start = time.monotonic()
     query_state = pose_actions.state(state, matrix_policy=matrix_policy) if pose_actions else state
-    response = session.predict(cameras=cameras, state=query_state, instruction=instruction, episode_start=episode_start)
+    sensors = {} if observation_time is None else {"timestamp": np.array([observation_time], dtype=np.float64)}
+    response = session.predict(cameras=cameras, state=query_state, instruction=instruction,
+                               episode_start=episode_start, **sensors)
     chunk = np.asarray(response.actions, dtype=np.float32)
     if chunk.shape != action_shape or not np.isfinite(chunk).all():
         raise ValueError(f"{model_label} returned an invalid action chunk")
+    chunk = chunk[:max_plan_rows]
     if pose_actions:
         from tool_pose_actions import UnreachableToolPose
 
@@ -73,7 +77,8 @@ def warm_session(session, instruction):
 
 def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         camera_bindings=CAMERAS, history_offsets=(-3, 0), control_hz=CONTROL_HZ,
-        action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False):
+        action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=0.05, pose_actions=None, matrix_policy=False,
+        timestamp_observations=False, max_plan_rows=None):
     period = 1 / control_hz
     history_size = 1 - min(history_offsets, default=0)
     history = deque(maxlen=history_size)
@@ -84,11 +89,13 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     rejected_chunks = 0
     rows = predictions = handoffs = misses = holds = 0
     next_tick = time.monotonic()
+    started_at = next_tick
     deadline = next_tick + seconds
     predictor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{model_label.lower()}-predict")
     try:
         while time.monotonic() < deadline:
             obs = env.get_obs()
+            observation_time = time.monotonic() - started_at if timestamp_observations else None
             history.append(frames_for_policy(obs, session.grant.io_spec.cameras, camera_bindings))
             measured = mask.validate_state(obs["joint_positions"], name="policy input state")
             if not pending and future is not None and future.done():
@@ -123,7 +130,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                                           instruction, episode_start=(predictions == 0),
                                           action_shape=action_shape, model_label=model_label,
                                           gripper_tolerance=gripper_tolerance, pose_actions=pose_actions,
-                                          matrix_policy=matrix_policy)
+                                          matrix_policy=matrix_policy, observation_time=observation_time,
+                                          max_plan_rows=max_plan_rows)
                 predictions += 1
 
             next_tick += period

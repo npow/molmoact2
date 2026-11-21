@@ -98,8 +98,9 @@ def rollout_joint_policy(host, identity, args):
     state_width, action_width = {"praxis1": (8, 13), "verne": (7, 10)}.get(family, (7, 7))
     if identity["state_dim"] != state_width or checked_shape[1] != action_width or checked_shape[0] <= 0:
         raise SystemExit(f"Unexpected {family} contract for YAM: {checked_shape}")
-    if args.prefetch_lead_steps >= checked_shape[0]:
-        raise SystemExit(f"--prefetch-lead-steps must be below the endpoint horizon ({checked_shape[0]})")
+    plan_rows = 4 if family == "verne" else checked_shape[0]
+    if args.prefetch_lead_steps >= plan_rows:
+        raise SystemExit(f"--prefetch-lead-steps must be below the rollout plan length ({plan_rows})")
     pose_actions = None
     if family in {"praxis1", "verne"}:
         from tool_pose_actions import ToolPoseActions
@@ -173,6 +174,7 @@ def rollout_joint_policy(host, identity, args):
                         camera_bindings=bindings, history_offsets=(), control_hz=args.control_hz,
                         action_shape=checked_shape,
                         model_label=family, pose_actions=pose_actions, matrix_policy=family == "praxis1",
+                        timestamp_observations=family == "verne", max_plan_rows=plan_rows,
                         gripper_tolerance=MOLMOACT2_GRIPPER_TOLERANCE if family == "molmoact2" else 0.05,
                     )
                 finally:
@@ -466,7 +468,7 @@ def main():
     settings.add_argument("--seconds", type=float, default=300)
     settings.add_argument("--control-hz", type=float, default=15 if family in {"praxis1", "isaac05"} else 30)
     settings.add_argument("--instruction", default=OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
-    settings.add_argument("--prefetch-lead-steps", type=int, default=8)
+    settings.add_argument("--prefetch-lead-steps", type=int, default=0 if family == "verne" else 8)
     settings.add_argument("--shadow", action="store_true")
     settings.add_argument("--rrd", type=Path, help="Rerun output path; opt in for soak runs")
     settings.add_argument("--metrics", type=Path, help="Soak CSV path (default: yam_eval_runs/soak/gr00t_soak_<timestamp>.metrics.csv)")
