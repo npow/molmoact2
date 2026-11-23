@@ -174,13 +174,13 @@ class _InlinePredictor:
 
 @pytest.mark.parametrize("mode", MODES)
 def test_rollout_loop_commands_a_continuous_stream(mode, monkeypatch):
-    groot_rollout = pytest.importorskip("groot_rollout")
-    monkeypatch.setattr(groot_rollout, "ThreadPoolExecutor", _InlinePredictor)
+    rollout_loop = pytest.importorskip("rollout_loop")
+    monkeypatch.setattr(rollout_loop, "ThreadPoolExecutor", _InlinePredictor)
     clock = iter(np.arange(0, 1000, 0.001))
-    monkeypatch.setattr(groot_rollout.time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(groot_rollout.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(rollout_loop.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(rollout_loop.time, "sleep", lambda seconds: None)
     env = _Env()
-    groot_rollout.run(env, _Session(), _Mask(), seconds=0.5, instruction="go", shadow=False,
+    rollout_loop.run(env, _Session(), _Mask(), seconds=0.5, instruction="go", shadow=False,
                       camera_bindings={"top": "front_camera_rgb"}, history_offsets=(),
                       chunk_fusion=mode, lead_steps=4)
     commands = np.array(env.commands)
@@ -192,14 +192,14 @@ def test_rollout_loop_commands_a_continuous_stream(mode, monkeypatch):
 @pytest.mark.parametrize("bimanual,stateful", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("noise_seed", [None, 0])
 def test_rollout_commits_the_queued_targets_before_appending_a_suffix(bimanual, stateful, noise_seed, monkeypatch):
-    groot_rollout = pytest.importorskip("groot_rollout")
-    monkeypatch.setattr(groot_rollout, "ThreadPoolExecutor", _InlinePredictor)
+    rollout_loop = pytest.importorskip("rollout_loop")
+    monkeypatch.setattr(rollout_loop, "ThreadPoolExecutor", _InlinePredictor)
     clock = iter(np.arange(0, 1000, 0.001))
-    monkeypatch.setattr(groot_rollout.time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(groot_rollout.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(rollout_loop.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(rollout_loop.time, "sleep", lambda seconds: None)
     env, session = _Env(), _Session()
     parked = np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32) if bimanual else None
-    groot_rollout.run(env, session, _Mask(), seconds=0.4, instruction="go", shadow=False,
+    rollout_loop.run(env, session, _Mask(), seconds=0.4, instruction="go", shadow=False,
                       camera_bindings={"top": "front_camera_rgb"}, history_offsets=(), lead_steps=4,
                       action_shape=(16, 14 if bimanual else 7), state_padding=parked,
                       timestamp_observations=bimanual, committed_actions=True, stream_observations=stateful,
@@ -222,14 +222,14 @@ def test_rollout_commits_the_queued_targets_before_appending_a_suffix(bimanual, 
 
 
 def test_checked_chunk_clips_flux_gripper_overshoot_before_queueing():
-    import groot_rollout
+    import rollout_loop
 
     raw = ramp(0)
     raw[:, 6] = np.linspace(0.9199, 1.0504, len(raw))
     session = SimpleNamespace(predict=lambda **kwargs: SimpleNamespace(actions=raw))
 
     def predict():
-        chunk, _ = groot_rollout.checked_chunk(session, {}, np.zeros(7), "go", episode_start=True,
+        chunk, _ = rollout_loop.checked_chunk(session, {}, np.zeros(7), "go", episode_start=True,
                                                model_label="flux3-action")
         return chunk
 
@@ -244,19 +244,19 @@ def test_checked_chunk_clips_flux_gripper_overshoot_before_queueing():
 
 
 def test_checked_chunk_rejects_changed_committed_rows():
-    groot_rollout = pytest.importorskip("groot_rollout")
+    rollout_loop = pytest.importorskip("rollout_loop")
     session = SimpleNamespace(predict=lambda **kwargs: SimpleNamespace(actions=np.zeros((16, 7))))
     with pytest.raises(ValueError, match="did not preserve the committed action prefix"):
-        groot_rollout.checked_chunk(session, {}, np.zeros(7), "go", episode_start=False,
+        rollout_loop.checked_chunk(session, {}, np.zeros(7), "go", episode_start=False,
                                     committed_actions=np.ones((1, 7), np.float32))
 
 
 def test_rollout_replans_if_the_safety_mask_changes_a_committed_command(monkeypatch):
-    groot_rollout = pytest.importorskip("groot_rollout")
-    monkeypatch.setattr(groot_rollout, "ThreadPoolExecutor", _InlinePredictor)
+    rollout_loop = pytest.importorskip("rollout_loop")
+    monkeypatch.setattr(rollout_loop, "ThreadPoolExecutor", _InlinePredictor)
     clock = iter(np.arange(0, 1000, 0.001))
-    monkeypatch.setattr(groot_rollout.time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(groot_rollout.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(rollout_loop.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(rollout_loop.time, "sleep", lambda seconds: None)
     env, session = _Env(), _Session()
 
     class ClipOnce(_Mask):
@@ -265,7 +265,7 @@ def test_rollout_replans_if_the_safety_mask_changes_a_committed_command(monkeypa
                 target[0] = measured[0]
             return target
 
-    groot_rollout.run(env, session, ClipOnce(), seconds=0.3, instruction="go", shadow=False,
+    rollout_loop.run(env, session, ClipOnce(), seconds=0.3, instruction="go", shadow=False,
                       camera_bindings={"top": "front_camera_rgb"}, history_offsets=(),
                       lead_steps=4, committed_actions=True)
     assert session.requests[1][1].shape == (4, 7)

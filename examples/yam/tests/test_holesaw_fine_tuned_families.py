@@ -13,7 +13,7 @@ from orchestral import IOSpec
 
 import managed_rollout
 from gripper_aperture import clip_predicted_aperture
-from groot_rollout import checked_chunk
+from rollout_loop import checked_chunk
 from orchestral_session_bridge import (
     SINGLE_ARM_IN_14,
     TOOL_POSE_QUAT_ADAPTER,

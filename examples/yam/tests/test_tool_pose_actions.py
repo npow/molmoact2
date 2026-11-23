@@ -11,7 +11,7 @@ class ToolPoseActionsTests(unittest.TestCase):
     def test_holesaw_bimanual_grasp_frame_and_committed_handoff(self):
         from types import SimpleNamespace
         from scipy.spatial.transform import Rotation
-        from groot_rollout import checked_chunk
+        from rollout_loop import checked_chunk
 
         adapter = HolesawBimanualActions(
             model_path=Path(__file__).resolve().parents[1] / "configs/yam_holesaw_kinematics.urdf",

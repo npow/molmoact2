@@ -200,7 +200,7 @@ def rollout_joint_policy(host, identity, args):
         validate_bimanual_model_arm_order,
     )
 
-    rollout = runpy.run_path(str(Path(__file__).with_name("groot_rollout.py")))
+    rollout = runpy.run_path(str(Path(__file__).with_name("rollout_loop.py")))
     family = args.policy_family
     checked_shape = (identity["action_horizon"], identity["action_dim"])
     bimanual_layout = family in PARKED_RIGHT_ARM_FAMILIES and (identity["state_dim"], checked_shape[1]) == (14, 14)
@@ -352,7 +352,7 @@ def soak_endpoint(host, identity, args):
     from omegaconf import OmegaConf
     from gello_min.v4l2_camera import V4L2Camera
 
-    rollout = runpy.run_path(str(Path(__file__).with_name("groot_rollout.py")))
+    rollout = runpy.run_path(str(Path(__file__).with_name("rollout_loop.py")))
     config = OmegaConf.to_container(OmegaConf.load(LEFT_CONFIG), resolve=True)
     rig_cameras = {"top": "front_camera", "left": "left_camera", "right": "right_camera"}
     camera_mapping = identity["camera_mapping"]
