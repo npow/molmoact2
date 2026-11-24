@@ -23,6 +23,7 @@ import rerun.blueprint as rrb
 
 from chunk_fusion import MODES as CHUNK_FUSION_MODES, ChunkPlan
 from committed_range import gr00t_conditioning_prefix
+from frame_capture_time import session_capture_time
 from gripper_aperture import clip_predicted_aperture
 from rollout_trace import COMMAND_STAGES, PREDICTION_OUTCOMES, PREDICTION_STAGES, TICK_STAGE, RolloutTrace
 import run_recording
@@ -245,11 +246,12 @@ class SdkLoopMetrics:
             print(f"[telemetry] This Orchestral SDK cannot record loop metrics: {error}", flush=True)
         self._chunks = {}
 
-    def delivered(self, chunk_id, observed_at, sent_at):
-        """A chunk was accepted into the plan. The times are `time.monotonic()` readings."""
+    def delivered(self, chunk_id, observed_at, sent_at, captured_at=None):
+        """A chunk was accepted into the plan. `observed_at` and `sent_at` are `time.monotonic()` readings;
+        `captured_at` is the frames' capture time on the Session clock (None: measure from `observed_at`)."""
         def call():
             chunk = SimpleNamespace(seq=chunk_id, t_observed=self._clock.from_source(observed_at),
-                                    t_captured=None, t_sent=self._clock.from_source(sent_at))
+                                    t_captured=captured_at, t_sent=self._clock.from_source(sent_at))
             self._chunks[chunk_id] = chunk
             self._timings._delivered(chunk, self._clock.now())
         self._guard(call)
@@ -350,7 +352,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     request_prefix_changed = False
     observations = deque()
     request_timings = {}
-    request_observed_at = request_submitted_at = None
+    request_observed_at = request_submitted_at = request_captured_at = None
     awaiting_command = None  # an AcceptedPrediction until its first row is sent
     prediction_samples, command_samples, tick_latencies_ms = [], [], []
     outcomes = Counter()
@@ -374,6 +376,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             with recorder.span("get_obs"):
                 obs = env.get_obs()
             observed_at = time.monotonic()
+            captured_at = session_capture_time(env, session.clock)
             observation_time = observed_at - started_at if timestamp_observations else None
             frames = frames_for_policy(obs, session.grant.io_spec.cameras, camera_bindings)
             history.append(frames)
@@ -442,7 +445,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                           f"{time.monotonic() - started_at:.1f} s into the run). Replanning.", flush=True)
                 elif first_row is not None:
                     active_prediction = predictions
-                    loop_metrics.delivered(predictions, request_observed_at, request_submitted_at)
+                    loop_metrics.delivered(predictions, request_observed_at, request_submitted_at, request_captured_at)
                     handoffs += bool(submitted_with)
                     awaiting_command = AcceptedPrediction(predictions, request_timings, prediction_stages,
                                                           request_observed_at, time.monotonic())
@@ -466,6 +469,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                                               lead_steps=lead_steps)
                 request_timings = {}
                 request_observed_at = observed_at
+                request_captured_at = captured_at
                 if trace is not None:
                     trace.event("Prediction %d requested with %d queued rows", predictions + 1, submitted_with)
                 request_submitted_at = time.monotonic()
