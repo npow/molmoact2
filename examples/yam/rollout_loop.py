@@ -373,6 +373,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             while observations and observations[0].done():
                 observations.popleft().result()
             tick += 1
+            due_at = next_tick  # this tick's scheduled time: the recorder's Tick jitter is measured from it
             with recorder.span("get_obs"):
                 obs = env.get_obs()
             observed_at = time.monotonic()
@@ -498,7 +499,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     ))
 
             next_tick += period
-            row = command = row_index = tick_ms = None
+            row = command = row_index = tick_ms = ran_at = None
             if pending and time.monotonic() < deadline:
                 row_index, row = pending.pop()
                 if not shadow:
@@ -516,7 +517,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     if temporal_history is not None:
                         temporal_history.commanded(command[:7])
                 rows += 1
-                commanded_at = time.monotonic()
+                commanded_at = ran_at = time.monotonic()
                 next_tick = max(next_tick, commanded_at + period)
                 tick_ms = 1000.0 * (commanded_at - tick_started)
                 tick_latencies_ms.append(tick_ms)
@@ -535,7 +536,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             loop_metrics.tick(tick, active_prediction if row is not None else None)
             recorder.tick(tick, chunk=active_prediction if row is not None else None, row=row_index,
                           held=row is None, reason=None if row is not None else "waiting" if future is not None
-                          else "idle", tick_elapsed_ms=1000 * (time.monotonic() - next_tick + period))
+                          else "idle", tick_elapsed_ms=1000 * (time.monotonic() - next_tick + period),
+                          due_ns=run_recording.ns(due_at), monotonic_ns=run_recording.ns(ran_at))
             if trace is not None:
                 trace.tick(measured, row, command, active_prediction, row_index,
                            holding=row is None and future is not None, tick_ms=tick_ms)
