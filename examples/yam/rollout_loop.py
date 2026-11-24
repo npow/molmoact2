@@ -219,6 +219,65 @@ class LatencySpans:
             print(f"[telemetry] Stopped recording latency spans: {error}", flush=True)
 
 
+class SdkLoopMetrics:
+    """Feed the SDK's `ControlLoopTimings` from this loop, which keeps its own chunk plan.
+
+    `ActionQueue` (used by `rtc_rollout.py`) feeds `ControlLoopTimings` itself. This loop does not use the
+    queue, so without this the Grafana panels built on it (`orchestral_ingest_loop_*`: observation to
+    action, reaction, action age, held ticks, tick jitter) stay empty for every non-RTC family. The calls
+    mirror the queue's: `delivered` when a chunk is accepted, `tick` once per control tick (a tick with
+    no row is a held tick), `finish` at the end. It uses the SDK's underscore methods, so any failure
+    turns it off with one warning: telemetry must never interrupt the robot.
+    """
+
+    def __init__(self, session, started_at, period):
+        self._timings = None
+        self._failed = False
+        clock = getattr(session, "clock", None)
+        try:
+            from orchestral.client.session_queues import ControlLoopTimings
+            self._clock = clock
+            self._period = period
+            self._t0 = clock.from_source(started_at)
+            self._timings = ControlLoopTimings(getattr(session, "_trace_attributes", None))
+        except Exception as error:  # an older SDK, or a session without a clock
+            self._failed = True
+            print(f"[telemetry] This Orchestral SDK cannot record loop metrics: {error}", flush=True)
+        self._chunks = {}
+
+    def delivered(self, chunk_id, observed_at, sent_at):
+        """A chunk was accepted into the plan. The times are `time.monotonic()` readings."""
+        def call():
+            chunk = SimpleNamespace(seq=chunk_id, t_observed=self._clock.from_source(observed_at),
+                                    t_captured=None, t_sent=self._clock.from_source(sent_at))
+            self._chunks[chunk_id] = chunk
+            self._timings._delivered(chunk, self._clock.now())
+        self._guard(call)
+
+    def tick(self, tick, chunk_id):
+        """One control tick; `chunk_id` is the chunk the row came from, or None when no row ran."""
+        def call():
+            now = self._clock.now()
+            grid = max(tick, math.floor((now - self._t0) / self._period))
+            chunk = None if chunk_id is None else self._chunks.get(chunk_id)
+            self._timings._tick(grid=grid, now=now, due=self._t0 + tick * self._period, chunk=chunk)
+            for stale in [seq for seq in self._chunks if chunk_id is not None and seq < chunk_id - 2]:
+                del self._chunks[stale]
+        self._guard(call)
+
+    def finish(self):
+        self._guard(lambda: self._timings._finish())
+
+    def _guard(self, call):
+        if self._failed:
+            return
+        try:
+            call()
+        except Exception as error:
+            self._failed = True
+            print(f"[telemetry] Stopped recording loop metrics: {error}", flush=True)
+
+
 def latency_summary(prediction_samples, command_samples, tick_ms, outcomes):
     """Lines of p50 / p95 / max per stage and the prediction outcomes, for the end-of-run printout."""
     def row(name, values):
@@ -305,6 +364,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     next_tick = time.monotonic()
     started_at = next_tick
     deadline = next_tick + seconds
+    loop_metrics = SdkLoopMetrics(session, started_at, period)
     predictor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{model_label.lower()}-predict")
     try:
         while (tick_started := time.monotonic()) < deadline:
@@ -382,6 +442,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                           f"{time.monotonic() - started_at:.1f} s into the run). Replanning.", flush=True)
                 elif first_row is not None:
                     active_prediction = predictions
+                    loop_metrics.delivered(predictions, request_observed_at, request_submitted_at)
                     handoffs += bool(submitted_with)
                     awaiting_command = AcceptedPrediction(predictions, request_timings, prediction_stages,
                                                           request_observed_at, time.monotonic())
@@ -467,6 +528,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             elif future is not None:
                 request_hold_ticks += 1
                 holds += 1
+            loop_metrics.tick(tick, active_prediction if row is not None else None)
             recorder.tick(tick, chunk=active_prediction if row is not None else None, row=row_index,
                           held=row is None, reason=None if row is not None else "waiting" if future is not None
                           else "idle", tick_elapsed_ms=1000 * (time.monotonic() - next_tick + period))
@@ -476,6 +538,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             time.sleep(max(0, next_tick - time.monotonic()))
     finally:
         predictor.shutdown(wait=False, cancel_futures=True)
+        loop_metrics.finish()
         # Printed on Ctrl+C too: that is how an operator ends most rollouts.
         if call_ms:
             print(latency_line(model_label, call_ms, stage_rows, final=True), flush=True)
