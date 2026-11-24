@@ -367,6 +367,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     started_at = next_tick
     deadline = next_tick + seconds
     loop_metrics = SdkLoopMetrics(session, started_at, period)
+    policy_camera_names = tuple(rig.removesuffix("_rgb") for rig in camera_bindings.values())
+    warned_no_capture = False
     predictor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{model_label.lower()}-predict")
     try:
         while (tick_started := time.monotonic()) < deadline:
@@ -376,7 +378,12 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             with recorder.span("get_obs"):
                 obs = env.get_obs()
             observed_at = time.monotonic()
-            captured_at = session_capture_time(env, session.clock)
+            captured_at = session_capture_time(env, session.clock, camera_names=policy_camera_names)
+            if captured_at is None and not warned_no_capture:
+                warned_no_capture = True
+                print("[telemetry] The env reported no capture time for the policy's cameras "
+                      f"{policy_camera_names}: loop latencies are measured from the observation, "
+                      f"not from capture. env timestamps: {getattr(env, 'last_frame_timestamps', None)}", flush=True)
             observation_time = observed_at - started_at if timestamp_observations else None
             frames = frames_for_policy(obs, session.grant.io_spec.cameras, camera_bindings)
             history.append(frames)
