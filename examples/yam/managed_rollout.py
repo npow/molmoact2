@@ -102,26 +102,22 @@ DECLARED_FAMILY = "declared"
 YAM_JOINTS = [f"joint{i}" for i in range(1, 7)]
 
 
-def declared_semantics(client, model_id, path=None):
-    """What the deployment's values mean: a local declaration file if given (logged), else its model's own.
+def declared_semantics(client, deployment, path=None):
+    """What the deployment's values mean: a local declaration file if given (logged), else its checkpoint's own.
 
-    The control plane returns a model's io_spec with its declared semantics; a model without one returns
-    None, and the rollout falls back to the family tables.
+    The control plane inspects the deployment's checkpoint (its URI and options) and returns its io_spec with the
+    declared semantics; a checkpoint without one returns None, and the rollout falls back to the family tables.
     """
     if path is not None:
         print(f"[semantics] Using the local declaration {path} instead of the deployment's.", flush=True)
         return json.loads(Path(path).read_text())
-    page = None
-    while True:
-        reply = client._http.get("/v1alpha1/models", params={"pageSize": 200, **({"pageToken": page} if page else {})})
-        reply.raise_for_status()
-        body = reply.json()
-        for model in body.get("models", []):
-            if model.get("name") == f"models/{model_id}":
-                return (model.get("ioSpec") or {}).get("semantics")
-        page = body.get("nextPageToken")
-        if not page:
-            return None
+    if not getattr(deployment, "checkpoint_uri", ""):
+        return None
+    options = (getattr(deployment, "data", None) or {}).get("checkpoint_options") or {}
+    reply = client._http.post("/v1alpha1/checkpoints:inspect", timeout=180, json={
+        "checkpointUri": deployment.checkpoint_uri, "checkpointOptions": {k: str(v) for k, v in options.items()}})
+    reply.raise_for_status()
+    return (reply.json().get("ioSpec") or {}).get("semantics")
 
 
 def declares_tool_poses(semantics):
@@ -703,7 +699,7 @@ def main():
     try:
         deployment = client.deployments.get(target.deployment)
         model_id = deployment.model_id
-        semantics = declared_semantics(client, model_id, target.semantics)
+        semantics = declared_semantics(client, deployment, target.semantics)
     finally:
         client._http.close()
     # The deployment's own declaration decides first; the family tables cover undeclared deployments.

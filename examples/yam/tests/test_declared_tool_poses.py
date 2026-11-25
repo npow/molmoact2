@@ -101,13 +101,13 @@ def _cli(monkeypatch, captured, *argv, semantics=FLUX_EE50):
         captured.update(kwargs)
         raise _Opened
 
-    models = {"models": [{"name": "models/holesaw-ee50", "ioSpec": {"stateDim": 7, "semantics": semantics}}]}
-    reply = SimpleNamespace(raise_for_status=lambda: None, json=lambda: models)
+    inspection = {"ioSpec": {"stateDim": 7, "semantics": semantics}}
+    reply = SimpleNamespace(raise_for_status=lambda: None, json=lambda: inspection)
     monkeypatch.chdir(CONFIGS.parents[2])
     monkeypatch.setattr(sys, "argv", ["managed_rollout.py", *argv])
     monkeypatch.setattr(managed_rollout, "Orchestral", lambda: SimpleNamespace(
-        deployments=SimpleNamespace(get=lambda _: SimpleNamespace(model_id="holesaw-ee50", checkpoint_uri="")),
-        _http=SimpleNamespace(get=lambda path, params=None: reply, close=lambda: None)))
+        deployments=SimpleNamespace(get=lambda _: SimpleNamespace(model_id="holesaw-ee50", checkpoint_uri="hf://o/r@1")),
+        _http=SimpleNamespace(post=lambda path, json=None, timeout=None: reply, close=lambda: None)))
     monkeypatch.setattr("orchestral_session_bridge.OrchestralSessionHost", host)
     managed_rollout.main()
 

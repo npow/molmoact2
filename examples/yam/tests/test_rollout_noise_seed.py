@@ -8,9 +8,10 @@ import pytest
 import managed_rollout
 import rtc_rollout
 
-# A control plane whose models declare no semantics, so the rollout falls back to the family tables.
+# A control plane whose checkpoints declare no semantics, so the rollout falls back to the family tables.
 UNDECLARED_HTTP = SimpleNamespace(
-    get=lambda path, params=None: SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"models": []}),
+    post=lambda path, json=None, timeout=None: SimpleNamespace(raise_for_status=lambda: None,
+                                                               json=lambda: {"ioSpec": {"stateDim": 7}}),
     close=lambda: None)
 
 
