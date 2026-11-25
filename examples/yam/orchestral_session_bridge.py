@@ -31,7 +31,7 @@ ACTION_SPACE = "joint_position"
 TOOL_POSE_ADAPTER = "tool_pose_rot6d"
 TOOL_POSE_MATRIX_ADAPTER = "tool_pose_matrix"
 #: Values converted from the deployment's declared semantics (declared_tool_poses.py): the contract's shapes
-#: are taken as declared and the rig names which physical camera feeds each image input.
+#: are taken as declared; cameras map by their names, as for any model, unless the rig gives a camera map.
 DECLARED_ADAPTER = "declared_semantics"
 #: Rho: absolute end-effector rows [x y z qx qy qz qw gripper] (xyzw quaternion, gripper 1 = open).
 TOOL_POSE_QUAT_ADAPTER = "tool_pose_quat"
@@ -501,8 +501,8 @@ class OrchestralSessionHost:
                                    TEMPORAL_JOINT_ADAPTER, GR00T_YAM_ADAPTER, PRAXIS_HOLESAW_BIMANUAL,
                                    TOOL_POSE_QUAT_ADAPTER, SINGLE_ARM_IN_14, DECLARED_ADAPTER}:
             raise OrchestralBridgeError(f"unsupported policy_adapter: {policy_adapter!r}")
-        if (policy_adapter == DECLARED_ADAPTER) != bool(camera_map):
-            raise OrchestralBridgeError("a declared-semantics deployment needs a camera map, and only it takes one")
+        if camera_map and policy_adapter != DECLARED_ADAPTER:
+            raise OrchestralBridgeError("only a declared-semantics deployment takes a camera map")
         self.policy_adapter = policy_adapter
         self.allow_camera_subset = allow_camera_subset
         #: Rig camera role ("top", "left", "right") for each image input name of the deployment.
@@ -605,6 +605,8 @@ class OrchestralSessionHost:
             raise OrchestralBridgeError("YAM cannot supply additional deployment modalities")
         if self.policy_adapter == DECLARED_ADAPTER:
             roles = set(CAMERA_KEYS)
+            if not self.camera_map:
+                self.camera_map = {name: _camera_role(name) for name in spec.cameras}
             if set(self.camera_map) != set(spec.cameras) or not set(self.camera_map.values()) <= roles \
                     or len(set(self.camera_map.values())) != len(self.camera_map):
                 raise OrchestralBridgeError(

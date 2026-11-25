@@ -112,23 +112,18 @@ def _cli(monkeypatch, captured, *argv, semantics=FLUX_EE50):
     managed_rollout.main()
 
 
-def test_a_deployment_declaring_tool_poses_takes_the_declared_path_without_a_family(monkeypatch):
+def test_a_deployment_declaring_tool_poses_takes_the_declared_path_without_a_family_or_flags(monkeypatch):
+    import managed_rollout
     from orchestral_session_bridge import DECLARED_ADAPTER
 
     captured = {}
-    cameras = "images.wrist=left,images.left=top,images.right=right"
     with pytest.raises(_Opened):
-        _cli(monkeypatch, captured, "--camera-map", cameras, "--instruction", "pick")
-    assert captured["policy_adapter"] == DECLARED_ADAPTER
+        _cli(monkeypatch, captured)
+    assert captured["policy_adapter"] == DECLARED_ADAPTER and not captured["camera_map"]
+    assert captured["instruction"] == managed_rollout.HOLESAW_INSTRUCTION
+    with pytest.raises(_Opened):  # a rig may still say which camera feeds which input
+        _cli(monkeypatch, captured, "--camera-map", "images.wrist=left,images.left=top,images.right=right")
     assert captured["camera_map"] == {"images.wrist": "left", "images.left": "top", "images.right": "right"}
-
-
-@pytest.mark.parametrize("argv, message", [
-    ((), "--camera-map"), (("--camera-map", "images.wrist=left"), "--instruction")])
-def test_a_declared_deployment_needs_the_rig_camera_map_and_its_instruction(argv, message, monkeypatch, capsys):
-    with pytest.raises(SystemExit):
-        _cli(monkeypatch, {}, *argv)
-    assert message in capsys.readouterr().err
 
 
 def test_the_rollout_takes_its_rate_and_converter_from_the_declaration(tmp_path, monkeypatch):
@@ -159,10 +154,16 @@ def test_the_rollout_takes_its_rate_and_converter_from_the_declaration(tmp_path,
     assert saved["committed_actions"] is False
 
 
-def test_the_bridge_maps_cameras_from_the_rig_and_takes_the_declared_shapes():
+def test_the_bridge_maps_declared_cameras_by_name_or_from_the_rig_and_takes_the_declared_shapes():
     from orchestral import IOSpec
     from orchestral_session_bridge import DECLARED_ADAPTER, OrchestralBridgeError, OrchestralSessionHost
 
+    # The recording's own camera names map to the rig's cameras by name, as for any model.
+    named = IOSpec(cameras={name: (360, 640) for name in ("images.left", "images.middle", "images.right")},
+                   state_dim=7, action_shape=(32, 10))
+    host = OrchestralSessionHost(deployment_id="m", policy_adapter=DECLARED_ADAPTER)
+    host._configure(named)
+    assert host.identity["camera_mapping"] == {"left": "images.left", "top": "images.middle", "right": "images.right"}
     spec = IOSpec(cameras={name: (360, 640) for name in ("images.wrist", "images.left", "images.right")},
                   state_dim=7, action_shape=(32, 10))
     cameras = {"images.wrist": "left", "images.left": "top", "images.right": "right"}

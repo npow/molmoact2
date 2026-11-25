@@ -36,7 +36,8 @@ ISAAC_BIMANUAL_PLAN_ROWS = 30   # replan every second instead of running the ful
 COMMITTED_ACTIONS_DEFAULT_OFF = frozenset({"rho", "dreamzero"})
 # Families fine-tuned on the Holesaw task. None has a noise-seed path.
 HOLESAW_INSTRUCTION = "Pick up the hole saws from the moving conveyor belt and place them in the red case"
-HOLESAW_FINE_TUNED_FAMILIES = frozenset({"rho", "dreamzero", "fastwam", "dw05", "aw0"})
+# A declared deployment runs the rig's Holesaw task too.
+HOLESAW_FINE_TUNED_FAMILIES = frozenset({"rho", "dreamzero", "fastwam", "dw05", "aw0", "declared"})
 # Checkpoints trained at 30 Hz; every other family defaults to 15 Hz.
 CONTROL_HZ_30_FAMILIES = frozenset({"flux3-action", "longwam", "rho", "aw0"})
 # AW-0 keeps the RoboTwin two-arm layout: our arm is in dims 0..6 and the other arm is the constant
@@ -690,8 +691,8 @@ def main():
     parser.add_argument("--semantics", type=Path,
                         help="Use this local declaration of what the values mean instead of the deployment's")
     parser.add_argument("--camera-map", type=parse_camera_map,
-                        help="For a declared deployment: the rig camera (top, left, right) for each image input, "
-                             "e.g. images.wrist=left,images.left=top,images.right=right")
+                        help="Override how a declared deployment's image inputs map to rig cameras (top, left, "
+                             "right), e.g. images.wrist=left,images.left=top; by default they map by name")
     target, rollout_args = parser.parse_known_args()
     if not math.isfinite(target.soak_hours) or target.soak_hours < 0:
         parser.error("--soak-hours must be finite and nonnegative")
@@ -704,9 +705,6 @@ def main():
         client._http.close()
     # The deployment's own declaration decides first; the family tables cover undeclared deployments.
     family = DECLARED_FAMILY if declares_tool_poses(semantics) else policy_family(model_id)
-    if family == DECLARED_FAMILY and not target.camera_map:
-        parser.error("this deployment declares tool poses; say which rig camera feeds each image input with "
-                     "--camera-map")
     if family is None:
         if target.soak_hours > 0 or target.probe:
             family = "generic"
@@ -757,8 +755,6 @@ def main():
     args.deployment = target.deployment
     args.soak_hours = target.soak_hours
     args.policy_family = family
-    if args.instruction is None and family == DECLARED_FAMILY:
-        settings.error("a declared deployment needs the instruction it was trained with: pass --instruction")
     if args.instruction is None:
         args.instruction = (HOLESAW_INSTRUCTION if family in HOLESAW_FINE_TUNED_FAMILIES
                             else OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
