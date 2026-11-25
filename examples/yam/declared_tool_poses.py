@@ -178,6 +178,13 @@ class DeclaredToolPoses:
         self.tool_frame = semantics["tools"][self.tool]
         self.kinematics = tool_kinematics(self.tool_frame, descriptions=descriptions, joint_names=joint_names,
                                           max_joint_step_rad=max_joint_step_rad)
+        rate = semantics.get("control_rate_hz")
+        if not isinstance(rate, (int, float)) or isinstance(rate, bool) or rate <= 0:
+            raise ValueError("the declaration needs the control_rate_hz its rows were trained at")
+        #: Declared facts the rollout loop follows: the rate one row was trained at, and the extra inputs.
+        self.control_rate_hz = float(rate)
+        self.episode_time = semantics.get("episode_time") is True
+        self.frame_stream = semantics.get("frame_stream") is True
         self.robot_gripper = tuple(float(v) for v in robot_gripper)
         self.gripper_tolerance = float(gripper_tolerance)
         self.horizon = int(action_shape[0])
@@ -232,13 +239,14 @@ class DeclaredToolPoses:
         rows = self.kinematics.committed(joint_states, matrix_policy=False)  # position, rotation rows 0-1, gripper
         return rows[:, :3].astype(np.float64), decode_rotations(rows[:, 3:9], "matrix_rows")
 
-    def state(self, joint_state):
+    # rollout_loop passes ``matrix_policy`` to every pose converter; a declaration needs no such flag.
+    def state(self, joint_state, *, matrix_policy=False):
         """The model's state for this rig's measured ``[joint1..6, gripper]``."""
         joint_state = np.asarray(joint_state, dtype=np.float64)
         positions, rotations = self._poses(joint_state[None])
         return self._rows(self.state_segments, positions, rotations, joint_state[None, 6])[0]
 
-    def actions(self, rows, joint_state):
+    def actions(self, rows, joint_state, *, matrix_policy=False):
         """Joint targets and gripper ``(<= K, 7)`` for the model's rows, solved from the measured joints.
 
         The chunk ends before the first pose out of reach or of the joint step bound; a first row out of
@@ -265,7 +273,7 @@ class DeclaredToolPoses:
                 canonical[:, 9] = self._to_robot_aperture(values[:, 0], segment)
         return self.kinematics.actions(canonical, joint_state, matrix_policy=False)
 
-    def committed(self, joint_targets):
+    def committed(self, joint_targets, *, matrix_policy=False):
         """Queued joint commands ``(k, 7)`` as the model's own rows: their tool poses and grippers."""
         joint_targets = np.asarray(joint_targets, dtype=np.float64)
         positions, rotations = self._poses(joint_targets)

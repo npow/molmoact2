@@ -22,6 +22,11 @@ from orchestral_session_bridge import (
 )
 from tool_pose_actions import QuatToolPoseActions, UnreachableToolPose
 
+# A control plane whose models declare no semantics, so the rollout falls back to the family tables.
+UNDECLARED_HTTP = SimpleNamespace(
+    get=lambda path, params=None: SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"models": []}),
+    close=lambda: None)
+
 YAM = Path(__file__).resolve().parents[1]
 URDF = YAM / "configs" / "yam_holesaw_kinematics.urdf"
 JOINTS = [f"joint{i}" for i in range(1, 7)]
@@ -331,7 +336,7 @@ def test_cli_selects_the_family_instruction_and_adapter(model, instruction, adap
     monkeypatch.setattr(sys, "argv", ["managed_rollout.py"])
     monkeypatch.setattr(managed_rollout, "Orchestral", lambda: SimpleNamespace(
         deployments=SimpleNamespace(get=lambda _: SimpleNamespace(model_id=model, checkpoint_uri="")),
-        _http=SimpleNamespace(close=lambda: None)))
+        _http=UNDECLARED_HTTP))
     monkeypatch.setattr("orchestral_session_bridge.OrchestralSessionHost", host)
     with pytest.raises(Opened):
         managed_rollout.main()
@@ -342,7 +347,7 @@ def test_cli_selects_the_family_instruction_and_adapter(model, instruction, adap
 def test_fine_tuned_families_take_no_noise_seed(model, monkeypatch, capsys):
     monkeypatch.setattr(managed_rollout, "Orchestral", lambda: SimpleNamespace(
         deployments=SimpleNamespace(get=lambda _: SimpleNamespace(model_id=model)),
-        _http=SimpleNamespace(close=lambda: None)))
+        _http=UNDECLARED_HTTP))
     monkeypatch.setattr(sys, "argv", ["managed_rollout.py", "--noise-seed", "0"])
     with pytest.raises(SystemExit):
         managed_rollout.main()
@@ -423,7 +428,7 @@ def test_pi05_runs_through_real_time_chunking(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["managed_rollout.py"])
     monkeypatch.setattr(managed_rollout, "Orchestral", lambda: SimpleNamespace(
         deployments=SimpleNamespace(get=lambda _: SimpleNamespace(model_id="pi05")),
-        _http=SimpleNamespace(close=lambda: None)))
+        _http=UNDECLARED_HTTP))
     started = []
     monkeypatch.setattr(managed_rollout.runpy, "run_path", lambda path, **kw: started.append(path))
     managed_rollout.main()
@@ -433,7 +438,7 @@ def test_pi05_runs_through_real_time_chunking(monkeypatch):
 def _cli(model, monkeypatch):
     monkeypatch.setattr(managed_rollout, "Orchestral", lambda: SimpleNamespace(
         deployments=SimpleNamespace(get=lambda _: SimpleNamespace(model_id=model, checkpoint_uri="")),
-        _http=SimpleNamespace(close=lambda: None)))
+        _http=UNDECLARED_HTTP))
 
 
 def test_there_is_no_opt_out_for_the_other_families(monkeypatch, capsys):

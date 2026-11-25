@@ -82,3 +82,94 @@ def test_rotation_encodings(encoding, turn):
     rz = np.array([[[0.0, -1, 0], [1, 0, 0], [0, 0, 1]]])
     np.testing.assert_allclose(encode_rotations(rz, encoding)[0], turn, atol=1e-12)
     np.testing.assert_allclose(decode_rotations(np.array([turn]), encoding), rz, atol=1e-12)
+
+
+# --- The rollout follows a deployment's own declaration, with no family entry ------------------------------
+
+class _Opened(Exception):
+    pass
+
+
+def _cli(monkeypatch, captured, *argv, semantics=FLUX_EE50):
+    """Run managed_rollout's command line against a control plane whose model declares `semantics`."""
+    import sys
+    from types import SimpleNamespace
+
+    import managed_rollout
+
+    def host(**kwargs):
+        captured.update(kwargs)
+        raise _Opened
+
+    models = {"models": [{"name": "models/holesaw-ee50", "ioSpec": {"stateDim": 7, "semantics": semantics}}]}
+    reply = SimpleNamespace(raise_for_status=lambda: None, json=lambda: models)
+    monkeypatch.chdir(CONFIGS.parents[2])
+    monkeypatch.setattr(sys, "argv", ["managed_rollout.py", *argv])
+    monkeypatch.setattr(managed_rollout, "Orchestral", lambda: SimpleNamespace(
+        deployments=SimpleNamespace(get=lambda _: SimpleNamespace(model_id="holesaw-ee50", checkpoint_uri="")),
+        _http=SimpleNamespace(get=lambda path, params=None: reply, close=lambda: None)))
+    monkeypatch.setattr("orchestral_session_bridge.OrchestralSessionHost", host)
+    managed_rollout.main()
+
+
+def test_a_deployment_declaring_tool_poses_takes_the_declared_path_without_a_family(monkeypatch):
+    from orchestral_session_bridge import DECLARED_ADAPTER
+
+    captured = {}
+    cameras = "images.wrist=left,images.left=top,images.right=right"
+    with pytest.raises(_Opened):
+        _cli(monkeypatch, captured, "--camera-map", cameras, "--instruction", "pick")
+    assert captured["policy_adapter"] == DECLARED_ADAPTER
+    assert captured["camera_map"] == {"images.wrist": "left", "images.left": "top", "images.right": "right"}
+
+
+@pytest.mark.parametrize("argv, message", [
+    ((), "--camera-map"), (("--camera-map", "images.wrist=left"), "--instruction")])
+def test_a_declared_deployment_needs_the_rig_camera_map_and_its_instruction(argv, message, monkeypatch, capsys):
+    with pytest.raises(SystemExit):
+        _cli(monkeypatch, {}, *argv)
+    assert message in capsys.readouterr().err
+
+
+def test_the_rollout_takes_its_rate_and_converter_from_the_declaration(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import managed_rollout
+
+    class Saved(Exception):
+        pass
+
+    saved = {}
+
+    def record(path, settings):
+        saved.update(settings)
+        raise Saved
+
+    monkeypatch.chdir(CONFIGS.parents[2])
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    monkeypatch.setattr(managed_rollout, "record_settings", record)
+    args = SimpleNamespace(policy_family=managed_rollout.DECLARED_FAMILY, control_hz=None, prefetch_lead_steps=None,
+                           plan_rows=None, chunk_fusion="splice", fusion_rows=4, shadow=False, instruction="pick",
+                           rrd=tmp_path / "run.rrd", deployment="d", seconds=30, noise_seed=None,
+                           committed_actions=False, declared=_poses())
+    identity = dict(state_dim=7, action_dim=10, action_horizon=32, camera_mapping={"top": "images.left"})
+    with pytest.raises(Saved):
+        managed_rollout.rollout_joint_policy(None, identity, args)
+    assert (saved["control_hz"], saved["plan_rows"], saved["prefetch_lead_steps"]) == (30, 32, 18)
+    assert saved["committed_actions"] is False
+
+
+def test_the_bridge_maps_cameras_from_the_rig_and_takes_the_declared_shapes():
+    from orchestral import IOSpec
+    from orchestral_session_bridge import DECLARED_ADAPTER, OrchestralBridgeError, OrchestralSessionHost
+
+    spec = IOSpec(cameras={name: (360, 640) for name in ("images.wrist", "images.left", "images.right")},
+                  state_dim=7, action_shape=(32, 10))
+    cameras = {"images.wrist": "left", "images.left": "top", "images.right": "right"}
+    host = OrchestralSessionHost(deployment_id="m", policy_adapter=DECLARED_ADAPTER, camera_map=cameras)
+    host._configure(spec)
+    assert host.identity["camera_mapping"] == {"left": "images.wrist", "top": "images.left", "right": "images.right"}
+    assert (host.identity["state_dim"], host.identity["action_dim"]) == (7, 10)
+    with pytest.raises(OrchestralBridgeError, match="its own rig camera"):
+        OrchestralSessionHost(deployment_id="m", policy_adapter=DECLARED_ADAPTER,
+                              camera_map={**cameras, "images.right": "left"})._configure(spec)

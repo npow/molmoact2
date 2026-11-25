@@ -30,6 +30,9 @@ ACTION_HORIZON = 30
 ACTION_SPACE = "joint_position"
 TOOL_POSE_ADAPTER = "tool_pose_rot6d"
 TOOL_POSE_MATRIX_ADAPTER = "tool_pose_matrix"
+#: Values converted from the deployment's declared semantics (declared_tool_poses.py): the contract's shapes
+#: are taken as declared and the rig names which physical camera feeds each image input.
+DECLARED_ADAPTER = "declared_semantics"
 #: Rho: absolute end-effector rows [x y z qx qy qz qw gripper] (xyzw quaternion, gripper 1 = open).
 TOOL_POSE_QUAT_ADAPTER = "tool_pose_quat"
 #: One YAM arm in a 14-value two-arm layout (left arm in 0..6, right arm parked by the rollout).
@@ -489,17 +492,21 @@ class OrchestralSessionHost:
     """One Orchestral prediction session for the entire evaluation."""
 
     def __init__(self, *, deployment_id: str, instruction=None, observation_encoding="h264",
-                 policy_adapter="identity", allow_camera_subset=False):
+                 policy_adapter="identity", allow_camera_subset=False, camera_map=None):
         if not deployment_id:
             raise OrchestralBridgeError("a managed Orchestral deployment id is required")
         if observation_encoding not in OBSERVATION_ENCODINGS:
             raise OrchestralBridgeError(f"unsupported observation encoding: {observation_encoding!r}")
         if policy_adapter not in {"identity", "pi05_yam_red_cap", TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER,
                                    TEMPORAL_JOINT_ADAPTER, GR00T_YAM_ADAPTER, PRAXIS_HOLESAW_BIMANUAL,
-                                   TOOL_POSE_QUAT_ADAPTER, SINGLE_ARM_IN_14}:
+                                   TOOL_POSE_QUAT_ADAPTER, SINGLE_ARM_IN_14, DECLARED_ADAPTER}:
             raise OrchestralBridgeError(f"unsupported policy_adapter: {policy_adapter!r}")
+        if (policy_adapter == DECLARED_ADAPTER) != bool(camera_map):
+            raise OrchestralBridgeError("a declared-semantics deployment needs a camera map, and only it takes one")
         self.policy_adapter = policy_adapter
         self.allow_camera_subset = allow_camera_subset
+        #: Rig camera role ("top", "left", "right") for each image input name of the deployment.
+        self.camera_map = dict(camera_map or {})
         self.deployment_id = deployment_id
         self.instruction = instruction
         self.observation_encoding = observation_encoding
@@ -596,6 +603,18 @@ class OrchestralSessionHost:
         )
         if getattr(spec, "modalities", {}):
             raise OrchestralBridgeError("YAM cannot supply additional deployment modalities")
+        if self.policy_adapter == DECLARED_ADAPTER:
+            roles = set(CAMERA_KEYS)
+            if set(self.camera_map) != set(spec.cameras) or not set(self.camera_map.values()) <= roles \
+                    or len(set(self.camera_map.values())) != len(self.camera_map):
+                raise OrchestralBridgeError(
+                    f"the camera map must give each image input {sorted(spec.cameras)} its own rig camera "
+                    f"from {sorted(roles)}; got {self.camera_map}")
+            self._camera_names = {role: name for name, role in self.camera_map.items()}
+            horizon, width = spec.action_shape
+            self.identity.update(camera_mapping=self._camera_names, state_dim=spec.state_dim, action_dim=width,
+                                 action_horizon=horizon, policy_adapter=self.policy_adapter)
+            return
         geometry = _checkpoint_geometry(
             contract, self.policy_adapter, allow_camera_subset=self.allow_camera_subset,
         )
@@ -773,7 +792,7 @@ class OrchestralSessionHost:
         actions = self.robot_actions(actions, query_state)
         timings = asdict(result.timings)
         return {"actions": actions.tolist(), "horizon": len(actions),
-                "action_space": self.policy_adapter if self.policy_adapter in {TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER, PRAXIS_HOLESAW_BIMANUAL, TOOL_POSE_QUAT_ADAPTER} else ACTION_SPACE,
+                "action_space": self.policy_adapter if self.policy_adapter in {TOOL_POSE_ADAPTER, TOOL_POSE_MATRIX_ADAPTER, PRAXIS_HOLESAW_BIMANUAL, TOOL_POSE_QUAT_ADAPTER, DECLARED_ADAPTER} else ACTION_SPACE,
                 "telemetry": {**timings, "server_infer_ms": result.timings.accel_exec_us / 1000,
                               "trace_id": result.trace_id or getattr(self._session, "last_predict_trace_id", ""),
                               "request_bytes": transport.get("client_transaction", {}).get("request_bytes"),

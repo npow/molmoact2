@@ -8,6 +8,11 @@ import pytest
 import managed_rollout
 import rtc_rollout
 
+# A control plane whose models declare no semantics, so the rollout falls back to the family tables.
+UNDECLARED_HTTP = SimpleNamespace(
+    get=lambda path, params=None: SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"models": []}),
+    close=lambda: None)
+
 
 @pytest.mark.parametrize("family", ["pi05", "flux3-action", "longwam"])
 def test_seeded_probe_checks_both_prediction_paths(family):
@@ -93,7 +98,7 @@ def test_managed_cli_rejects_noise_seed_before_opening_session(family, monkeypat
         "Orchestral",
         lambda: SimpleNamespace(
             deployments=SimpleNamespace(get=lambda _: SimpleNamespace(model_id=family)),
-            _http=SimpleNamespace(close=lambda: None),
+            _http=UNDECLARED_HTTP,
         ),
     )
     with pytest.raises(SystemExit) as error:
@@ -109,7 +114,7 @@ def test_managed_pi_dispatch_forwards_parsed_seed(monkeypatch):
         "Orchestral",
         lambda: SimpleNamespace(
             deployments=SimpleNamespace(get=lambda _: SimpleNamespace(model_id="pi05")),
-            _http=SimpleNamespace(close=lambda: None),
+            _http=UNDECLARED_HTTP,
         ),
     )
     dispatched_args = []

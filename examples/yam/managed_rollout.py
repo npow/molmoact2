@@ -96,6 +96,47 @@ def policy_family(model_id):
     return None
 
 
+#: The family of a deployment whose own declaration (Orchestral io_spec.semantics) says its values are tool
+#: poses; it needs no entry in the family tables. The YAM arm's joints, as the declared kinematics name them.
+DECLARED_FAMILY = "declared"
+YAM_JOINTS = [f"joint{i}" for i in range(1, 7)]
+
+
+def declared_semantics(client, model_id, path=None):
+    """What the deployment's values mean: a local declaration file if given (logged), else its model's own.
+
+    The control plane returns a model's io_spec with its declared semantics; a model without one returns
+    None, and the rollout falls back to the family tables.
+    """
+    if path is not None:
+        print(f"[semantics] Using the local declaration {path} instead of the deployment's.", flush=True)
+        return json.loads(Path(path).read_text())
+    page = None
+    while True:
+        reply = client._http.get("/v1alpha1/models", params={"pageSize": 200, **({"pageToken": page} if page else {})})
+        reply.raise_for_status()
+        body = reply.json()
+        for model in body.get("models", []):
+            if model.get("name") == f"models/{model_id}":
+                return (model.get("ioSpec") or {}).get("semantics")
+        page = body.get("nextPageToken")
+        if not page:
+            return None
+
+
+def declares_tool_poses(semantics):
+    return isinstance(semantics, dict) and any(
+        segment.get("kind") in ("tool_position", "tool_rotation") for segment in semantics.get("action", ()))
+
+
+def parse_camera_map(text):
+    """``input=role,...``: which rig camera (top, left, right) feeds each of the deployment's image inputs."""
+    pairs = [item.split("=", 1) for item in text.split(",") if item]
+    if any(len(pair) != 2 for pair in pairs):
+        raise argparse.ArgumentTypeError("use input=role pairs, e.g. images.wrist=left,images.left=top")
+    return {name.strip(): role.strip() for name, role in pairs}
+
+
 def placeholder_state(family, dimension):
     if family == "praxis1":
         if dimension == 16:
@@ -142,11 +183,15 @@ def require_committed_actions(host, family):
 
 
 def committed_enabled(family, args):
-    """Committed actions are on unless the family is a temporary exception and the user did not opt in."""
+    """Committed actions are on unless the family is a temporary exception and the user did not opt in.
+
+    A declared deployment uses them when its Worker supports them (set once the session is open)."""
+    if family == DECLARED_FAMILY:
+        return bool(getattr(args, "committed_actions", False))
     return family not in COMMITTED_ACTIONS_DEFAULT_OFF or bool(getattr(args, "committed_actions", False))
 
 
-def probe(host, family, instruction, *, committed_actions=True, noise_seed=None):
+def probe(host, family, instruction, *, committed_actions=True, noise_seed=None, state=None):
     if committed_actions:
         require_committed_actions(host, family)
     if family == "pi05":
@@ -156,7 +201,7 @@ def probe(host, family, instruction, *, committed_actions=True, noise_seed=None)
     if family == "longwam" and not getattr(host.session, "supports_observe", False):
         raise SystemExit("Long-WAM requires a Worker and SDK that support observation-only requests.")
 
-    state = placeholder_state(family, host.identity["state_dim"])
+    state = placeholder_state(family, host.identity["state_dim"]) if state is None else state
     camera_mapping = host.identity["camera_mapping"]
     spec = host.session.grant.io_spec
     cameras = {name: np.zeros((*shape, 3), np.uint8) for name, shape in spec.cameras.items()}
@@ -219,11 +264,16 @@ def rollout_joint_policy(host, identity, args):
     checked_shape = (identity["action_horizon"], identity["action_dim"])
     bimanual_layout = family in PARKED_RIGHT_ARM_FAMILIES and (identity["state_dim"], checked_shape[1]) == (14, 14)
     praxis_bimanual = family == "praxis1" and identity["state_dim"] == 16
+    declared = getattr(args, "declared", None)  # DeclaredToolPoses when the deployment declares tool poses
     state_width, action_width = {"praxis1": (16, 26) if praxis_bimanual else (8, 13), "verne": (7, 10), "rho": (8, 8),
                                          "aw0": (14, 14)}.get(
         family, (14, 14) if bimanual_layout else (7, 7))
+    if declared is not None:  # the declaration was checked against these shapes when it was read
+        state_width, action_width = identity["state_dim"], checked_shape[1]
     if identity["state_dim"] != state_width or checked_shape[1] != action_width or checked_shape[0] <= 0:
         raise SystemExit(f"Unexpected {family} contract for YAM: {checked_shape}")
+    if args.control_hz is None and declared is not None:
+        args.control_hz = declared.control_rate_hz
     if args.control_hz is None:
         args.control_hz = (ISAAC_BIMANUAL_CONTROL_HZ if bimanual_layout and family == "isaac05"
                            else 30 if family in CONTROL_HZ_30_FAMILIES else 15)
@@ -241,6 +291,9 @@ def rollout_joint_policy(host, identity, args):
         # and brings observation-to-command from about 620 ms to about 340 ms.
         default_lead = {"verne": 1, "flux3-action": 4, "longwam": 16,
                         "rho": 16, "aw0": 6, "dw05": 4, "praxis1": 4}.get(family, 8)
+        if declared is not None:
+            # About 0.6 s of queued rows covers one chunk on one GPU; a knob, set it with --prefetch-lead-steps.
+            default_lead = math.ceil(0.6 * args.control_hz)
         lead_steps = min(default_lead, plan_rows - 1)
     if lead_steps >= plan_rows:
         raise SystemExit(f"--prefetch-lead-steps must be below the rollout plan length ({plan_rows})")
@@ -254,7 +307,7 @@ def rollout_joint_policy(host, identity, args):
         from temporal_joint_history import TemporalJointHistory
 
         temporal_history = TemporalJointHistory(identity["history_rows"])
-    pose_actions = None
+    pose_actions = declared
     if family in {"praxis1", "verne", "rho"}:
         from tool_pose_actions import HolesawBimanualActions, QuatToolPoseActions, ToolPoseActions
 
@@ -351,14 +404,16 @@ def rollout_joint_policy(host, identity, args):
                         action_shape=checked_shape,
                         model_label=family, pose_actions=pose_actions, matrix_policy=family == "praxis1",
                         # Isaac is conditioned on time since the episode began.
-                        timestamp_observations=family in {"verne", "isaac05"}, max_plan_rows=plan_rows,
+                        timestamp_observations=(declared.episode_time if declared is not None
+                                                else family in {"verne", "isaac05"}), max_plan_rows=plan_rows,
                         temporal_history=temporal_history,
                         chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
                         hold_gripper_rows=HOLD_GRIPPER_ROWS.get(family, 0),
                         state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
                         trace=trace,
                         committed_actions=committed,
-                        stream_observations=family in {"longwam", "praxis1"},
+                        stream_observations=(declared.frame_stream if declared is not None
+                                             else family in {"longwam", "praxis1"}),
                         # Praxis encodes the window it is sent. With 20 or more observed frames between two predictions
                         # but fewer than a full 24, the Worker rebuilds the whole window at call time: 106-127 ms instead
                         # of 30 ms, whenever the count lands there (and on the second call of every run). 19 or fewer
@@ -623,7 +678,7 @@ def main():
     from omegaconf import OmegaConf
     from orchestral_session_bridge import (
         GR00T_YAM_ADAPTER, PRAXIS_HOLESAW_BIMANUAL, SINGLE_ARM_IN_14, TEMPORAL_JOINT_ADAPTER, TOOL_POSE_ADAPTER,
-        TOOL_POSE_MATRIX_ADAPTER, TOOL_POSE_QUAT_ADAPTER,
+        TOOL_POSE_MATRIX_ADAPTER, TOOL_POSE_QUAT_ADAPTER, DECLARED_ADAPTER,
         OrchestralSessionHost, parse_noise_seed,
     )
 
@@ -636,6 +691,11 @@ def main():
     parser.add_argument("--noise-seed", type=parse_noise_seed, help="Fixed noise seed for each prediction")
     parser.add_argument("--praxis-holesaw-bimanual", action="store_true",
                         help="Select the Holesaw grasp-site rig for a checkpoint without a known layout")
+    parser.add_argument("--semantics", type=Path,
+                        help="Use this local declaration of what the values mean instead of the deployment's")
+    parser.add_argument("--camera-map", type=parse_camera_map,
+                        help="For a declared deployment: the rig camera (top, left, right) for each image input, "
+                             "e.g. images.wrist=left,images.left=top,images.right=right")
     target, rollout_args = parser.parse_known_args()
     if not math.isfinite(target.soak_hours) or target.soak_hours < 0:
         parser.error("--soak-hours must be finite and nonnegative")
@@ -643,15 +703,20 @@ def main():
     try:
         deployment = client.deployments.get(target.deployment)
         model_id = deployment.model_id
+        semantics = declared_semantics(client, model_id, target.semantics)
     finally:
         client._http.close()
-    family = policy_family(model_id)
+    # The deployment's own declaration decides first; the family tables cover undeclared deployments.
+    family = DECLARED_FAMILY if declares_tool_poses(semantics) else policy_family(model_id)
+    if family == DECLARED_FAMILY and not target.camera_map:
+        parser.error("this deployment declares tool poses; say which rig camera feeds each image input with "
+                     "--camera-map")
     if family is None:
         if target.soak_hours > 0 or target.probe:
             family = "generic"
         else:
             parser.error(f"{target.deployment} has no YAM joint-rollout adapter for model {model_id!r}")
-    if target.noise_seed is not None and family not in NOISE_SEED_FAMILIES:
+    if target.noise_seed is not None and family not in NOISE_SEED_FAMILIES | {DECLARED_FAMILY}:
         parser.error(f"{family} does not support --noise-seed")
     if target.praxis_holesaw_bimanual and family != "praxis1":
         parser.error("--praxis-holesaw-bimanual requires a Praxis-1 checkpoint")
@@ -696,6 +761,8 @@ def main():
     args.deployment = target.deployment
     args.soak_hours = target.soak_hours
     args.policy_family = family
+    if args.instruction is None and family == DECLARED_FAMILY:
+        settings.error("a declared deployment needs the instruction it was trained with: pass --instruction")
     if args.instruction is None:
         args.instruction = (HOLESAW_INSTRUCTION if family in HOLESAW_FINE_TUNED_FAMILIES
                             else OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
@@ -736,16 +803,31 @@ def main():
         "rho": TOOL_POSE_QUAT_ADAPTER,
         "aw0": SINGLE_ARM_IN_14,
         "pi05": "pi05_yam_red_cap" if target.soak_hours <= 0 else "identity",
+        DECLARED_FAMILY: DECLARED_ADAPTER,
     }.get(family, "identity")
     host = OrchestralSessionHost(
         deployment_id=target.deployment, instruction=args.instruction, policy_adapter=adapter,
         allow_camera_subset=family != "pi05" or target.soak_hours > 0,
+        camera_map=target.camera_map if family == DECLARED_FAMILY else None,
     )
     try:
         identity = host.open()
+        probe_state = None
+        if family == DECLARED_FAMILY:
+            from declared_tool_poses import DeclaredToolPoses
+
+            args.declared = DeclaredToolPoses(
+                semantics, state_dim=identity["state_dim"],
+                action_shape=(identity["action_horizon"], identity["action_dim"]),
+                descriptions=[Path(__file__).with_name("configs")], joint_names=YAM_JOINTS, max_joint_step_rad=0.12)
+            # Committed actions are a Worker capability: used when the deployment's Worker supports them.
+            args.committed_actions = host.supports_committed_actions()
+            if args.committed_actions and args.chunk_fusion != "splice":
+                settings.error("this Worker takes committed actions, which need --chunk-fusion splice")
+            probe_state = args.declared.state(np.r_[np.zeros(6), 0.5])
         if target.soak_hours <= 0:
             probe(host, family, args.instruction, committed_actions=args.committed_actions,
-                  noise_seed=args.noise_seed)
+                  noise_seed=args.noise_seed, state=probe_state)
         if not target.probe:
             if args.soak_hours > 0:
                 soak_endpoint(host, identity, args)
