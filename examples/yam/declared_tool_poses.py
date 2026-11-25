@@ -106,11 +106,14 @@ def _description(digest, descriptions):
     raise ValueError(f"no robot description with sha256 {digest} among {[str(p) for p in candidates]}")
 
 
-def tool_kinematics(frame, *, descriptions, joint_names, max_joint_step_rad):
+def tool_kinematics(frame, *, descriptions, joint_names, max_joint_step_rad, first_row_max_step_rad=None,
+                    joint_limit_margin_rad=0.0):
     """``ToolPoseActions`` whose tool body is exactly the declared tool frame.
 
     The description must be byte-identical to the declared one. Its visual and collision geometry is
     dropped (kinematics only), and the tool frame is added as a link fixed to ``link`` at ``xyz``/``rpy``.
+    ``joint_limit_margin_rad`` widens each driven joint's limits; recorded commands go slightly past them.
+    ``first_row_max_step_rad`` lets row 0 lead the measured joints by more than later rows step.
     """
     from tool_pose_actions import ToolPoseActions
 
@@ -121,6 +124,11 @@ def tool_kinematics(frame, *, descriptions, joint_names, max_joint_step_rad):
     for link in root.iter("link"):
         for geometry in [*link.findall("visual"), *link.findall("collision")]:
             link.remove(geometry)
+    for joint in root.iter("joint"):
+        limit = joint.find("limit")
+        if joint.get("name") in joint_names and limit is not None and joint_limit_margin_rad:
+            for bound, sign in (("lower", -1), ("upper", 1)):
+                limit.set(bound, repr(float(limit.get(bound)) + sign * joint_limit_margin_rad))
     ET.SubElement(root, "link", name=_TOOL_BODY)
     joint = ET.SubElement(root, "joint", name=f"{frame['link']}_to_{_TOOL_BODY}", type="fixed")
     ET.SubElement(joint, "parent", link=frame["link"])
@@ -130,8 +138,10 @@ def tool_kinematics(frame, *, descriptions, joint_names, max_joint_step_rad):
     with tempfile.NamedTemporaryFile("wb", suffix=".urdf", delete=False) as file:
         file.write(ET.tostring(root))
     try:
-        return ToolPoseActions(model_path=file.name, base_body=frame["base_link"], tool_body=_TOOL_BODY,
-                               joint_names=joint_names, max_joint_step_rad=max_joint_step_rad)
+        kinematics = ToolPoseActions(model_path=file.name, base_body=frame["base_link"], tool_body=_TOOL_BODY,
+                                     joint_names=joint_names, max_joint_step_rad=max_joint_step_rad)
+        kinematics.first_row_max_step_rad = first_row_max_step_rad
+        return kinematics
     finally:
         Path(file.name).unlink()
 
@@ -146,7 +156,8 @@ class DeclaredToolPoses:
     """
 
     def __init__(self, semantics, *, state_dim, action_shape, descriptions, joint_names, max_joint_step_rad,
-                 group=None, robot_gripper=(1.0, 0.0), gripper_tolerance=0.0):
+                 first_row_max_step_rad=None, joint_limit_margin_rad=0.0, group=None, robot_gripper=(1.0, 0.0),
+                 gripper_tolerance=0.0):
         if not isinstance(semantics, dict):
             raise ValueError("this deployment declares no semantics; tool poses cannot be converted without them")
         self.state_segments = self._segments(semantics, "state", state_dim)
@@ -177,7 +188,9 @@ class DeclaredToolPoses:
         self.tool = next(iter(tools))
         self.tool_frame = semantics["tools"][self.tool]
         self.kinematics = tool_kinematics(self.tool_frame, descriptions=descriptions, joint_names=joint_names,
-                                          max_joint_step_rad=max_joint_step_rad)
+                                          max_joint_step_rad=max_joint_step_rad,
+                                          first_row_max_step_rad=first_row_max_step_rad,
+                                          joint_limit_margin_rad=joint_limit_margin_rad)
         rate = semantics.get("control_rate_hz")
         if not isinstance(rate, (int, float)) or isinstance(rate, bool) or rate <= 0:
             raise ValueError("the declaration needs the control_rate_hz its rows were trained at")

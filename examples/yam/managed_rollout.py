@@ -811,7 +811,11 @@ def main():
             args.declared = DeclaredToolPoses(
                 semantics, state_dim=identity["state_dim"],
                 action_shape=(identity["action_horizon"], identity["action_dim"]),
-                descriptions=[Path(__file__).with_name("configs")], joint_names=YAM_JOINTS, max_joint_step_rad=0.12)
+                descriptions=[Path(__file__).with_name("configs")], joint_names=YAM_JOINTS, max_joint_step_rad=0.12,
+                # A chunk's first row leads the measured joints (the recorded commands do, by up to ~0.4 rad), and
+                # recorded commands go slightly past the URDF limits; without both, IK refused a third of
+                # the recording's own trajectories at row 0. The executor's per-tick cap still bounds the motion.
+                first_row_max_step_rad=0.5, joint_limit_margin_rad=0.05)
             # Committed actions are a Worker capability: used when the deployment's Worker supports them.
             args.committed_actions = host.supports_committed_actions()
             if args.committed_actions and args.chunk_fusion != "splice":
