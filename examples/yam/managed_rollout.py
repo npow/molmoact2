@@ -164,6 +164,8 @@ def committed_contract(family, identity):
         "aw0": "absolute 14-value joint rows: this arm in 0..6 and the parked right arm [0,0,0,0,0,0,1] in 7..13",
         "praxis1": "absolute tool-pose rows in the layout the Worker returns",
         "verne": "absolute tool-pose rows in the layout the Worker returns",
+        "declared": "rows in the layout its semantics declare (for tool poses, the queued commands as forward "
+                    "kinematics of the declared tool frame)",
     }.get(family, "absolute rows in the same space and width as the returned actions")
     return (f"a committed_actions input of shape (k, {width}), 1 <= k < {horizon}, holding {space}, "
             f"and a returned chunk whose first k rows equal it exactly")
@@ -182,7 +184,7 @@ def require_committed_actions(host, family):
 def committed_enabled(family, args):
     """Committed actions are on unless the family is a temporary exception and the user did not opt in.
 
-    A declared deployment uses them when its Worker supports them (set once the session is open)."""
+    A declared deployment always uses them (set once the session is open)."""
     if family == DECLARED_FAMILY:
         return bool(getattr(args, "committed_actions", False))
     return family not in COMMITTED_ACTIONS_DEFAULT_OFF or bool(getattr(args, "committed_actions", False))
@@ -816,10 +818,10 @@ def main():
                 # recorded commands go slightly past the URDF limits; without both, IK refused a third of
                 # the recording's own trajectories at row 0. The executor's per-tick cap still bounds the motion.
                 first_row_max_step_rad=0.5, joint_limit_margin_rad=0.05)
-            # Committed actions are a Worker capability: used when the deployment's Worker supports them.
-            args.committed_actions = host.supports_committed_actions()
-            if args.committed_actions and args.chunk_fusion != "splice":
-                settings.error("this Worker takes committed actions, which need --chunk-fusion splice")
+            # Committed actions are mandatory, as for every family: probe() refuses a Worker without them.
+            args.committed_actions = True
+            if args.chunk_fusion != "splice":
+                settings.error("committed actions need --chunk-fusion splice")
             probe_state = args.declared.state(np.r_[np.zeros(6), 0.5])
         if target.soak_hours <= 0:
             probe(host, family, args.instruction, committed_actions=args.committed_actions,

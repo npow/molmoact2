@@ -174,3 +174,14 @@ def test_the_bridge_maps_declared_cameras_by_name_or_from_the_rig_and_takes_the_
     with pytest.raises(OrchestralBridgeError, match="its own rig camera"):
         OrchestralSessionHost(deployment_id="m", policy_adapter=DECLARED_ADAPTER,
                               camera_map={**cameras, "images.right": "left"})._configure(spec)
+
+
+def test_a_declared_worker_without_committed_actions_is_refused_before_any_motion():
+    from types import SimpleNamespace
+
+    import managed_rollout
+
+    host = SimpleNamespace(supports_committed_actions=lambda: False,
+                           identity={"model_ref": "m", "action_dim": 10, "action_horizon": 32})
+    with pytest.raises(SystemExit, match="does not support committed actions"):
+        managed_rollout.probe(host, managed_rollout.DECLARED_FAMILY, "pick", committed_actions=True)
