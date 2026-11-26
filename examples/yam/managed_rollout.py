@@ -773,7 +773,6 @@ def main():
         parser.error(f"{family} does not support --noise-seed")
     if target.praxis_holesaw_bimanual and family != "praxis1":
         parser.error("--praxis-holesaw-bimanual requires a Praxis-1 checkpoint")
-    args.praxis_holesaw_single_arm = family == "praxis1" and praxis_holesaw_single_arm(deployment.checkpoint_uri)
 
     if family == "pi05" and not target.probe and target.soak_hours <= 0:
         sys.argv = [
@@ -819,8 +818,10 @@ def main():
     args.deployment = target.deployment
     args.soak_hours = target.soak_hours
     args.policy_family = family
+    args.praxis_holesaw_single_arm = family == "praxis1" and praxis_holesaw_single_arm(deployment.checkpoint_uri)
     if args.instruction is None:
-        args.instruction = (HOLESAW_INSTRUCTION if family in HOLESAW_FINE_TUNED_FAMILIES
+        args.instruction = (HOLESAW_INSTRUCTION
+                            if family in HOLESAW_FINE_TUNED_FAMILIES or args.praxis_holesaw_single_arm
                             else OmegaConf.load(LEFT_CONFIG).storage.language_instruction)
     if args.plan_rows is not None and args.plan_rows < 1:
         settings.error("--plan-rows must be at least 1")
