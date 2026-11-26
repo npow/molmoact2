@@ -225,7 +225,7 @@ def test_rollout_traces_every_prediction_and_each_first_command(clock, mode, cap
         assert command["response_to_command_ms"] == pytest.approx(
             prediction["ik_ms"] + prediction["postprocess_ms"] + command["ready_to_accept_ms"]
             + command["accept_to_command_ms"])
-        assert command["observation_to_command_ms"] >= (
+        assert command["observation_to_command_ms"] + 1e-9 >= (
             prediction["queue_ms"] + prediction["prepare_ms"] + prediction["predict_ms"]
             + command["response_to_command_ms"])
     assert len(trace.tick_ms) == env.commands
@@ -318,3 +318,67 @@ def test_a_short_truncated_plan_finishes_before_replanning_instead_of_missing_pr
     assert "Tool IK kept 1 of 8 rows." in out
     assert "missed_boundary" not in out
     assert len(trace.commands) >= 4
+
+
+def test_nonzero_tick_work_keeps_the_configured_30hz_rate(clock):
+    class TimedEnv(_Env):
+        def __init__(self):
+            super().__init__()
+            self.command_times = []
+
+        def get_obs(self):
+            clock.now += 0.006
+            return super().get_obs()
+
+        def step_command_only(self, command, wait=False):
+            clock.now += 0.003  # 9 ms total tick_to_command_ms (< 33.3 ms period)
+            super().step_command_only(command, wait=wait)
+            self.command_times.append(clock.now)
+
+    class ZeroPredictSession(_Session):
+        def predict(self, *, state, **_kwargs):
+            chunk = np.tile(np.asarray(state, dtype=np.float32), (32, 1))
+            chunk[:, :6] += 0.01 * np.arange(32)[:, None]
+            return SimpleNamespace(actions=chunk)
+
+    import rollout_loop
+
+    env = TimedEnv()
+    pose = _PoseActions(clock)
+    pose.clock = SimpleNamespace(now=0.0)  # isolate tick-work pacing from inline predict cost
+    rollout_loop.run(env, ZeroPredictSession(clock), _Mask(), seconds=1.0, instruction="go", shadow=False,
+                     camera_bindings={"top": "front_camera_rgb"}, history_offsets=(), control_hz=30,
+                     action_shape=(32, 7), max_plan_rows=32, lead_steps=18, pose_actions=pose, model_label="declared")
+    intervals = np.diff(env.command_times[:20])
+    np.testing.assert_allclose(intervals, 1.0 / 30.0, atol=1e-6)
+
+
+def test_predict_timeout_caps_transport_timeout_and_recovers_within_failure_budget(clock, capsys):
+    from rollout_loop import checked_chunk
+
+    transport = SimpleNamespace(_timeout_s=120.0)
+    session = _Session(clock)
+    session._transport = transport
+    checked_chunk(session, {}, np.zeros(7, np.float32), "go", episode_start=True, predict_timeout=5.0)
+    assert transport._timeout_s == pytest.approx(5.0)
+
+    class FlakySession(_Session):
+        def __init__(self):
+            super().__init__(clock)
+            self.calls = 0
+
+        def predict(self, *, state, **kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                clock.now += 0.050
+                raise TimeoutError("simulated QUIC timeout")
+            return super().predict(state=state, **kwargs)
+
+    flaky = FlakySession()
+    trace = _run(clock, session=flaky, max_prediction_failures=1, predict_timeout=5.0)
+    out = capsys.readouterr().out
+    assert "Prediction 2 failed (1/1 allowed): TimeoutError: simulated QUIC timeout. Replanning." in out
+    assert len(trace.commands) >= 3
+
+    with pytest.raises(TimeoutError, match="simulated QUIC timeout"):
+        _run(clock, session=FlakySession(), max_prediction_failures=0, predict_timeout=5.0)

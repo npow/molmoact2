@@ -22,8 +22,10 @@ class ToolPoseActions:
 
     def __init__(self, *, model_path, base_body, tool_body, joint_names, max_joint_step_rad):
         import mujoco
+        from scipy.optimize import least_squares
 
         self._mj = mujoco
+        self._least_squares = least_squares
         spec = mujoco.MjSpec.from_file(str(Path(model_path).expanduser()))
         # Preserve fixed tool and base links in URDFs.
         spec.compiler.fusestatic = False
@@ -177,7 +179,6 @@ class ToolPoseActions:
         upper = np.minimum(self.upper, previous + max_step)
         if np.any(lower >= upper):
             raise UnreachableToolPose("No joint target lies within both the joint limits and step bound")
-        from scipy.optimize import least_squares
 
         position_tolerance, rotation_tolerance = self.position_tolerance, self.rotation_tolerance
 
@@ -200,7 +201,7 @@ class ToolPoseActions:
         def jacobian(q):  # analytic, instead of 6 finite-difference residuals per iteration
             return -np.vstack(self._jacobian(data, q)) * scale[:, None]
 
-        result = least_squares(residual, joints, jac=jacobian, bounds=(lower, upper), max_nfev=40)
+        result = self._least_squares(residual, joints, jac=jacobian, bounds=(lower, upper), max_nfev=40)
         if np.linalg.norm(result.fun[:3]) <= self.accept_norm and np.linalg.norm(result.fun[3:]) <= self.accept_norm:
             return result.x
         raise UnreachableToolPose("Tool target is unreachable within the configured joint limits and step bound")

@@ -325,11 +325,11 @@ def rollout_joint_policy(host, identity, args):
     mask = resolve_bimanual_execution_mask(
         bimanual=True, active_arm_side="left",
         execution_mode="shadow" if args.shadow else "active_arm_hold",
-        # Per-tick cap against encoder feedback, sized from the Holesaw demos at 15 Hz:
-        # joints reach 0.19 rad/step at p99, the gripper up to 0.67/step when closing.
-        # A tighter gripper cap stops the jaws at the object and leaves no grip force.
-        # The joint cap is a speed limit, so it shrinks with the tick when the rate rises.
-        both_arm_max_delta=([0.2 * 15 / args.control_hz] * 6 + [1.0]) * 2,
+        # Cap against live encoder feedback (target - measured), not step-to-step delta,
+        # so it does not shrink with control_hz. In the Holesaw demos leader commands lead
+        # the follower encoders by up to ~0.4 rad at p99 (matching first_row_max_step_rad=0.5);
+        # tighter bounds starve PD torque and clip committed prefixes. Gripper stays 1.0 for grip force.
+        both_arm_max_delta=([0.5] * 6 + [1.0]) * 2,
     )
     rig_cameras = {"top": "front_camera", "left": "left_camera", "right": "right_camera"}
     camera_mapping = identity["camera_mapping"]
@@ -396,40 +396,45 @@ def rollout_joint_policy(host, identity, args):
                     trace = rollout["RolloutTrace"](recording, recording_start, host.session)
                     stack.enter_context(run_recording.recording(
                         args, loop="managed", model=family, prompt=args.instruction, **settings)).attach(host.session)
-                    rollout["run"](
-                        env, host.session, mask, seconds=args.seconds, instruction=args.instruction,
-                        shadow=args.shadow, lead_steps=lead_steps,
-                        camera_bindings=bindings, history_offsets=(), control_hz=args.control_hz,
-                        action_shape=checked_shape,
-                        model_label=family, pose_actions=pose_actions, matrix_policy=family == "praxis1",
-                        # Isaac is conditioned on time since the episode began.
-                        timestamp_observations=(declared.episode_time if declared is not None
-                                                else family in {"verne", "isaac05"}), max_plan_rows=plan_rows,
-                        temporal_history=temporal_history,
-                        chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
-                        hold_gripper_rows=HOLD_GRIPPER_ROWS.get(family, 0),
-                        state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
-                        trace=trace,
-                        committed_actions=committed,
-                        stream_observations=(declared.frame_stream if declared is not None
-                                             else family in {"longwam", "praxis1"}),
-                        # Praxis encodes the window it is sent. With 20 or more observed frames between two predictions
-                        # but fewer than a full 24, the Worker rebuilds the whole window at call time: 106-127 ms instead
-                        # of 30 ms, whenever the count lands there (and on the second call of every run). 19 or fewer
-                        # takes the cold-start path (about 30 ms) every time.
-                        max_observed_rows=PRAXIS_MAX_OBSERVED_ROWS if family == "praxis1" else None,
-                        noise_seed=args.noise_seed,
-                    )
+                    try:
+                        rollout["run"](
+                            env, host.session, mask, seconds=args.seconds, instruction=args.instruction,
+                            shadow=args.shadow, lead_steps=lead_steps,
+                            camera_bindings=bindings, history_offsets=(), control_hz=args.control_hz,
+                            action_shape=checked_shape,
+                            model_label=family, pose_actions=pose_actions, matrix_policy=family == "praxis1",
+                            # Isaac is conditioned on time since the episode began.
+                            timestamp_observations=(declared.episode_time if declared is not None
+                                                    else family in {"verne", "isaac05"}), max_plan_rows=plan_rows,
+                            temporal_history=temporal_history,
+                            chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
+                            hold_gripper_rows=HOLD_GRIPPER_ROWS.get(family, 0),
+                            state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
+                            trace=trace,
+                            committed_actions=committed,
+                            stream_observations=(declared.frame_stream if declared is not None
+                                                 else family in {"longwam", "praxis1"}),
+                            # Praxis encodes the window it is sent. With 20 or more observed frames between two predictions
+                            # but fewer than a full 24, the Worker rebuilds the whole window at call time: 106-127 ms instead
+                            # of 30 ms, whenever the count lands there (and on the second call of every run). 19 or fewer
+                            # takes the cold-start path (about 30 ms) every time.
+                            max_observed_rows=PRAXIS_MAX_OBSERVED_ROWS if family == "praxis1" else None,
+                            noise_seed=args.noise_seed,
+                            predict_timeout=getattr(args, "predict_timeout", 5.0),
+                            max_prediction_failures=getattr(args, "max_prediction_failures", 0),
+                        )
+                    except KeyboardInterrupt:
+                        pass
                 finally:
                     try:
-                        # The recorder exports through the robot's native worker, so it must close first.
-                        stack.close()
+                        # Release CAN motors and stop camera callbacks before flushing/uploading recordings.
+                        env.close()
                     finally:
                         try:
-                            env.close()
-                        finally:
                             if trace is not None:
                                 trace.stop()
+                        finally:
+                            stack.close()
     finally:
         recording.disconnect()
     print(f"[rerun] Saved {', '.join(f'{name}={count}' for name, count in frame_counts.items())} frames to {output_path}",
@@ -750,6 +755,10 @@ def main():
     settings.add_argument("--fusion-rows", type=int, default=4,
                           help="Ticks over which crossfade and rail move onto a new chunk")
     settings.add_argument("--shadow", action="store_true")
+    settings.add_argument("--predict-timeout", type=float, default=5.0,
+                          help="per-request transport timeout in seconds during the live rollout (default: 5)")
+    settings.add_argument("--max-prediction-failures", type=int, default=0,
+                          help="failed predictions to hold through before one ends the rollout (default: 0)")
     settings.add_argument("--rrd", type=Path, help="Rerun output path; opt in for soak runs")
     run_recording.add_arguments(settings)
     settings.add_argument("--metrics", type=Path, help="Soak CSV path (default: yam_eval_runs/soak/gr00t_soak_<timestamp>.metrics.csv)")
@@ -765,6 +774,10 @@ def main():
     args.noise_seed = target.noise_seed
     if not math.isfinite(args.seconds) or args.seconds <= 0:
         settings.error("--seconds must be positive and finite")
+    if not math.isfinite(args.predict_timeout) or args.predict_timeout <= 0:
+        settings.error("--predict-timeout must be positive and finite")
+    if args.max_prediction_failures < 0:
+        settings.error("--max-prediction-failures must be nonnegative")
     if args.control_hz is not None and (not math.isfinite(args.control_hz) or args.control_hz < 1):
         settings.error("--control-hz must be finite and at least 1")
     if not math.isfinite(args.soak_hours) or args.soak_hours < 0:
@@ -828,7 +841,13 @@ def main():
             args.committed_actions = True
             if args.chunk_fusion != "splice":
                 settings.error("committed actions need --chunk-fusion splice")
-            probe_state = args.declared.state(np.r_[np.zeros(6), 0.5])
+            probe_joints = np.r_[np.zeros(6), 0.5]
+            probe_state = args.declared.state(probe_joints)
+            # Warm the IK Jacobian/solver path before motor startup so Prediction 1 runs at steady-state latency.
+            args.declared.actions(
+                args.declared.committed(probe_joints[None]),
+                np.array([0.01, 0.01, 0.01, -0.01, 0.01, 0.01, 0.5]),
+            )
         if target.soak_hours <= 0:
             probe(host, family, args.instruction, committed_actions=args.committed_actions,
                   noise_seed=args.noise_seed, state=probe_state)

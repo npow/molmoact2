@@ -821,6 +821,12 @@ class OrchestralSessionHost:
         client, self._client = self._client, None
         try:
             if session is not None:
+                predict_lock = getattr(session, "_predict_lock", None)
+                transport = getattr(session, "_transport", None)
+                if (predict_lock is not None and callable(getattr(predict_lock, "locked", None))
+                        and predict_lock.locked() and callable(getattr(transport, "close", None))):
+                    # Unblock an abandoned background predict() before session.close() waits on _predict_lock.
+                    transport.close()
                 session.close()
         finally:
             if client is not None:

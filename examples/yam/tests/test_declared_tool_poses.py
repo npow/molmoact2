@@ -204,3 +204,100 @@ def test_sub_stop_leader_rest_poses_project_onto_the_home_bound_without_truncati
     assert solved.shape == (32, 7)
     assert np.all(solved[:, 1] >= -0.05 - 1e-6)
     np.testing.assert_allclose(solved[-1, :6], lift[:6], atol=5e-3)
+
+
+def test_30hz_rollout_keeps_encoder_lead_unclipped_and_releases_motors_before_recorder_export(tmp_path, monkeypatch):
+    import contextlib
+    from types import SimpleNamespace
+
+    import launch_yaml_eval_molmoact
+    import managed_rollout
+    import run_recording
+
+    poses = _poses()
+    assert callable(poses.kinematics._least_squares)
+
+    events = []
+    captured_mask = {}
+
+    class FakeRecording:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def save(self, *args, **kwargs):
+            pass
+
+        def log(self, *args, **kwargs):
+            pass
+
+        def disconnect(self):
+            events.append("rerun.disconnect")
+
+    @contextlib.contextmanager
+    def fake_run_recording(*args, **kwargs):
+        try:
+            yield SimpleNamespace(attach=lambda session: events.append("recorder.attach"))
+        finally:
+            events.append("recorder.close")
+
+    def fake_build_env(args, **kwargs):
+        return (SimpleNamespace(close=lambda: events.append("env.close")),)
+
+    def fake_run(env, session, mask, **kwargs):
+        captured_mask["mask"] = mask
+        captured_mask["predict_timeout"] = kwargs.get("predict_timeout")
+        events.append("loop.interrupt")
+        raise KeyboardInterrupt
+
+    monkeypatch.chdir(CONFIGS.parents[2])
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    monkeypatch.setattr("rerun.RecordingStream", lambda *a, **kw: FakeRecording())
+    monkeypatch.setattr(launch_yaml_eval_molmoact, "_build_env", fake_build_env)
+    monkeypatch.setattr(run_recording, "recording", fake_run_recording)
+    monkeypatch.setattr(managed_rollout, "record_settings", lambda *a, **kw: None)
+    orig_run_path = managed_rollout.runpy.run_path
+    monkeypatch.setattr(
+        managed_rollout.runpy, "run_path",
+        lambda path: {**orig_run_path(path), "run": fake_run,
+                      "RolloutTrace": lambda *a, **kw: SimpleNamespace(stop=lambda: events.append("trace.stop"))},
+    )
+
+    args = SimpleNamespace(
+        policy_family=managed_rollout.DECLARED_FAMILY, control_hz=None, prefetch_lead_steps=None,
+        plan_rows=None, chunk_fusion="splice", fusion_rows=4, shadow=False, instruction="pick",
+        rrd=tmp_path / "run.rrd", deployment="d", seconds=30, noise_seed=None,
+        committed_actions=True, declared=poses,
+    )
+    identity = dict(state_dim=7, action_dim=10, action_horizon=32, camera_mapping={"top": "images.middle"})
+    host = SimpleNamespace(session=SimpleNamespace())
+    managed_rollout.rollout_joint_policy(host, identity, args)
+
+    mask = captured_mask["mask"]
+    measured = np.zeros(14, dtype=np.float32)
+    target = measured.copy()
+    target[:6] = 0.35  # typical 30 Hz Holesaw command lead over measured encoders
+    command = mask.command_target(target, measured)
+    np.testing.assert_allclose(command[:6], target[:6], atol=1e-6)
+    excessive = measured.copy()
+    excessive[0] = 0.9
+    assert mask.command_target(excessive, measured)[0] == pytest.approx(0.5)
+    assert captured_mask["predict_timeout"] == pytest.approx(5.0)
+    assert events.index("env.close") < events.index("trace.stop") < events.index("recorder.close")
+
+
+def test_host_close_aborts_transport_first_when_predict_lock_is_held():
+    from types import SimpleNamespace
+    from orchestral_session_bridge import OrchestralSessionHost
+
+    order = []
+    host = OrchestralSessionHost(deployment_id="dep")
+    host._session = SimpleNamespace(
+        _predict_lock=SimpleNamespace(locked=lambda: True),
+        _transport=SimpleNamespace(close=lambda: order.append("transport.close")),
+        close=lambda: order.append("session.close"),
+    )
+    host.close()
+    assert order == ["transport.close", "session.close"]

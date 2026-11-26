@@ -47,7 +47,8 @@ def frames_for_policy(obs, camera_shapes, camera_bindings=CAMERAS):
 def checked_chunk(session, cameras, state, instruction, *, episode_start, action_shape=ACTION_SHAPE,
                   model_label="GR00T", gripper_tolerance=None, pose_actions=None, matrix_policy=False,
                   observation_time=None, max_plan_rows=None, history_inputs=None, trace=None, prediction_id=0,
-                  state_padding=None, committed_actions=None, noise_seed=None, timings=None, observation=None):
+                  state_padding=None, committed_actions=None, noise_seed=None, timings=None, observation=None,
+                  predict_timeout=None):
     """Query the worker and return the checked joint chunk and the seconds it took.
 
     ``timings``, when given, is filled with monotonic timestamps of each stage (see
@@ -79,6 +80,10 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
         sensors["committed_actions"] = committed_actions
     if noise_seed is not None:
         sensors["noise_seed"] = noise_seed
+    if predict_timeout is not None:
+        transport = getattr(session, "_transport", None)
+        if isinstance(getattr(transport, "_timeout_s", None), (int, float)) and transport._timeout_s > predict_timeout:
+            transport._timeout_s = float(predict_timeout)
     requested = time.monotonic()
     response = session.predict(cameras=cameras, state=query_state, instruction=instruction,
                                episode_start=episode_start, **sensors, **run_recording.predict_link(observation))
@@ -339,7 +344,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         action_shape=ACTION_SHAPE, model_label="GR00T", gripper_tolerance=None, pose_actions=None, matrix_policy=False,
         timestamp_observations=False, max_plan_rows=None, temporal_history=None, trace=None,
         state_padding=None, chunk_fusion="splice", fusion_rows=4, committed_actions=False,
-        stream_observations=False, noise_seed=None, max_observed_rows=None, hold_gripper_rows=0):
+        stream_observations=False, noise_seed=None, max_observed_rows=None, hold_gripper_rows=0,
+        predict_timeout=None, max_prediction_failures=0):
     if committed_actions and (chunk_fusion != "splice" or lead_steps < 1):
         raise ValueError("Committed actions require splice and at least one prefetch lead step")
     period = 1 / control_hz
@@ -361,6 +367,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     outcomes = Counter()
     latency_spans = LatencySpans(session, model_label, shadow=shadow, chunk_fusion=chunk_fusion)
     rejected_chunks = 0
+    failed_predictions = 0
+    hold_warned_at = 0.0
     rows = predictions = handoffs = misses = holds = 0
     recorder = run_recording.current()
     tick = -1
@@ -401,66 +409,81 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 try:
                     chunk, elapsed = future.result()
                 except Exception as error:
+                    future = None
+                    failed_predictions += 1
                     if trace is not None:
                         trace.event("Prediction %d failed: %s", predictions, error)
-                    raise
-                future = None
-                call_ms.append(elapsed * 1000)
-                try:
-                    stage_rows.append(session.step_timings[-1].stages_ms())
-                except (AttributeError, IndexError, TypeError):
-                    pass
-                if len(call_ms) % 20 == 0:
-                    print(latency_line(model_label, call_ms, stage_rows), flush=True)
-                # Each command sent since the request corresponds to one row of the new
-                # plan, which starts at the observation taken for this prediction.
-                # A missed deadline invalidates a prefetched plan. Wait for a fresh
-                # observation instead of applying a plan computed before the hold.
-                missed = bool(submitted_with and request_hold_ticks)
-                first_row = None if missed or request_prefix_changed else pending.add(chunk, request_slot)
-                outcome = ("unreachable" if not len(chunk) else "missed_boundary" if missed
-                           else "prefix_changed" if request_prefix_changed
-                           else "stale" if first_row is None else "accepted")
-                # Recorded for every chunk: IK is most likely to matter in the ones that came too late.
-                prediction_stages = prediction_latency(request_timings, request_submitted_at)
-                prediction_samples.append(prediction_stages)
-                outcomes[outcome] += 1
-                latency_spans.prediction(predictions, outcome, prediction_stages)
-                recorder.chunk(predictions, outcome="accepted" if outcome == "accepted" else "dropped",
-                               reason=None if outcome == "accepted" else outcome, first_row=first_row,
-                               hold_ticks_while_waiting=request_hold_ticks, queued_rows_at_request=submitted_with,
-                               fusion=chunk_fusion)
-                if trace is not None:
-                    trace.latency(prediction_stages)
-                    if outcome == "unreachable":
-                        trace.event("Prediction %d rejected: unreachable plan", predictions)
-                    elif outcome == "missed_boundary":
-                        trace.event("Prediction %d dropped after %d hold ticks", predictions, request_hold_ticks)
-                    elif outcome == "prefix_changed":
-                        trace.event("Prediction %d dropped after the safety mask changed a committed target", predictions)
-                    elif outcome == "stale":
-                        trace.event("Prediction %d dropped: every row was stale", predictions)
-                    else:
-                        trace.event("Prediction %d accepted starting at row %d", predictions, first_row)
-                if len(chunk):
-                    rejected_chunks = 0
+                    if failed_predictions > max_prediction_failures:
+                        print(f"[{model_label.lower()}] Prediction {predictions} failed: "
+                              f"{type(error).__name__}: {error}", flush=True)
+                        raise
+                    print(f"[{model_label.lower()}] Prediction {predictions} failed "
+                          f"({failed_predictions}/{max_prediction_failures} allowed): "
+                          f"{type(error).__name__}: {error}. Replanning.", flush=True)
+                    if type(error).__name__ == "EpisodeResetRequired" and callable(getattr(session, "new_episode", None)):
+                        session.new_episode()
                 else:
-                    rejected_chunks += 1
-                    if rejected_chunks == 3:
-                        raise SystemExit(f"{model_label} returned three consecutive unreachable plans; rollout stopped")
-                if missed:
-                    misses += 1
-                    # elapsed is predict + IK only; since-request also counts time queued behind observe() calls.
-                    print(f"[{model_label.lower()}] Prefetch missed the boundary ({elapsed * 1000:.0f} ms; "
-                          f"{(time.monotonic() - submitted_at) * 1000:.0f} ms since request, requested with "
-                          f"{submitted_with} queued rows, {request_hold_ticks} hold ticks, prediction {predictions}, "
-                          f"{time.monotonic() - started_at:.1f} s into the run). Replanning.", flush=True)
-                elif first_row is not None:
-                    active_prediction = predictions
-                    loop_metrics.delivered(predictions, request_observed_at, request_submitted_at, request_captured_at)
-                    handoffs += bool(submitted_with)
-                    awaiting_command = AcceptedPrediction(predictions, request_timings, prediction_stages,
-                                                          request_observed_at, time.monotonic())
+                    future = None
+                    call_ms.append(elapsed * 1000)
+                    try:
+                        stage_rows.append(session.step_timings[-1].stages_ms())
+                    except (AttributeError, IndexError, TypeError):
+                        pass
+                    if len(call_ms) % 20 == 0:
+                        print(latency_line(model_label, call_ms, stage_rows), flush=True)
+                    # Each command sent since the request corresponds to one row of the new
+                    # plan, which starts at the observation taken for this prediction.
+                    # A missed deadline invalidates a prefetched plan. Wait for a fresh
+                    # observation instead of applying a plan computed before the hold.
+                    missed = bool(submitted_with and request_hold_ticks)
+                    first_row = None if missed or request_prefix_changed else pending.add(chunk, request_slot)
+                    outcome = ("unreachable" if not len(chunk) else "missed_boundary" if missed
+                               else "prefix_changed" if request_prefix_changed
+                               else "stale" if first_row is None else "accepted")
+                    # Recorded for every chunk: IK is most likely to matter in the ones that came too late.
+                    prediction_stages = prediction_latency(request_timings, request_submitted_at)
+                    prediction_samples.append(prediction_stages)
+                    outcomes[outcome] += 1
+                    latency_spans.prediction(predictions, outcome, prediction_stages)
+                    recorder.chunk(predictions, outcome="accepted" if outcome == "accepted" else "dropped",
+                                   reason=None if outcome == "accepted" else outcome, first_row=first_row,
+                                   hold_ticks_while_waiting=request_hold_ticks, queued_rows_at_request=submitted_with,
+                                   fusion=chunk_fusion)
+                    if trace is not None:
+                        trace.latency(prediction_stages)
+                        if outcome == "unreachable":
+                            trace.event("Prediction %d rejected: unreachable plan", predictions)
+                        elif outcome == "missed_boundary":
+                            trace.event("Prediction %d dropped after %d hold ticks", predictions, request_hold_ticks)
+                        elif outcome == "prefix_changed":
+                            trace.event("Prediction %d dropped after the safety mask changed a committed target", predictions)
+                        elif outcome == "stale":
+                            trace.event("Prediction %d dropped: every row was stale", predictions)
+                        else:
+                            trace.event("Prediction %d accepted starting at row %d", predictions, first_row)
+                    if len(chunk):
+                        rejected_chunks = 0
+                    else:
+                        rejected_chunks += 1
+                        if rejected_chunks == 3:
+                            raise SystemExit(f"{model_label} returned three consecutive unreachable plans; rollout stopped")
+                    if missed:
+                        misses += 1
+                        # elapsed is predict + IK only; since-request also counts time queued behind observe() calls.
+                        print(f"[{model_label.lower()}] Prefetch missed the boundary ({elapsed * 1000:.0f} ms; "
+                              f"{(time.monotonic() - submitted_at) * 1000:.0f} ms since request, requested with "
+                              f"{submitted_with} queued rows, {request_hold_ticks} hold ticks, prediction {predictions}, "
+                              f"{time.monotonic() - started_at:.1f} s into the run). Replanning.", flush=True)
+                    elif outcome == "prefix_changed":
+                        print(f"[{model_label.lower()}] Prefetch dropped after the safety mask clipped a committed "
+                              f"target (prediction {predictions}, {time.monotonic() - started_at:.1f} s into the run). "
+                              "Replanning.", flush=True)
+                    elif first_row is not None:
+                        active_prediction = predictions
+                        loop_metrics.delivered(predictions, request_observed_at, request_submitted_at, request_captured_at)
+                        handoffs += bool(submitted_with)
+                        awaiting_command = AcceptedPrediction(predictions, request_timings, prediction_stages,
+                                                              request_observed_at, time.monotonic())
             short_truncated_plan = (
                 bool(pending) and len(pending) < lead_steps and bool(call_ms)
                 and len(pending) * period < min(call_ms[-3:]) / 1000.0
@@ -478,6 +501,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 submitted_at = time.monotonic()
                 request_slot = pending.slot
                 request_hold_ticks = 0
+                hold_warned_at = 0.0
                 request_prefix_changed = False
                 prefix = pending.committed_actions() if committed_actions and submitted_with else None
                 handle = recorder.observation(prediction=predictions + 1, queued_rows=submitted_with,
@@ -498,7 +522,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                                           trace=trace, prediction_id=predictions + 1,
                                           state_padding=state_padding, committed_actions=prefix, noise_seed=noise_seed,
                                           timings=request_timings,
-                                          observation=handle)
+                                          observation=handle,
+                                          predict_timeout=predict_timeout)
                 predictions += 1
                 observed_since_prediction = 0
             elif stream_observations:
@@ -533,7 +558,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                         temporal_history.commanded(command[:7])
                 rows += 1
                 commanded_at = time.monotonic()
-                next_tick = max(next_tick, commanded_at + period)
+                next_tick = max(next_tick, commanded_at)
                 tick_ms = 1000.0 * (commanded_at - tick_started)
                 tick_latencies_ms.append(tick_ms)
                 if awaiting_command is not None:
@@ -548,14 +573,22 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             elif future is not None:
                 request_hold_ticks += 1
                 holds += 1
+                hold_seconds = request_hold_ticks * period
+                if hold_seconds >= 1.0 and tick_started - hold_warned_at >= (5.0 if hold_warned_at else 0.0):
+                    hold_warned_at = tick_started
+                    print(f"[{model_label.lower()}] Holding while waiting on prediction {predictions} "
+                          f"({hold_seconds:.1f} s, {request_hold_ticks} hold ticks)...", flush=True)
             loop_metrics.tick(tick, active_prediction if row is not None else None)
             recorder.tick(tick, chunk=active_prediction if row is not None else None, row=row_index,
                           held=row is None, reason=None if row is not None else "waiting" if future is not None
-                          else "idle", tick_elapsed_ms=1000 * (time.monotonic() - next_tick + period))
+                          else "idle", tick_elapsed_ms=1000 * (time.monotonic() - tick_started))
             if trace is not None:
                 trace.tick(measured, row, command, active_prediction, row_index,
                            holding=row is None and future is not None, tick_ms=tick_ms)
-            time.sleep(max(0, next_tick - time.monotonic()))
+            now = time.monotonic()
+            if now > next_tick:
+                next_tick = now
+            time.sleep(max(0, next_tick - now))
     finally:
         predictor.shutdown(wait=False, cancel_futures=True)
         loop_metrics.finish()
