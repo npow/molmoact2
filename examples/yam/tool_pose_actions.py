@@ -146,12 +146,17 @@ class ToolPoseActions:
             position, angular = self._jacobian(data, joints, kinematics_current)
             jacobian = -np.vstack((position, angular)) * scale[:, None]
             gradient = jacobian.T @ error
-            normal = jacobian.T @ jacobian
+            free = ~(((joints <= lower + 1e-9) & (gradient > 0)) | ((joints >= upper - 1e-9) & (gradient < 0)))
+            if not np.any(free) or np.max(np.abs(gradient[free])) < 1e-3:
+                break
+            sub_j, sub_g = jacobian[:, free], gradient[free]
+            normal = sub_j.T @ sub_j
             diagonal = np.diag(normal) + 1e-9
             for _ in range(8):
                 lhs = normal.copy()
-                lhs.flat[::7] += damping * diagonal
-                step = -np.linalg.solve(lhs, gradient)
+                lhs.flat[::len(sub_g) + 1] += damping * diagonal
+                step = np.zeros_like(joints)
+                step[free] = -np.linalg.solve(lhs, sub_g)
                 trial = np.clip(joints + step, lower, upper)
                 trial_error = residual(trial)
                 trial_cost = trial_error @ trial_error

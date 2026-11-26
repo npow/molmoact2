@@ -185,3 +185,22 @@ def test_a_declared_worker_without_committed_actions_is_refused_before_any_motio
                            identity={"model_ref": "m", "action_dim": 10, "action_horizon": 32})
     with pytest.raises(SystemExit, match="does not support committed actions"):
         managed_rollout.probe(host, managed_rollout.DECLARED_FAMILY, "pick", committed_actions=True)
+
+
+def test_sub_stop_leader_rest_poses_project_onto_the_home_bound_without_truncating_the_chunk():
+    # Recorded Holesaw rest poses have the GELLO leader arm below joint2 = 0 with wrist compensation in joint4,
+    # up to ~21 mm past the follower's -0.05 rad bound, before lifting out of the rest stop.
+    leader = _poses(joint_limit_margin_rad=0.5)
+    rollout_poses = DeclaredToolPoses(
+        FLUX_EE50, state_dim=7, action_shape=(32, 10), descriptions=[CONFIGS], joint_names=JOINTS,
+        max_joint_step_rad=0.25, accept_norm=12.0, first_row_max_step_rad=0.5, joint_limit_margin_rad=0.05,
+    )
+    measured = np.array([0.038, 0.008, 0.012, -0.067, 0.017, 0.160, 0.0])
+    rest = np.array([0.0856, -0.1463, 0.0073, -0.2067, 0.0604, 0.1660, 0.0])
+    lift = np.array([0.0500, 0.5500, 0.6500, -0.3500, 0.0200, 0.1200, 0.0])
+    leader_joints = np.vstack([np.linspace(measured, rest, 16), np.linspace(rest, lift, 16)])
+    rows = leader.committed(leader_joints)
+    solved = rollout_poses.actions(rows, measured)
+    assert solved.shape == (32, 7)
+    assert np.all(solved[:, 1] >= -0.05 - 1e-6)
+    np.testing.assert_allclose(solved[-1, :6], lift[:6], atol=5e-3)

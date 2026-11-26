@@ -113,6 +113,9 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
             try:
                 solved = pose_actions.actions(suffix, kept[-1] if len(kept) else state, matrix_policy=matrix_policy)
                 chunk = np.concatenate((kept, solved))
+                if len(solved) < len(suffix):
+                    print(f"[{model_label.lower()}] Tool IK kept {len(chunk)} of {len(kept) + len(suffix)} rows.",
+                          flush=True)
             except UnreachableToolPose as error:
                 print(f"[{model_label.lower()}] {error}. Replanning after the queued targets.", flush=True)
             finally:
@@ -378,7 +381,9 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             with recorder.span("get_obs"):
                 obs = env.get_obs()
             observed_at = time.monotonic()
-            captured_at = session_capture_time(env, session.clock, camera_names=policy_camera_names)
+            session_clock = getattr(session, "clock", None)
+            captured_at = (session_capture_time(env, session_clock, camera_names=policy_camera_names)
+                           if session_clock is not None else None)
             if captured_at is None and not warned_no_capture:
                 warned_no_capture = True
                 print("[telemetry] The env reported no capture time for the policy's cameras "
@@ -456,7 +461,11 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     handoffs += bool(submitted_with)
                     awaiting_command = AcceptedPrediction(predictions, request_timings, prediction_stages,
                                                           request_observed_at, time.monotonic())
-            if len(history) == history_size and future is None and len(pending) <= lead_steps:
+            short_truncated_plan = (
+                bool(pending) and len(pending) < lead_steps and bool(call_ms)
+                and len(pending) * period < min(call_ms[-3:]) / 1000.0
+            )
+            if len(history) == history_size and future is None and len(pending) <= lead_steps and not short_truncated_plan:
                 cameras = (
                     {name: np.stack([history[offset - 1][name] for offset in history_offsets])
                      for name in camera_bindings}

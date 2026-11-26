@@ -304,3 +304,17 @@ def test_an_sdk_without_span_recording_keeps_the_rerun_trace(clock, monkeypatch,
     trace = _run(clock)
     assert len(trace.commands) >= 3
     assert "cannot record spans" in capsys.readouterr().out
+
+
+def test_a_short_truncated_plan_finishes_before_replanning_instead_of_missing_prefetch(clock, capsys):
+    class TruncatingPoseActions(_PoseActions):
+        def actions(self, rows, start, *, matrix_policy=False):
+            solved = super().actions(rows, start, matrix_policy=matrix_policy)
+            # First two calls return only 1 row (67 ms < 132 ms predict+IK), then full chunks.
+            return solved[:1] if self.solved <= 2 else solved
+
+    trace = _run(clock, pose=TruncatingPoseActions(clock))
+    out = capsys.readouterr().out
+    assert "Tool IK kept 1 of 8 rows." in out
+    assert "missed_boundary" not in out
+    assert len(trace.commands) >= 4
