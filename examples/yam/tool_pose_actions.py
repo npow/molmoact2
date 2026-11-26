@@ -324,6 +324,21 @@ class QuatToolPoseActions(ToolPoseActions):
         return output
 
 
+class HolesawSingleArmActions(ToolPoseActions):
+    """The single-arm Holesaw Praxis checkpoint (hf://orchestrallabs/praxis-1-holesaw-single-arm): the working
+    arm alone, its pose at ``grasp_site`` in its own base frame, as the dataset recorded it (no rig mount, no
+    parked arm). Holesaw actions are leader commands, so it takes the same row-0 cap, step floor and acceptance
+    as the bimanual Holesaw adapter (see there for the measurements)."""
+
+    first_row_max_step_rad = 1.0
+    step_floor_rad = 0.2
+    accept_norm = 2
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.max_step = max(self.max_step, self.step_floor_rad)
+
+
 class HolesawBimanualActions(ToolPoseActions):
     """The Holesaw training rig puts the physical working arm in the right policy slot."""
 

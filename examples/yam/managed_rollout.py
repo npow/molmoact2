@@ -63,6 +63,12 @@ NOISE_SEED_FAMILIES = frozenset({"pi05", "flux3-action", "longwam", "praxis1"})
 PRAXIS_HOLESAW_BIMANUAL_CHECKPOINT = (
     "file:///cache/private-checkpoints/praxis1-yam-holesaw-15hz-full-step001155"
 )
+# The single-arm Holesaw checkpoint: the working arm's pose at grasp_site in its own base frame.
+PRAXIS_HOLESAW_SINGLE_ARM_REPO = "hf://orchestrallabs/praxis-1-holesaw-single-arm"
+
+
+def praxis_holesaw_single_arm(checkpoint_uri):
+    return (checkpoint_uri or "").split("@", 1)[0] == PRAXIS_HOLESAW_SINGLE_ARM_REPO
 
 original_init = ManagedTailnetNode.__init__
 original_run = TailscaleCli.run
@@ -82,7 +88,7 @@ TailscaleCli.run = run_tailscale
 # (model ID prefix, family). Every family here always uses committed actions.
 FAMILY_PREFIXES = (("pi05", "pi05"), ("gr00t", "gr00t"),
                    ("molmoact2", "molmoact2"), ("dm05", "dexmal"),
-                   ("praxis1", "praxis1"), ("verne", "verne"), ("isaac05", "isaac05"),
+                   ("praxis1", "praxis1"), ("praxis-1", "praxis1"), ("verne", "verne"), ("isaac05", "isaac05"),
                    ("flux3-action", "flux3-action"), ("longwam", "longwam"), ("long-wam", "longwam"),
                    ("rho", "rho"), ("dreamzero", "dreamzero"), ("fastwam", "fastwam"),
                    ("dw05", "dw05"), ("aw0", "aw0"))
@@ -308,13 +314,21 @@ def rollout_joint_policy(host, identity, args):
         temporal_history = TemporalJointHistory(identity["history_rows"])
     pose_actions = declared
     if family in {"praxis1", "verne", "rho"}:
-        from tool_pose_actions import HolesawBimanualActions, QuatToolPoseActions, ToolPoseActions
+        from tool_pose_actions import (
+            HolesawBimanualActions,
+            HolesawSingleArmActions,
+            QuatToolPoseActions,
+            ToolPoseActions,
+        )
 
-        adapter = QuatToolPoseActions if family == "rho" else HolesawBimanualActions if praxis_bimanual else ToolPoseActions
+        holesaw_single_arm = family == "praxis1" and getattr(args, "praxis_holesaw_single_arm", False)
+        adapter = (QuatToolPoseActions if family == "rho" else HolesawBimanualActions if praxis_bimanual
+                   else HolesawSingleArmActions if holesaw_single_arm else ToolPoseActions)
         pose_actions = adapter(
             model_path=Path(__file__).with_name("configs") / "yam_holesaw_kinematics.urdf",
             base_body="base",
-            tool_body="rho_tool" if family == "rho" else "grasp_site" if praxis_bimanual else "gripper",
+            tool_body=("rho_tool" if family == "rho" else "grasp_site" if praxis_bimanual or holesaw_single_arm
+                       else "gripper"),
             joint_names=[f"joint{i}" for i in range(1, 7)],
             # The 0.12 rad bound is per 15 Hz row; keep the same joint speed at 30 Hz.
             max_joint_step_rad=0.12 * 15 / args.control_hz if family == "rho" else 0.12,
@@ -759,6 +773,7 @@ def main():
         parser.error(f"{family} does not support --noise-seed")
     if target.praxis_holesaw_bimanual and family != "praxis1":
         parser.error("--praxis-holesaw-bimanual requires a Praxis-1 checkpoint")
+    args.praxis_holesaw_single_arm = family == "praxis1" and praxis_holesaw_single_arm(deployment.checkpoint_uri)
 
     if family == "pi05" and not target.probe and target.soak_hours <= 0:
         sys.argv = [
