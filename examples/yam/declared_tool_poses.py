@@ -107,7 +107,7 @@ def _description(digest, descriptions):
 
 
 def tool_kinematics(frame, *, descriptions, joint_names, max_joint_step_rad, first_row_max_step_rad=None,
-                    joint_limit_margin_rad=0.0):
+                    joint_limit_margin_rad=0.0, accept_norm=None):
     """``ToolPoseActions`` whose tool body is exactly the declared tool frame.
 
     The description must be byte-identical to the declared one. Its visual and collision geometry is
@@ -141,6 +141,8 @@ def tool_kinematics(frame, *, descriptions, joint_names, max_joint_step_rad, fir
         kinematics = ToolPoseActions(model_path=file.name, base_body=frame["base_link"], tool_body=_TOOL_BODY,
                                      joint_names=joint_names, max_joint_step_rad=max_joint_step_rad)
         kinematics.first_row_max_step_rad = first_row_max_step_rad
+        if accept_norm is not None:  # a solve is accepted within this many position/rotation tolerances
+            kinematics.accept_norm = accept_norm
         return kinematics
     finally:
         Path(file.name).unlink()
@@ -156,7 +158,8 @@ class DeclaredToolPoses:
     """
 
     def __init__(self, semantics, *, state_dim, action_shape, descriptions, joint_names, max_joint_step_rad,
-                 first_row_max_step_rad=None, joint_limit_margin_rad=0.0, group=None, robot_gripper=(1.0, 0.0),
+                 first_row_max_step_rad=None, joint_limit_margin_rad=0.0, accept_norm=None, group=None,
+                 robot_gripper=(1.0, 0.0),
                  gripper_tolerance=0.0):
         if not isinstance(semantics, dict):
             raise ValueError("this deployment declares no semantics; tool poses cannot be converted without them")
@@ -190,7 +193,7 @@ class DeclaredToolPoses:
         self.kinematics = tool_kinematics(self.tool_frame, descriptions=descriptions, joint_names=joint_names,
                                           max_joint_step_rad=max_joint_step_rad,
                                           first_row_max_step_rad=first_row_max_step_rad,
-                                          joint_limit_margin_rad=joint_limit_margin_rad)
+                                          joint_limit_margin_rad=joint_limit_margin_rad, accept_norm=accept_norm)
         rate = semantics.get("control_rate_hz")
         if not isinstance(rate, (int, float)) or isinstance(rate, bool) or rate <= 0:
             raise ValueError("the declaration needs the control_rate_hz its rows were trained at")
