@@ -68,6 +68,108 @@ def _quic_snapshots():
         if original is None:
             os.environ.pop(_QUIC_SNAPSHOT_ENV, None)
 
+
+def redial_session_transport(session: Any, *, timeout_s: Optional[float] = None) -> bool:
+    """Re-open a Session's QUIC transport onto the same live Worker after a transport timeout.
+
+    When ``QuicTransport.request`` times out it closes itself and marks ``session._dead``. The SDK's
+    own ``Session._reconnect`` requires a newly published replacement ``worker_id``
+    (``validate_successor``), so against the same still-healthy Worker every subsequent ``predict``
+    would otherwise fail with ``ConnectionError('No replacement worker has been published...')``.
+    Re-dialing ``create_transport`` over the already-joined ``_tailnet_node`` recovers in ~150 ms.
+    """
+    if session is None or getattr(session, "_closed", False):
+        return False
+    dead = getattr(session, "_dead", None)
+    transport = getattr(session, "_transport", None)
+    if dead is None and not getattr(transport, "_closed", False):
+        return False
+    required = ("_predict_lock", "_connection_options", "grant", "protocol", "_codecs",
+                "_negotiate_wire_encoding", "_prepare_encoders")
+    if not all(hasattr(session, attr) for attr in required):
+        return False
+
+    from dataclasses import replace
+    from orchestral.core import codecs as _codecs
+    from orchestral.core import transport as _transport_mod
+
+    with session._predict_lock:
+        if getattr(session, "_closed", False):
+            return False
+        dead = getattr(session, "_dead", None)
+        transport = getattr(session, "_transport", None)
+        if dead is None and not getattr(transport, "_closed", False):
+            return False
+        grant = session.grant
+        prior_failures = int(getattr(session, "_redial_failures", 0))
+        deployment = getattr(session, "_deployment", None)
+        endpoint_client = getattr(session, "_endpoint_client", None)
+        expires_at = getattr(grant, "expires_at", float("inf"))
+        if (
+            deployment is not None
+            and endpoint_client is not None
+            and (prior_failures > 0 or time.time() >= expires_at - 30.0)
+        ):
+            refreshed = deployment._connection_grant(endpoint_client, refresh=True)
+            if getattr(refreshed, "worker_id", "") != getattr(grant, "worker_id", ""):
+                # A replacement Worker was published; let Session._reconnect() validate and switch to it.
+                return False
+            grant = replace(refreshed, endpoint_host=grant.endpoint_host)
+
+        node = getattr(session, "_tailnet_node", None)
+        socks5_udp_relay = (
+            node.socks5_address if node is not None and getattr(node, "running", False)
+            else os.environ.get(_transport_mod.SOCKS5_UDP_RELAY_ENV) or None
+        )
+        _codecs.close_observation_encoders(session._codecs)
+        if callable(getattr(transport, "close", None)):
+            transport.close()
+        options = getattr(session, "_connection_options", {}) or {}
+        connect_timeout = max(3.0, float(timeout_s)) if timeout_s is not None else None
+        orig_op_timeout = getattr(_transport_mod, "_quic_operation_timeout_seconds", None)
+        new_transport = None
+        try:
+            if connect_timeout is not None and callable(orig_op_timeout):
+                _transport_mod._quic_operation_timeout_seconds = lambda _accel: connect_timeout
+            try:
+                with _quic_snapshots():
+                    new_transport = _transport_mod.create_transport(
+                        session.protocol,
+                        grant,
+                        socks5_udp_relay=socks5_udp_relay,
+                        transport_options=options.get("transport_options"),
+                        transaction_records=bool(options.get("transaction_records", False)),
+                    )
+            finally:
+                if connect_timeout is not None and callable(orig_op_timeout):
+                    _transport_mod._quic_operation_timeout_seconds = orig_op_timeout
+            if timeout_s is not None and isinstance(getattr(new_transport, "_timeout_s", None), (int, float)):
+                new_transport._timeout_s = min(float(new_transport._timeout_s), float(timeout_s))
+            session.grant = grant
+            session._transport = new_transport
+            session._supports_stateful_h264 = bool(getattr(new_transport, "supports_stateful_h264", False))
+            session._supports_connection_grant_cache = bool(
+                getattr(new_transport, "supports_connection_grant_cache", False)
+            )
+            if getattr(session, "_offload_recorder", None) is not None and hasattr(new_transport, "request_progress"):
+                new_transport.request_progress = session._offload_progress
+            session.wire_encoding = session._negotiate_wire_encoding()
+            session._observe_capability = None
+            session._prepare_encoders()
+        except BaseException:
+            session._redial_failures = prior_failures + 1
+            if new_transport is not None and callable(getattr(new_transport, "close", None)):
+                new_transport.close()
+            session._dead = dead or "transport redial failed"
+            session._reconnect_required = True
+            raise
+        session._redial_failures = 0
+        session._dead = None
+        session._reconnect_required = False
+        session._episode_started = False
+        session._episode_start_pending = True
+        return True
+
 #: SDK image encoders supported for both managed and direct sessions.
 OBSERVATION_ENCODINGS: Tuple[str, ...] = ("jpeg", "h264")
 
@@ -751,6 +853,8 @@ class OrchestralSessionHost:
         from dataclasses import asdict
         if self._session is None:
             raise OrchestralBridgeError("Orchestral session is not open")
+        if redial_session_transport(self._session):
+            self._episode_start = True
         inputs, query_state = self.predict_inputs(images, state)
         prefix = None
         executed_prefix = None

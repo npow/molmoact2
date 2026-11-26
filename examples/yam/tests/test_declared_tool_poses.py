@@ -244,11 +244,19 @@ def test_30hz_rollout_keeps_encoder_lead_unclipped_and_releases_motors_before_re
             events.append("recorder.close")
 
     def fake_build_env(args, **kwargs):
-        return (SimpleNamespace(close=lambda: events.append("env.close")),)
+        events.append("env.open")
+        return (SimpleNamespace(
+            get_obs=lambda: {
+                "front_camera_rgb": np.zeros((480, 640, 3), dtype=np.uint8),
+                "joint_positions": np.zeros(14, dtype=np.float32),
+            },
+            close=lambda: events.append("env.close"),
+        ),)
 
     def fake_run(env, session, mask, **kwargs):
         captured_mask["mask"] = mask
         captured_mask["predict_timeout"] = kwargs.get("predict_timeout")
+        captured_mask["max_prediction_failures"] = kwargs.get("max_prediction_failures")
         events.append("loop.interrupt")
         raise KeyboardInterrupt
 
@@ -265,6 +273,14 @@ def test_30hz_rollout_keeps_encoder_lead_unclipped_and_releases_motors_before_re
                       "RolloutTrace": lambda *a, **kw: SimpleNamespace(stop=lambda: events.append("trace.stop"))},
     )
 
+    warmup_calls = []
+
+    def fake_predict(*, cameras, state, instruction, episode_start, **kwargs):
+        warmup_calls.append(episode_start)
+        if len(warmup_calls) == 1:
+            raise TimeoutError("stale post-idle DERP socket")
+        return SimpleNamespace(actions=poses.committed(np.zeros((32, 7), dtype=np.float32)))
+
     args = SimpleNamespace(
         policy_family=managed_rollout.DECLARED_FAMILY, control_hz=None, prefetch_lead_steps=None,
         plan_rows=None, chunk_fusion="splice", fusion_rows=4, shadow=False, instruction="pick",
@@ -272,7 +288,12 @@ def test_30hz_rollout_keeps_encoder_lead_unclipped_and_releases_motors_before_re
         committed_actions=True, declared=poses,
     )
     identity = dict(state_dim=7, action_dim=10, action_horizon=32, camera_mapping={"top": "images.middle"})
-    host = SimpleNamespace(session=SimpleNamespace())
+    session = SimpleNamespace(
+        grant=SimpleNamespace(io_spec=SimpleNamespace(cameras={"images.middle": (360, 640)})),
+        predict=fake_predict,
+        new_episode=lambda: events.append("session.new_episode"),
+    )
+    host = SimpleNamespace(session=session)
     managed_rollout.rollout_joint_policy(host, identity, args)
 
     mask = captured_mask["mask"]
@@ -284,7 +305,11 @@ def test_30hz_rollout_keeps_encoder_lead_unclipped_and_releases_motors_before_re
     excessive = measured.copy()
     excessive[0] = 0.9
     assert mask.command_target(excessive, measured)[0] == pytest.approx(0.5)
-    assert captured_mask["predict_timeout"] == pytest.approx(5.0)
+    assert warmup_calls == [True, True]
+    assert captured_mask["predict_timeout"] == pytest.approx(2.5)
+    assert captured_mask["max_prediction_failures"] == 3
+    assert (events.index("env.open") < events.index("session.new_episode")
+            < events.index("recorder.attach") < events.index("loop.interrupt"))
     assert events.index("env.close") < events.index("trace.stop") < events.index("recorder.close")
 
 

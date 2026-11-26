@@ -393,6 +393,45 @@ def rollout_joint_policy(host, identity, args):
                 )
                 trace = None
                 try:
+                    predict_timeout = getattr(args, "predict_timeout", 2.5)
+                    max_prediction_failures = getattr(args, "max_prediction_failures", 3)
+                    timestamp_observations = (declared.episode_time if declared is not None
+                                              else family in {"verne", "isaac05"})
+                    state_padding = ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None
+                    # _build_env runs after the Enter prompt and resets can_left/can_right via netlink.
+                    # Send one live-camera warmup prediction before starting the rollout clock so any
+                    # idle/netlink Tailnet/DERP stall is detected and redialed before tick 0.
+                    if callable(getattr(env, "get_obs", None)) and callable(getattr(host.session, "predict", None)):
+                        obs = env.get_obs()
+                        frames = rollout["frames_for_policy"](obs, host.session.grant.io_spec.cameras, bindings)
+                        measured = mask.validate_state(obs["joint_positions"], name="policy input state")
+                        history_inputs = None
+                        warm_cameras = frames
+                        if temporal_history is not None:
+                            warm_history = TemporalJointHistory(identity["history_rows"])
+                            warm_history.observe(frames, measured[:7])
+                            warm_cameras, history_inputs = warm_history.inputs()
+                        for attempt in range(2):
+                            try:
+                                _, warm_elapsed = rollout["checked_chunk"](
+                                    host.session, warm_cameras, measured[:7].copy(), args.instruction,
+                                    episode_start=True, action_shape=checked_shape, model_label=family,
+                                    pose_actions=pose_actions, matrix_policy=family == "praxis1",
+                                    observation_time=0.0 if timestamp_observations else None,
+                                    max_plan_rows=plan_rows, history_inputs=history_inputs,
+                                    state_padding=state_padding, noise_seed=args.noise_seed,
+                                    predict_timeout=predict_timeout,
+                                )
+                                print(f"[{family.lower()}] Post-CAN live warmup ready in {warm_elapsed * 1000:.0f} ms.",
+                                      flush=True)
+                                break
+                            except Exception as error:
+                                if attempt == 1:
+                                    raise
+                                print(f"[{family.lower()}] Post-CAN warmup stalled ({type(error).__name__}: {error}); "
+                                      "re-opening QUIC transport...", flush=True)
+                        if callable(getattr(host.session, "new_episode", None)):
+                            host.session.new_episode()
                     trace = rollout["RolloutTrace"](recording, recording_start, host.session)
                     stack.enter_context(run_recording.recording(
                         args, loop="managed", model=family, prompt=args.instruction, **settings)).attach(host.session)
@@ -404,12 +443,11 @@ def rollout_joint_policy(host, identity, args):
                             action_shape=checked_shape,
                             model_label=family, pose_actions=pose_actions, matrix_policy=family == "praxis1",
                             # Isaac is conditioned on time since the episode began.
-                            timestamp_observations=(declared.episode_time if declared is not None
-                                                    else family in {"verne", "isaac05"}), max_plan_rows=plan_rows,
+                            timestamp_observations=timestamp_observations, max_plan_rows=plan_rows,
                             temporal_history=temporal_history,
                             chunk_fusion=args.chunk_fusion, fusion_rows=args.fusion_rows,
                             hold_gripper_rows=HOLD_GRIPPER_ROWS.get(family, 0),
-                            state_padding=ISAAC_PARKED_RIGHT_ARM if bimanual_layout else None,
+                            state_padding=state_padding,
                             trace=trace,
                             committed_actions=committed,
                             stream_observations=(declared.frame_stream if declared is not None
@@ -420,8 +458,8 @@ def rollout_joint_policy(host, identity, args):
                             # takes the cold-start path (about 30 ms) every time.
                             max_observed_rows=PRAXIS_MAX_OBSERVED_ROWS if family == "praxis1" else None,
                             noise_seed=args.noise_seed,
-                            predict_timeout=getattr(args, "predict_timeout", 5.0),
-                            max_prediction_failures=getattr(args, "max_prediction_failures", 0),
+                            predict_timeout=predict_timeout,
+                            max_prediction_failures=max_prediction_failures,
                         )
                     except KeyboardInterrupt:
                         pass
@@ -755,10 +793,10 @@ def main():
     settings.add_argument("--fusion-rows", type=int, default=4,
                           help="Ticks over which crossfade and rail move onto a new chunk")
     settings.add_argument("--shadow", action="store_true")
-    settings.add_argument("--predict-timeout", type=float, default=5.0,
-                          help="per-request transport timeout in seconds during the live rollout (default: 5)")
-    settings.add_argument("--max-prediction-failures", type=int, default=0,
-                          help="failed predictions to hold through before one ends the rollout (default: 0)")
+    settings.add_argument("--predict-timeout", type=float, default=2.5,
+                          help="per-request transport timeout in seconds during the live rollout (default: 2.5)")
+    settings.add_argument("--max-prediction-failures", type=int, default=3,
+                          help="consecutive failed predictions to hold/redial through before ending (default: 3)")
     settings.add_argument("--rrd", type=Path, help="Rerun output path; opt in for soak runs")
     run_recording.add_arguments(settings)
     settings.add_argument("--metrics", type=Path, help="Soak CSV path (default: yam_eval_runs/soak/gr00t_soak_<timestamp>.metrics.csv)")

@@ -363,22 +363,98 @@ def test_predict_timeout_caps_transport_timeout_and_recovers_within_failure_budg
     assert transport._timeout_s == pytest.approx(5.0)
 
     class FlakySession(_Session):
-        def __init__(self):
+        def __init__(self, fail_calls=(2,)):
             super().__init__(clock)
             self.calls = 0
+            self.fail_calls = set(fail_calls)
 
         def predict(self, *, state, **kwargs):
             self.calls += 1
-            if self.calls == 2:
+            if self.calls in self.fail_calls:
                 clock.now += 0.050
                 raise TimeoutError("simulated QUIC timeout")
             return super().predict(state=state, **kwargs)
 
-    flaky = FlakySession()
-    trace = _run(clock, session=flaky, max_prediction_failures=1, predict_timeout=5.0)
+    # Separated transient blips reset the consecutive counter once a prediction succeeds.
+    flaky = FlakySession(fail_calls=(2, 4))
+    trace = _run(clock, session=flaky, max_prediction_failures=1, predict_timeout=2.5)
     out = capsys.readouterr().out
     assert "Prediction 2 failed (1/1 allowed): TimeoutError: simulated QUIC timeout. Replanning." in out
+    assert "Prediction 4 failed (1/1 allowed): TimeoutError: simulated QUIC timeout. Replanning." in out
+    assert "2 recovered failures." in out
     assert len(trace.commands) >= 3
 
+    # Back-to-back failures exceeding the consecutive budget still stop the rollout.
     with pytest.raises(TimeoutError, match="simulated QUIC timeout"):
-        _run(clock, session=FlakySession(), max_prediction_failures=0, predict_timeout=5.0)
+        _run(clock, session=FlakySession(fail_calls=(2, 3)), max_prediction_failures=1, predict_timeout=2.5)
+
+    with pytest.raises(TimeoutError, match="simulated QUIC timeout"):
+        _run(clock, session=FlakySession(fail_calls=(2,)), max_prediction_failures=0, predict_timeout=2.5)
+
+
+def test_redial_session_transport_reopens_quic_on_same_worker_and_defers_worker_replacement(monkeypatch):
+    import threading
+    import time
+    from orchestral_session_bridge import redial_session_transport
+    from orchestral.core import codecs as codecs_mod
+    from orchestral.core import transport as transport_mod
+
+    closed_transports = []
+    created = []
+    prepared = []
+
+    def fake_create_transport(protocol, grant, *, socks5_udp_relay=None, transport_options=None, transaction_records=False):
+        t = SimpleNamespace(
+            _timeout_s=120.0,
+            _closed=False,
+            supports_stateful_h264=True,
+            supports_connection_grant_cache=True,
+            close=lambda: closed_transports.append("new"),
+        )
+        created.append((protocol, grant.endpoint_host, socks5_udp_relay, t))
+        return t
+
+    monkeypatch.setattr(transport_mod, "create_transport", fake_create_transport)
+    monkeypatch.setattr(codecs_mod, "close_observation_encoders", lambda cache: cache.clear())
+
+    old_transport = SimpleNamespace(_closed=True, close=lambda: closed_transports.append("old"))
+    grant = SimpleNamespace(endpoint_host="100.103.70.121", worker_id="w-1", expires_at=time.time() + 600.0)
+    session = SimpleNamespace(
+        _closed=False,
+        _dead="TimeoutError: timed out",
+        _reconnect_required=True,
+        _episode_started=True,
+        _episode_start_pending=False,
+        _predict_lock=threading.Lock(),
+        _connection_options={"transport_options": {"congestion_controller": "bbr"}, "transaction_records": False},
+        grant=grant,
+        protocol="quic",
+        _codecs={"images.middle": object()},
+        _transport=old_transport,
+        _tailnet_node=SimpleNamespace(running=True, socks5_address="127.0.0.1:41887"),
+        _negotiate_wire_encoding=lambda: "protobuf",
+        _prepare_encoders=lambda: prepared.append(True),
+    )
+
+    assert redial_session_transport(session, timeout_s=2.5) is True
+    assert created and created[0][:3] == ("quic", "100.103.70.121", "127.0.0.1:41887")
+    assert session._transport is created[0][3]
+    assert session._transport._timeout_s == pytest.approx(2.5)
+    assert session._dead is None and session._reconnect_required is False
+    assert session._episode_started is False and session._episode_start_pending is True
+    assert session.wire_encoding == "protobuf"
+    assert prepared == [True]
+    assert closed_transports == ["old"]
+
+    # If the control plane published a new worker_id, defer to Session._reconnect().
+    session._dead = "TimeoutError: timed out"
+    session._reconnect_required = True
+    session._redial_failures = 1
+    session._endpoint_client = object()
+    session._deployment = SimpleNamespace(
+        _connection_grant=lambda _c, refresh=False: SimpleNamespace(
+            endpoint_host="100.103.70.222", worker_id="w-2", expires_at=time.time() + 600.0
+        )
+    )
+    assert redial_session_transport(session, timeout_s=2.5) is False
+    assert len(created) == 1

@@ -25,6 +25,7 @@ from chunk_fusion import MODES as CHUNK_FUSION_MODES, ChunkPlan
 from committed_range import gr00t_conditioning_prefix
 from frame_capture_time import session_capture_time
 from gripper_aperture import clip_predicted_aperture
+from orchestral_session_bridge import redial_session_transport
 from rollout_trace import COMMAND_STAGES, PREDICTION_OUTCOMES, PREDICTION_STAGES, TICK_STAGE, RolloutTrace
 import run_recording
 
@@ -80,6 +81,8 @@ def checked_chunk(session, cameras, state, instruction, *, episode_start, action
         sensors["committed_actions"] = committed_actions
     if noise_seed is not None:
         sensors["noise_seed"] = noise_seed
+    if redial_session_transport(session, timeout_s=predict_timeout):
+        print(f"[{model_label.lower()}] Re-opened QUIC transport onto the active Worker.", flush=True)
     if predict_timeout is not None:
         transport = getattr(session, "_transport", None)
         if isinstance(getattr(transport, "_timeout_s", None), (int, float)) and transport._timeout_s > predict_timeout:
@@ -308,8 +311,13 @@ def latency_summary(prediction_samples, command_samples, tick_ms, outcomes):
     return lines
 
 
-def observe(session, frames, joints, instruction, *, pose_actions=None, matrix_policy=False):
+def observe(session, frames, joints, instruction, *, pose_actions=None, matrix_policy=False, predict_timeout=None):
     """Stream one observation; a pose worker's forward kinematics runs here, off the control tick."""
+    redial_session_transport(session, timeout_s=predict_timeout)
+    if predict_timeout is not None:
+        transport = getattr(session, "_transport", None)
+        if isinstance(getattr(transport, "_timeout_s", None), (int, float)) and transport._timeout_s > predict_timeout:
+            transport._timeout_s = float(predict_timeout)
     state = pose_actions.state(joints, matrix_policy=matrix_policy) if pose_actions else joints
     session.observe(cameras=frames, state=state, instruction=instruction)
 
@@ -368,6 +376,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     latency_spans = LatencySpans(session, model_label, shadow=shadow, chunk_fusion=chunk_fusion)
     rejected_chunks = 0
     failed_predictions = 0
+    recovered_failures = 0
     hold_warned_at = 0.0
     rows = predictions = handoffs = misses = holds = 0
     recorder = run_recording.current()
@@ -384,7 +393,16 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     try:
         while (tick_started := time.monotonic()) < deadline:
             while observations and observations[0].done():
-                observations.popleft().result()
+                try:
+                    observations.popleft().result()
+                except Exception as error:
+                    failed_predictions += 1
+                    if failed_predictions > max_prediction_failures:
+                        raise
+                    recovered_failures += 1
+                    print(f"[{model_label.lower()}] Streamed observation failed "
+                          f"({failed_predictions}/{max_prediction_failures} allowed): "
+                          f"{type(error).__name__}: {error}. Continuing.", flush=True)
             tick += 1
             with recorder.span("get_obs"):
                 obs = env.get_obs()
@@ -417,6 +435,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                         print(f"[{model_label.lower()}] Prediction {predictions} failed: "
                               f"{type(error).__name__}: {error}", flush=True)
                         raise
+                    recovered_failures += 1
                     print(f"[{model_label.lower()}] Prediction {predictions} failed "
                           f"({failed_predictions}/{max_prediction_failures} allowed): "
                           f"{type(error).__name__}: {error}. Replanning.", flush=True)
@@ -424,6 +443,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                         session.new_episode()
                 else:
                     future = None
+                    failed_predictions = 0
                     call_ms.append(elapsed * 1000)
                     try:
                         stage_rows.append(session.step_timings[-1].stages_ms())
@@ -536,6 +556,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                     observations.append(predictor.submit(
                         observe, session, frames, measured[:7].copy(), instruction,
                         pose_actions=pose_actions, matrix_policy=matrix_policy,
+                        predict_timeout=predict_timeout,
                     ))
 
             next_tick += period
@@ -599,7 +620,8 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
             print("\n".join(latency_summary(prediction_samples, command_samples, tick_latencies_ms, outcomes)),
                   flush=True)
     print(f"{model_label} rollout finished. {predictions} predictions, {rows} {'shadow rows' if shadow else 'commands'}, "
-          f"{handoffs} prefetched handoffs, {misses} missed boundaries, {holds} hold ticks.")
+          f"{handoffs} prefetched handoffs, {misses} missed boundaries, {holds} hold ticks"
+          + (f", {recovered_failures} recovered failures." if recovered_failures else "."))
 
 
 def default_rrd_path(config_path):
