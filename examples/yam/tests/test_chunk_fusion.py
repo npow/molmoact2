@@ -256,6 +256,29 @@ def test_rollout_bounds_the_frames_observed_between_predictions(monkeypatch):
     assert longest_observed_run(max_observed_rows=3) == 3
 
 
+def test_rollout_keeps_at_most_one_streamed_observation_in_flight(monkeypatch):
+    """A slow observe round trip must not queue one frame per tick ahead of the next predict."""
+    rollout_loop = pytest.importorskip("rollout_loop")
+    clock = iter(np.arange(0, 1000, 0.001))
+    monkeypatch.setattr(rollout_loop.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(rollout_loop.time, "sleep", lambda seconds: None)
+    stalled = []
+
+    class _StalledObserves(_InlinePredictor):
+        # Predictions finish inline; observes never return, like a Worker slower than the control tick.
+        def submit(self, function, *args, **kwargs):
+            if function is rollout_loop.observe:
+                stalled.append(Future())
+                return stalled[-1]
+            return super().submit(function, *args, **kwargs)
+
+    monkeypatch.setattr(rollout_loop, "ThreadPoolExecutor", _StalledObserves)
+    rollout_loop.run(_Env(), _Session(), _Mask(), seconds=1.0, instruction="go", shadow=False,
+                      camera_bindings={"top": "front_camera_rgb"}, history_offsets=(), lead_steps=4,
+                      action_shape=(16, 7), committed_actions=True, stream_observations=True)
+    assert len(stalled) == 1
+
+
 def test_checked_chunk_clips_flux_gripper_overshoot_before_queueing():
     import rollout_loop
 

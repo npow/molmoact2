@@ -383,6 +383,7 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
     tick = -1
     call_ms, stage_rows = [], []
     observed_since_prediction = 0
+    skipped_observations = 0
     next_tick = time.monotonic()
     started_at = next_tick
     deadline = next_tick + seconds
@@ -551,7 +552,12 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
                 # It also runs a pose worker's forward kinematics, so the command below does not wait for it;
                 # the single worker thread never uses pose_actions from two threads at once.
                 # `max_observed_rows` bounds the frames sent between two predictions: see managed_rollout.
-                if max_observed_rows is None or observed_since_prediction < max_observed_rows:
+                # At most one observe in flight: each is a full round trip (~60-70 ms to a remote Worker), about one
+                # 15 Hz tick, on the same thread as predict. Queuing one per tick backed up to 19 of them and the next
+                # predict waited ~1.3 s behind them (queue_ms), so every prefetch missed its boundary. Skip the frame.
+                if observations:
+                    skipped_observations += 1
+                elif max_observed_rows is None or observed_since_prediction < max_observed_rows:
                     observed_since_prediction += 1
                     observations.append(predictor.submit(
                         observe, session, frames, measured[:7].copy(), instruction,
@@ -616,6 +622,9 @@ def run(env, session, mask, *, seconds, instruction, shadow, lead_steps=8,
         # Printed on Ctrl+C too: that is how an operator ends most rollouts.
         if call_ms:
             print(latency_line(model_label, call_ms, stage_rows, final=True), flush=True)
+        if skipped_observations:
+            print(f"[{model_label.lower()}] Skipped {skipped_observations} streamed frames while an observe was in flight.",
+                  flush=True)
         if prediction_samples:
             print("\n".join(latency_summary(prediction_samples, command_samples, tick_latencies_ms, outcomes)),
                   flush=True)
