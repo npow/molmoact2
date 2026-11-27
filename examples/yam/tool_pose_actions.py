@@ -333,6 +333,12 @@ class HolesawSingleArmActions(ToolPoseActions):
     first_row_max_step_rad = 1.0
     step_floor_rad = 0.2
     accept_norm = 2
+    # The checkpoint's predicted orientations sit about 0.06 rad (p50) off any pose the arm reaches at the predicted
+    # position; its training actions solve at 0.02 rad. At 0.02 rad, IK kept a median 8 of 24 rows on the robot (16 of 74
+    # chunks whole) and the rollout replanned every few ticks. At 0.1 rad, replaying that run's 74 chunks keeps a mean of
+    # 22.7 rows (67 whole), position error p95 0.2 mm, max 3.4 mm, and rotation error p95 0.12 rad, max 0.19 rad: the
+    # solve now gives up orientation, not position.
+    rotation_tolerance = 0.1
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

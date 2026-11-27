@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tool_pose_actions import HolesawBimanualActions, ToolPoseActions
+from tool_pose_actions import HolesawBimanualActions, HolesawSingleArmActions, ToolPoseActions
 
 
 class ToolPoseActionsTests(unittest.TestCase):
@@ -49,6 +49,26 @@ class ToolPoseActionsTests(unittest.TestCase):
         np.testing.assert_array_equal(result[:1], queued)
         # The solver stops at 0.2 mm and 0.002 rad (a tenth of its tolerances), so poses match to about 1e-3.
         np.testing.assert_allclose(adapter.committed(result[1:]), adapter.committed(target), atol=2e-3)
+
+    def test_single_arm_holesaw_keeps_a_real_chunk_whose_orientation_is_slightly_off(self):
+        # A 24-row chunk the checkpoint returned on the robot (run nimble-zebra-t8qb_20261126_153632) and the measured
+        # joints it was solved from. At the default 0.02 rad rotation tolerance IK kept only its first row.
+        sample = np.load(Path(__file__).with_name("fixtures") / "praxis1_single_arm_chunk.npz")
+        rows, start = sample["rows"].astype(np.float64), sample["joints"].astype(np.float64)
+        kwargs = dict(model_path=Path(__file__).resolve().parents[1] / "configs/yam_holesaw_kinematics.urdf",
+                      base_body="base", tool_body="grasp_site", joint_names=[f"joint{i}" for i in range(1, 7)],
+                      max_joint_step_rad=0.12)
+        adapter = HolesawSingleArmActions(**kwargs)
+        solved = adapter.actions(rows, start, matrix_policy=True)
+        self.assertEqual(len(solved), len(rows))
+        data = adapter._mj.MjData(adapter.model)
+        for joints, row in zip(solved, rows):
+            position, _ = adapter._pose(data, joints[:6].astype(np.float64))
+            self.assertLess(np.linalg.norm(position - row[:3]), 4e-3)
+        self.assertLessEqual(np.abs(np.diff(np.vstack((start[:6], solved[:, :6])), axis=0)[1:]).max(), 0.2 + 1e-6)
+        strict = HolesawSingleArmActions(**kwargs)
+        strict.rotation_tolerance = ToolPoseActions.rotation_tolerance
+        self.assertEqual(len(strict.actions(rows, start, matrix_policy=True)), 1)
 
     def test_a_run_starts_from_the_near_singular_zero_pose_without_truncating_the_chunk(self):
         adapter = HolesawBimanualActions(
