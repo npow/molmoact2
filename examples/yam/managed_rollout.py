@@ -123,6 +123,14 @@ def declared_semantics(client, deployment, path=None):
     options = (getattr(deployment, "data", None) or {}).get("checkpoint_options") or {}
     reply = client._http.post("/v1alpha1/checkpoints:inspect", timeout=180, json={
         "checkpointUri": deployment.checkpoint_uri, "checkpointOptions": {k: str(v) for k, v in options.items()}})
+    if reply.status_code == 400:
+        # The deployment's own options do not describe its checkpoint (an imported Model keeps them on the
+        # Model record), so the control plane cannot inspect it from here: treat it as undeclared.
+        message = (reply.json() if reply.headers.get("content-type", "").startswith("application/json")
+                   else {}).get("message") or reply.text
+        print(f"[semantics] Cannot inspect {deployment.checkpoint_uri} ({message}); "
+              "using the family tables.", flush=True)
+        return None
     reply.raise_for_status()
     return (reply.json().get("ioSpec") or {}).get("semantics")
 
